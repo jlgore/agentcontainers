@@ -87,7 +87,7 @@ fn get_enforced_cgroup() -> Option<u64> {
 
 /// Emit a block event for a denied process execution to the PROC_EVENTS ring buffer.
 #[inline(always)]
-fn emit_exec_block_event(ino: u64) {
+fn emit_exec_block_event(cgroup_id: u64, ino: u64) {
     if let Some(mut entry) = PROC_EVENTS.reserve::<ExecEvent>(0) {
         let ev = entry.as_mut_ptr();
         unsafe {
@@ -101,6 +101,7 @@ fn emit_exec_block_event(ino: u64) {
 
             (*ev).event_type = 4; // EventType::ProcessExec
             (*ev).verdict = 1; // Verdict::Block
+            (*ev).cgroup_id = cgroup_id;
 
             (*ev).inode = ino;
 
@@ -192,6 +193,7 @@ fn try_bprm_check(ctx: &LsmContext) -> Result<i32, i64> {
         inode: ino,
         dev_major: (s_dev >> 20) & 0xfff,
         dev_minor: s_dev & 0xfffff,
+        cgroup_id,
     };
 
     // 1. Check allowed executables map.
@@ -204,6 +206,6 @@ fn try_bprm_check(ctx: &LsmContext) -> Result<i32, i64> {
     // 2. Default deny -- block execution, emit audit event.
     bump_stat(STAT_PROC_BLOCKED);
     bump_cgroup_stat(cgroup_id, CGROUP_STAT_PROC_BLOCKED);
-    emit_exec_block_event(ino);
+    emit_exec_block_event(cgroup_id, ino);
     Ok(LSM_DENY)
 }

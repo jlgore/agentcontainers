@@ -165,6 +165,8 @@ pub fn parse_network_event(raw: &bpf::NetworkEvent, container_id: &str) -> Enfor
 
     EnforcementEvent {
         timestamp_ns: raw.timestamp_ns,
+        cgroup_id: raw.cgroup_id,
+        correlation_id: String::new(),
         container_id: container_id.to_string(),
         domain: EventDomain::Network,
         verdict,
@@ -187,6 +189,8 @@ pub fn parse_fs_event(raw: &bpf::FsEvent, container_id: &str) -> EnforcementEven
 
     EnforcementEvent {
         timestamp_ns: raw.timestamp_ns,
+        cgroup_id: raw.cgroup_id,
+        correlation_id: String::new(),
         container_id: container_id.to_string(),
         domain: EventDomain::Filesystem,
         verdict,
@@ -210,6 +214,8 @@ pub fn parse_exec_event(raw: &bpf::ExecEvent, container_id: &str) -> Enforcement
 
     EnforcementEvent {
         timestamp_ns: raw.timestamp_ns,
+        cgroup_id: raw.cgroup_id,
+        correlation_id: String::new(),
         container_id: container_id.to_string(),
         domain: EventDomain::Process,
         verdict,
@@ -243,6 +249,8 @@ pub fn parse_cred_event(raw: &bpf::CredEvent, container_id: &str) -> Enforcement
 
     EnforcementEvent {
         timestamp_ns: raw.timestamp_ns,
+        cgroup_id: raw.cgroup_id,
+        correlation_id: String::new(),
         container_id: container_id.to_string(),
         domain: EventDomain::Credential,
         verdict,
@@ -286,6 +294,8 @@ pub fn parse_dns_event(raw: &bpf::DnsEvent, container_id: &str) -> EnforcementEv
 
     EnforcementEvent {
         timestamp_ns: raw.timestamp_ns,
+        cgroup_id: raw.cgroup_id,
+        correlation_id: String::new(),
         container_id: container_id.to_string(),
         domain: EventDomain::Network,
         verdict: EventVerdict::Allow,
@@ -315,6 +325,7 @@ mod tests {
             uid: 1000,
             event_type: bpf::EventType::NetworkConnect as u32,
             verdict: bpf::Verdict::Block as u32,
+            cgroup_id: 1001,
             // BPF stores 10.0.0.1 in network byte order (big-endian).
             dst_ip4: 0x0a000001,
             dst_ip6: [0; 4],
@@ -335,6 +346,7 @@ mod tests {
             uid: 1000,
             event_type: bpf::EventType::FsOpen as u32,
             verdict: bpf::Verdict::Allow as u32,
+            cgroup_id: 1002,
             inode: 12345,
             flags: 0x0002,
             _pad: 0,
@@ -354,6 +366,7 @@ mod tests {
             uid: 0,
             event_type: bpf::EventType::ProcessExec as u32,
             verdict: bpf::Verdict::Block as u32,
+            cgroup_id: 1003,
             inode: 99999,
             comm,
             binary,
@@ -423,6 +436,7 @@ mod tests {
             uid: 1000,
             event_type: bpf::EventType::DnsResponse as u32,
             ttl: 3600,
+            cgroup_id: 1004,
             domain_hash: [
                 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54,
                 0x32, 0x10,
@@ -526,6 +540,8 @@ mod tests {
 
         let event = EnforcementEvent {
             timestamp_ns: 42,
+            cgroup_id: 1,
+            correlation_id: String::new(),
             container_id: "ctr-1".into(),
             domain: EventDomain::Network,
             verdict: EventVerdict::Allow,
@@ -554,6 +570,8 @@ mod tests {
 
         let make_event = |cid: &str, ts: u64| EnforcementEvent {
             timestamp_ns: ts,
+            cgroup_id: ts,
+            correlation_id: String::new(),
             container_id: cid.into(),
             domain: EventDomain::Filesystem,
             verdict: EventVerdict::Block,
@@ -611,6 +629,8 @@ mod tests {
         // Publishing with no subscribers should not panic.
         bus.publish(EnforcementEvent {
             timestamp_ns: 0,
+            cgroup_id: 0,
+            correlation_id: String::new(),
             container_id: String::new(),
             domain: EventDomain::Network,
             verdict: EventVerdict::Allow,

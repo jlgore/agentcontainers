@@ -10,7 +10,7 @@ use aya_ebpf::macros::map;
 use aya_ebpf::maps::{Array, HashMap, LpmTrie, PerCpuArray, PerCpuHashMap, RingBuf};
 
 use agentcontainer_common::maps::{
-    CgroupStats, FsInodeKey, PortKeyV4, SecretAclKey, SecretAclValue,
+    CgroupStats, FsInodeKey, LpmDataV4, LpmDataV6, PortKeyV4, SecretAclKey, SecretAclValue,
 };
 use agentcontainer_common::siphash::SipHashKey;
 
@@ -23,25 +23,26 @@ pub static ENFORCED_CGROUPS: HashMap<u64, u8> = HashMap::with_max_entries(256, 0
 
 // --- Network maps ---
 
-/// IPv4 CIDRs that are permitted (LPM trie longest prefix match).
-/// Key type is `u32` (network-byte-order IPv4 address). The prefix length
-/// is supplied via `Key::new(prefix_len, addr)` at lookup/insert time.
+/// IPv4 CIDRs that are permitted (LPM trie longest prefix match),
+/// scoped per-cgroup. LPM data = (cgroup_id ++ addr in network byte order);
+/// prefix_len = 64 + cidr_bits via `Key::new` at lookup/insert time.
+/// NEVER insert with prefix_len < 64 — that would match across cgroups.
 #[map]
-pub static ALLOWED_V4: LpmTrie<u32, u8> = LpmTrie::with_max_entries(4096, 0);
+pub static ALLOWED_V4: LpmTrie<LpmDataV4, u8> = LpmTrie::with_max_entries(4096, 0);
 
-/// IPv6 CIDRs that are permitted.
-/// Key type is `[u32; 4]` (four 32-bit words of IPv6 address in network order).
+/// IPv6 CIDRs that are permitted, scoped per-cgroup.
+/// LPM data = (cgroup_id ++ four 32-bit words of IPv6 address in network order).
 #[map]
-pub static ALLOWED_V6: LpmTrie<[u32; 4], u8> = LpmTrie::with_max_entries(4096, 0);
+pub static ALLOWED_V6: LpmTrie<LpmDataV6, u8> = LpmTrie::with_max_entries(4096, 0);
 
-/// IPv4 CIDRs that are always denied (e.g., cloud metadata endpoints).
-/// Checked BEFORE the allow lists.
+/// IPv4 CIDRs that are always denied (e.g., cloud metadata endpoints),
+/// scoped per-cgroup. Checked BEFORE the allow lists.
 #[map]
-pub static BLOCKED_CIDRS_V4: LpmTrie<u32, u8> = LpmTrie::with_max_entries(256, 0);
+pub static BLOCKED_CIDRS_V4: LpmTrie<LpmDataV4, u8> = LpmTrie::with_max_entries(256, 0);
 
-/// IPv6 CIDRs that are always denied.
+/// IPv6 CIDRs that are always denied, scoped per-cgroup.
 #[map]
-pub static BLOCKED_CIDRS_V6: LpmTrie<[u32; 4], u8> = LpmTrie::with_max_entries(256, 0);
+pub static BLOCKED_CIDRS_V6: LpmTrie<LpmDataV6, u8> = LpmTrie::with_max_entries(256, 0);
 
 /// IPv4 IP+port+protocol tuples that are explicitly permitted.
 /// Checked after blocked CIDRs but before broad allowed CIDRs.

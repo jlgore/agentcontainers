@@ -24,6 +24,7 @@ fn test_dns_event_has_domain_hash() {
         uid: 0,
         event_type: EventType::DnsResponse as u32,
         ttl: 300,
+        cgroup_id: 42,
         domain_hash: hash_bytes,
         addr_v4: [0u8; 4],
         addr_v6: [0u8; 16],
@@ -36,12 +37,12 @@ fn test_dns_event_has_domain_hash() {
 
 #[test]
 fn test_dns_event_size_reduced() {
-    // DnsEvent with [u8; 16] hash: 8+4+4+4+4+16+4+16+1+3 = 64 bytes.
+    // DnsEvent with cgroup_id and [u8; 16] hash: 72 bytes.
     // Much smaller than old 304-byte version with [u8; 256] domain.
     let size = core::mem::size_of::<DnsEvent>();
     assert_eq!(
-        size, 64,
-        "DnsEvent should be exactly 64 bytes, got {}",
+        size, 72,
+        "DnsEvent should be exactly 72 bytes, got {}",
         size
     );
 }
@@ -55,6 +56,7 @@ fn test_exec_event_has_binary_path() {
         uid: 0,
         event_type: EventType::ProcessExec as u32,
         verdict: Verdict::Block as u32,
+        cgroup_id: 42,
         inode: 42,
         comm: [0u8; COMM_MAX],
         binary: [0u8; PATH_MAX],

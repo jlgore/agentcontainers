@@ -116,6 +116,21 @@ func runMCPStart(cmd *cobra.Command, port int, sessionID, auditDir string) error
 	if err != nil {
 		return fmt.Errorf("mcp start: %w", err)
 	}
+	var enforcerAudit *mcpproxy.EnforcerAuditSink
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+	if deps.Enforcer != nil {
+		enforcerAudit, err = mcpproxy.NewEnforcerAuditSink(sessionID, auditDir)
+		if err != nil {
+			_ = proxy.Close(ctx)
+			return fmt.Errorf("mcp start: %w", err)
+		}
+		go func() {
+			if err := mcpproxy.StreamEnforcerAudit(streamCtx, deps.Enforcer, enforcerAudit); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
+				logger.Warn("enforcer audit stream stopped", zap.Error(err))
+			}
+		}()
+	}
 
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", port),
@@ -127,6 +142,9 @@ func runMCPStart(cmd *cobra.Command, port int, sessionID, auditDir string) error
 	_, _ = fmt.Fprintf(out, "Session:  %s\n", sessionID)
 	_, _ = fmt.Fprintf(out, "Backends: %s\n", strings.Join(proxy.Backends(), ", "))
 	_, _ = fmt.Fprintf(out, "Audit:    %s\n", proxy.AuditPath())
+	if enforcerAudit != nil {
+		_, _ = fmt.Fprintf(out, "Enforcer: %s\n", enforcerAudit.Path())
+	}
 	_, _ = fmt.Fprintln(out, "Press Ctrl-C to stop.")
 
 	// Serve until interrupted, then tear down backends gracefully.
@@ -154,6 +172,10 @@ func runMCPStart(cmd *cobra.Command, port int, sessionID, auditDir string) error
 	if err := proxy.Close(shutdownCtx); err != nil {
 		return fmt.Errorf("mcp start: shutdown: %w", err)
 	}
+	cancelStream()
+	if enforcerAudit != nil {
+		_ = enforcerAudit.Close()
+	}
 	return nil
 }
 
@@ -175,6 +197,9 @@ func buildMCPDeps(cfg *config.AgentContainer, log *zap.Logger) (mcpproxy.Deps, f
 			needsEnforcer = true
 		case "", "container":
 			needsDocker = true
+			if !mcpEnforcerDisabled(cfg) {
+				needsEnforcer = true
+			}
 		}
 	}
 
@@ -201,6 +226,10 @@ func buildMCPDeps(cfg *config.AgentContainer, log *zap.Logger) (mcpproxy.Deps, f
 	}
 
 	return deps, cleanup, nil
+}
+
+func mcpEnforcerDisabled(cfg *config.AgentContainer) bool {
+	return cfg != nil && cfg.Agent != nil && cfg.Agent.Enforcer != nil && cfg.Agent.Enforcer.Required != nil && !*cfg.Agent.Enforcer.Required
 }
 
 func newMCPPsCmd() *cobra.Command {

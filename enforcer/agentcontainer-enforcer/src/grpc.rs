@@ -175,6 +175,41 @@ impl Enforcer for EnforcerService {
         Ok(Response::new(UnregisterContainerResponse {}))
     }
 
+    async fn prepare_tool_call(
+        &self,
+        request: Request<PrepareToolCallRequest>,
+    ) -> Result<Response<PrepareToolCallResponse>, Status> {
+        let req = request.into_inner();
+        tracing::debug!(
+            container_id = %req.container_id,
+            correlation_id = %req.correlation_id,
+            tool = %req.tool_name,
+            "preparing tool-call correlation window"
+        );
+        self.manager
+            .prepare_tool_call(&req.container_id, &req.correlation_id, &req.tool_name)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(PrepareToolCallResponse {}))
+    }
+
+    async fn complete_tool_call(
+        &self,
+        request: Request<CompleteToolCallRequest>,
+    ) -> Result<Response<CompleteToolCallResponse>, Status> {
+        let req = request.into_inner();
+        tracing::debug!(
+            container_id = %req.container_id,
+            correlation_id = %req.correlation_id,
+            "completing tool-call correlation window"
+        );
+        self.manager
+            .complete_tool_call(&req.container_id, &req.correlation_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(CompleteToolCallResponse {}))
+    }
+
     async fn apply_network_policy(
         &self,
         request: Request<NetworkPolicyRequest>,
@@ -544,6 +579,8 @@ impl Enforcer for EnforcerService {
                     pid: ev.pid,
                     comm: ev.comm,
                     details: ev.details.into_iter().collect(),
+                    cgroup_id: ev.cgroup_id,
+                    correlation_id: ev.correlation_id,
                 };
                 if tx.send(Ok(proto_event)).await.is_err() {
                     break;

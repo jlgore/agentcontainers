@@ -91,7 +91,7 @@ fn bump_fs_stat(idx: u32) {
 
 /// Emit a filesystem block event to the ring buffer.
 #[inline(always)]
-fn emit_fs_block_event(inode_nr: u64, flags: u32) {
+fn emit_fs_block_event(cgroup_id: u64, inode_nr: u64, flags: u32) {
     if let Some(mut buf) = FS_EVENTS.reserve::<FsEvent>(0) {
         let event = buf.as_mut_ptr();
         unsafe {
@@ -105,6 +105,7 @@ fn emit_fs_block_event(inode_nr: u64, flags: u32) {
 
             (*event).event_type = EventType::FsOpen as u32;
             (*event).verdict = Verdict::Block as u32;
+            (*event).cgroup_id = cgroup_id;
             (*event).inode = inode_nr;
             (*event).flags = flags;
             (*event)._pad = 0;
@@ -286,7 +287,7 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
     if unsafe { is_proc_environ(file_ptr) } {
         bump_fs_stat(agentcontainer_common::events::STAT_FS_BLOCKED);
         bump_cgroup_stat(cgid, CGROUP_STAT_FS_BLOCKED);
-        emit_fs_block_event(0, 0);
+        emit_fs_block_event(cgid, 0, 0);
         return Ok(LSM_DENY);
     }
 
@@ -345,6 +346,7 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
         inode: ino,
         dev_major: (s_dev >> 20) & 0xfff,
         dev_minor: s_dev & 0xfffff,
+        cgroup_id: cgid,
     };
 
     // 2a. Credential enforcement: check SECRET_ACLS for per-cgroup secret access.
@@ -395,7 +397,7 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
     if denied.is_some() {
         bump_fs_stat(agentcontainer_common::events::STAT_FS_BLOCKED);
         bump_cgroup_stat(cgid, CGROUP_STAT_FS_BLOCKED);
-        emit_fs_block_event(ino, flags);
+        emit_fs_block_event(cgid, ino, flags);
         return Ok(LSM_DENY);
     }
 
@@ -412,7 +414,7 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
         if write_access && (*perm & FS_PERM_WRITE) == 0 {
             bump_fs_stat(agentcontainer_common::events::STAT_FS_BLOCKED);
             bump_cgroup_stat(cgid, CGROUP_STAT_FS_BLOCKED);
-            emit_fs_block_event(ino, flags);
+            emit_fs_block_event(cgid, ino, flags);
             return Ok(LSM_DENY);
         }
 
@@ -424,6 +426,6 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
     // 4. Default deny.
     bump_fs_stat(agentcontainer_common::events::STAT_FS_BLOCKED);
     bump_cgroup_stat(cgid, CGROUP_STAT_FS_BLOCKED);
-    emit_fs_block_event(ino, flags);
+    emit_fs_block_event(cgid, ino, flags);
     Ok(LSM_DENY)
 }

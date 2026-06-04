@@ -22,6 +22,43 @@ use crate::policy::{
     NetworkPolicy, PolicyManager, ProcessPolicy,
 };
 
+#[derive(Clone, Debug)]
+struct ToolWindow {
+    correlation_id: String,
+    start_ns: u64,
+    end_ns: Option<u64>,
+}
+
+type CorrelationWindows = std::sync::Arc<RwLock<HashMap<u64, Vec<ToolWindow>>>>;
+
+#[cfg(target_os = "linux")]
+fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+    }
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+#[cfg(not(target_os = "linux"))]
+fn monotonic_ns() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+}
+
+fn assign_correlation(event: &mut EnforcementEvent, windows: &CorrelationWindows) {
+    let guard = windows.read().unwrap();
+    let Some(items) = guard.get(&event.cgroup_id) else {
+        return;
+    };
+    for w in items.iter().rev() {
+        if event.timestamp_ns >= w.start_ns && w.end_ns.is_none_or(|end| event.timestamp_ns <= end) {
+            event.correlation_id = w.correlation_id.clone();
+            return;
+        }
+    }
+}
+
 // ===========================================================================
 // Linux implementation — real BPF via aya
 // ===========================================================================
@@ -32,8 +69,8 @@ mod linux {
     use crate::events::{parse_cred_event, parse_exec_event, parse_fs_event, parse_network_event};
     use agentcontainer_common::events as bpf_events;
     use agentcontainer_common::maps::{
-        CgroupStats, FsInodeKey, PortKeyV4, SecretAclKey, SecretAclValue, FS_PERM_READ,
-        FS_PERM_WRITE,
+        CgroupStats, FsInodeKey, LpmDataV4, LpmDataV6, PortKeyV4, SecretAclKey, SecretAclValue,
+        FS_PERM_READ, FS_PERM_WRITE, LPM_CGROUP_PREFIX,
     };
     use aya::maps::lpm_trie::Key as LpmKey;
     use aya::maps::{HashMap as AyaHashMap, LpmTrie, PerCpuHashMap, RingBuf};
@@ -83,6 +120,10 @@ mod linux {
         /// In-memory tracking of which cgroup IDs have been registered,
         /// so we can clean up all related map entries on unregister.
         container_cgroups: RwLock<HashMap<String, u64>>,
+
+        /// Per-cgroup tool-call windows used to attach MCP correlation IDs
+        /// to asynchronous kernel events by event timestamp.
+        correlations: CorrelationWindows,
     }
 
     impl BpfPolicyManager {
@@ -119,6 +160,7 @@ mod linux {
                 registry,
                 event_bus,
                 container_cgroups: RwLock::new(HashMap::new()),
+                correlations: std::sync::Arc::new(RwLock::new(HashMap::new())),
             };
 
             // Spawn background ring buffer readers for all event sources.
@@ -147,6 +189,7 @@ mod linux {
             let programs: &'static std::sync::Mutex<Ebpf> = unsafe { &*programs_ptr };
             let bus = self.event_bus.clone();
             let registry = self.registry.clone();
+            let correlations = self.correlations.clone();
 
             std::thread::Builder::new()
                 .name("event-readers".into())
@@ -169,11 +212,13 @@ mod linux {
                                     if let Ok(ring_buf) = RingBuf::try_from(map_data) {
                                         let b = bus.clone();
                                         let r = registry.clone();
+                                        let c = correlations.clone();
                                         handles.push(tokio::task::spawn_local(async move {
                                             Self::run_ring_buf_reader(
                                                 ring_buf,
                                                 b,
                                                 r,
+                                                c,
                                                 |data, cid| {
                                                     if data.len()
                                                         >= std::mem::size_of::<$event_type>()
@@ -224,7 +269,8 @@ mod linux {
         async fn run_ring_buf_reader<F>(
             mut ring_buf: RingBuf<&aya::maps::MapData>,
             bus: EventBus,
-            _registry: ContainerRegistry,
+            registry: ContainerRegistry,
+            correlations: CorrelationWindows,
             parse: F,
         ) where
             F: Fn(&[u8], &str) -> Option<crate::policy::EnforcementEvent> + Send + 'static,
@@ -261,19 +307,11 @@ mod linux {
                 while let Some(item) = ring_buf.next() {
                     let data: &[u8] = &item;
 
-                    // The cgroup_id is embedded at offset 24 in all our event structs
-                    // (after timestamp_ns:u64, pid:u32, uid:u32, event_type:u32, verdict:u32, inode:u64).
-                    // For CRED_EVENTS it is explicit; for other events we use the registry.
-                    // Here we read a u64 cgroup_id from the CredEvent-specific offset if present,
-                    // otherwise fall back to zero (events that don't carry cgroup_id use
-                    // container_id="" meaning "unknown").
-                    //
-                    // For a cleaner implementation each event type should carry cgroup_id.
-                    // CredEvent does; NetworkEvent, FsEvent, ExecEvent do not yet.
-                    // Until those structs are extended, we resolve with "" (broadcast).
-                    let container_id = "".to_string();
-
-                    if let Some(event) = parse(data, &container_id) {
+                    if let Some(mut event) = parse(data, "") {
+                        if let Some(container_id) = registry.lookup(event.cgroup_id).await {
+                            event.container_id = container_id;
+                        }
+                        assign_correlation(&mut event, &correlations);
                         bus.publish(event);
                     }
                 }
@@ -336,6 +374,102 @@ mod linux {
             let dev_major = ((dev >> 8) & 0xfff) as u32;
             let dev_minor = (dev & 0xff) as u32;
             Ok((meta.ino(), dev_major, dev_minor))
+        }
+
+        /// Remove entries belonging to `cgroup_id` from a hash map whose key
+        /// struct embeds a cgroup_id (extracted via `key_cgroup`).
+        fn cleanup_hash_entries<K: aya::Pod, V: aya::Pod>(
+            bpf: &mut Ebpf,
+            name: &str,
+            cgroup_id: u64,
+            key_cgroup: impl Fn(&K) -> u64,
+        ) {
+            let Some(map_data) = bpf.map_mut(name) else {
+                return;
+            };
+            let Ok(mut map) = AyaHashMap::<_, K, V>::try_from(map_data) else {
+                warn!(map = name, "failed to open map for per-cgroup cleanup");
+                return;
+            };
+            let stale: Vec<K> = map
+                .keys()
+                .filter_map(|k| k.ok())
+                .filter(|k| key_cgroup(k) == cgroup_id)
+                .collect();
+            for key in &stale {
+                if let Err(e) = map.remove(key) {
+                    warn!(map = name, cgroup_id, error = %e, "failed to remove stale entry");
+                }
+            }
+            if !stale.is_empty() {
+                info!(map = name, cgroup_id, removed = stale.len(), "cleaned per-cgroup entries");
+            }
+        }
+
+        /// Remove entries belonging to `cgroup_id` from a per-cgroup LPM trie
+        /// (data payload begins with the 64-bit cgroup_id).
+        fn cleanup_lpm_entries<K: aya::Pod>(
+            bpf: &mut Ebpf,
+            name: &str,
+            cgroup_id: u64,
+            key_cgroup: impl Fn(&K) -> u64,
+        ) {
+            let Some(map_data) = bpf.map_mut(name) else {
+                return;
+            };
+            let Ok(mut map) = LpmTrie::<_, K, u8>::try_from(map_data) else {
+                warn!(map = name, "failed to open map for per-cgroup cleanup");
+                return;
+            };
+            let stale: Vec<LpmKey<K>> = map
+                .keys()
+                .filter_map(|k| k.ok())
+                .filter(|k| key_cgroup(&k.data()) == cgroup_id)
+                .collect();
+            let removed = stale.len();
+            for key in stale {
+                if let Err(e) = map.remove(&key) {
+                    warn!(map = name, cgroup_id, error = %e, "failed to remove stale entry");
+                }
+            }
+            if removed > 0 {
+                info!(map = name, cgroup_id, removed, "cleaned per-cgroup entries");
+            }
+        }
+
+        /// Remove all per-cgroup policy entries for `cgroup_id`.
+        ///
+        /// cgroup IDs are kernfs inode numbers and can be recycled after a
+        /// container exits; a stale entry would hand the prior container's
+        /// policy to whichever cgroup reuses the ID. With per-cgroup map
+        /// keys this cleanup is mandatory, not best-effort.
+        fn cleanup_cgroup_entries(bpf: &mut Ebpf, cgroup_id: u64) {
+            Self::cleanup_lpm_entries::<LpmDataV4>(bpf, "ALLOWED_V4", cgroup_id, |k| k.cgroup_id);
+            Self::cleanup_lpm_entries::<LpmDataV6>(bpf, "ALLOWED_V6", cgroup_id, |k| k.cgroup_id);
+            Self::cleanup_lpm_entries::<LpmDataV4>(bpf, "BLOCKED_CIDRS_V4", cgroup_id, |k| {
+                k.cgroup_id
+            });
+            Self::cleanup_lpm_entries::<LpmDataV6>(bpf, "BLOCKED_CIDRS_V6", cgroup_id, |k| {
+                k.cgroup_id
+            });
+            Self::cleanup_hash_entries::<PortKeyV4, u8>(bpf, "ALLOWED_PORTS", cgroup_id, |k| {
+                k.cgroup_id
+            });
+            Self::cleanup_hash_entries::<FsInodeKey, u8>(bpf, "ALLOWED_INODES", cgroup_id, |k| {
+                k.cgroup_id
+            });
+            Self::cleanup_hash_entries::<FsInodeKey, u8>(bpf, "DENIED_INODES", cgroup_id, |k| {
+                k.cgroup_id
+            });
+            Self::cleanup_hash_entries::<FsInodeKey, u8>(bpf, "ALLOWED_EXECS", cgroup_id, |k| {
+                k.cgroup_id
+            });
+            Self::cleanup_hash_entries::<SecretAclKey, SecretAclValue>(
+                bpf,
+                "SECRET_ACLS",
+                cgroup_id,
+                |k| k.cgroup_id,
+            );
         }
     }
 
@@ -408,18 +542,12 @@ mod linux {
                         }
                     }
 
-                    // Clean up per-cgroup entries in ALLOWED_PORTS (keyed by IP+port, not cgroup,
-                    // so we cannot selectively remove — this is acceptable because policy is
-                    // re-applied on register).
+                    self.correlations.write().unwrap().remove(&cgroup_id);
 
-                    // Clean up SECRET_ACLS entries for this cgroup.
-                    // SecretAclKey includes cgroup_id, but we'd need to iterate all keys.
-                    // For now, log that cleanup is best-effort.
-                    warn!(
-                        cgroup_id,
-                        "per-cgroup cleanup for ALLOWED_PORTS/SECRET_ACLS is best-effort; \
-                         stale entries expire naturally or on next policy apply"
-                    );
+                    // Remove this cgroup's entries from every per-cgroup policy
+                    // map (network LPM tries, ports, inodes, execs, secret ACLs)
+                    // so a recycled cgroup ID cannot inherit stale policy.
+                    Self::cleanup_cgroup_entries(&mut bpf, cgroup_id);
                 } // MutexGuard dropped before await
 
                 self.registry.unregister_container(cgroup_id).await;
@@ -445,13 +573,23 @@ mod linux {
                         let mut bpf = self.programs.lock().unwrap();
                         for addr in addrs {
                             if let std::net::IpAddr::V4(ip) = addr.ip() {
-                                let key = LpmKey::new(32, u32::from(ip).to_be());
+                                // Per-cgroup LPM key: prefix covers all 64 cgroup
+                                // bits plus the full /32 host address.
+                                let key = LpmKey::new(
+                                    LPM_CGROUP_PREFIX + 32,
+                                    LpmDataV4 {
+                                        cgroup_id,
+                                        addr: u32::from(ip).to_be(),
+                                        _pad: 0,
+                                    },
+                                );
                                 let map_data = bpf.map_mut("ALLOWED_V4").ok_or_else(|| {
                                     anyhow::anyhow!("BPF map ALLOWED_V4 not found")
                                 })?;
-                                let mut map: LpmTrie<_, u32, u8> = LpmTrie::try_from(map_data)?;
+                                let mut map: LpmTrie<_, LpmDataV4, u8> =
+                                    LpmTrie::try_from(map_data)?;
                                 map.insert(&key, 1, 0)?;
-                                info!(host, ip = %ip, "added IP to ALLOWED_V4");
+                                info!(host, ip = %ip, cgroup_id, "added IP to ALLOWED_V4");
                             }
                         }
                     }
@@ -477,6 +615,7 @@ mod linux {
                         for addr in addrs {
                             if let std::net::IpAddr::V4(ip) = addr.ip() {
                                 let key = PortKeyV4 {
+                                    cgroup_id,
                                     ip: u32::from(ip).to_be(),
                                     port: rule.port,
                                     protocol: proto,
@@ -532,6 +671,7 @@ mod linux {
                             inode,
                             dev_major,
                             dev_minor,
+                            cgroup_id,
                         };
                         let map_data = bpf
                             .map_mut("ALLOWED_INODES")
@@ -555,6 +695,7 @@ mod linux {
                             inode,
                             dev_major,
                             dev_minor,
+                            cgroup_id,
                         };
                         let map_data = bpf
                             .map_mut("ALLOWED_INODES")
@@ -566,6 +707,31 @@ mod linux {
                     }
                     Err(e) => {
                         warn!(path, error = %e, "failed to resolve write path inode, skipping");
+                    }
+                }
+            }
+
+            // Insert denied paths (checked by the LSM hook BEFORE the allow
+            // list, so a deny entry overrides any allow for the same inode).
+            for path in &policy.deny_paths {
+                match Self::resolve_inode(path) {
+                    Ok((inode, dev_major, dev_minor)) => {
+                        let key = FsInodeKey {
+                            inode,
+                            dev_major,
+                            dev_minor,
+                            cgroup_id,
+                        };
+                        let map_data = bpf
+                            .map_mut("DENIED_INODES")
+                            .ok_or_else(|| anyhow::anyhow!("BPF map DENIED_INODES not found"))?;
+                        let mut map: AyaHashMap<_, FsInodeKey, u8> =
+                            AyaHashMap::try_from(map_data)?;
+                        map.insert(key, 1, 0)?;
+                        info!(path, inode, "added denied inode to DENIED_INODES");
+                    }
+                    Err(e) => {
+                        warn!(path, error = %e, "failed to resolve deny path inode, skipping");
                     }
                 }
             }
@@ -590,6 +756,7 @@ mod linux {
                             inode,
                             dev_major,
                             dev_minor,
+                            cgroup_id,
                         };
                         let map_data = bpf
                             .map_mut("ALLOWED_EXECS")
@@ -721,6 +888,40 @@ mod linux {
         ) -> anyhow::Result<tokio::sync::mpsc::Receiver<EnforcementEvent>> {
             Ok(self.event_bus.subscribe(container_id))
         }
+
+        async fn prepare_tool_call(
+            &self,
+            container_id: &str,
+            correlation_id: &str,
+            _tool_name: &str,
+        ) -> anyhow::Result<()> {
+            let cgroup_id = self.lookup_cgroup(container_id)?;
+            let mut windows = self.correlations.write().unwrap();
+            windows.entry(cgroup_id).or_default().push(ToolWindow {
+                correlation_id: correlation_id.to_string(),
+                start_ns: monotonic_ns(),
+                end_ns: None,
+            });
+            Ok(())
+        }
+
+        async fn complete_tool_call(
+            &self,
+            container_id: &str,
+            correlation_id: &str,
+        ) -> anyhow::Result<()> {
+            let cgroup_id = self.lookup_cgroup(container_id)?;
+            let mut windows = self.correlations.write().unwrap();
+            if let Some(items) = windows.get_mut(&cgroup_id) {
+                for w in items.iter_mut().rev() {
+                    if w.correlation_id == correlation_id && w.end_ns.is_none() {
+                        w.end_ns = Some(monotonic_ns());
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        }
     }
 
     impl BpfPolicyManager {
@@ -757,6 +958,7 @@ mod stub {
         event_bus: EventBus,
         container_cgroups: RwLock<HashMap<String, u64>>,
         next_fake_id: RwLock<u64>,
+        correlations: CorrelationWindows,
     }
 
     impl BpfPolicyManager {
@@ -770,6 +972,7 @@ mod stub {
                 event_bus: EventBus::new(),
                 container_cgroups: RwLock::new(HashMap::new()),
                 next_fake_id: RwLock::new(1),
+                correlations: std::sync::Arc::new(RwLock::new(HashMap::new())),
             })
         }
     }
@@ -811,6 +1014,7 @@ mod stub {
             let cgroup_id = self.container_cgroups.write().unwrap().remove(container_id);
             if let Some(cgroup_id) = cgroup_id {
                 self.registry.unregister_container(cgroup_id).await;
+                self.correlations.write().unwrap().remove(&cgroup_id);
             }
             Ok(())
         }
@@ -879,6 +1083,43 @@ mod stub {
             container_id: &str,
         ) -> anyhow::Result<tokio::sync::mpsc::Receiver<EnforcementEvent>> {
             Ok(self.event_bus.subscribe(container_id))
+        }
+
+        async fn prepare_tool_call(
+            &self,
+            container_id: &str,
+            correlation_id: &str,
+            _tool_name: &str,
+        ) -> anyhow::Result<()> {
+            let cgroup_id = self.lookup_cgroup(container_id)?;
+            self.correlations
+                .write()
+                .unwrap()
+                .entry(cgroup_id)
+                .or_default()
+                .push(ToolWindow {
+                    correlation_id: correlation_id.to_string(),
+                    start_ns: monotonic_ns(),
+                    end_ns: None,
+                });
+            Ok(())
+        }
+
+        async fn complete_tool_call(
+            &self,
+            container_id: &str,
+            correlation_id: &str,
+        ) -> anyhow::Result<()> {
+            let cgroup_id = self.lookup_cgroup(container_id)?;
+            if let Some(items) = self.correlations.write().unwrap().get_mut(&cgroup_id) {
+                for w in items.iter_mut().rev() {
+                    if w.correlation_id == correlation_id && w.end_ns.is_none() {
+                        w.end_ns = Some(monotonic_ns());
+                        break;
+                    }
+                }
+            }
+            Ok(())
         }
     }
 }

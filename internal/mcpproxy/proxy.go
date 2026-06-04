@@ -17,6 +17,7 @@ import (
 
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/audit"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/config"
+	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/enforcerapi"
 )
 
 // proxyImpl identifies the proxy in MCP initialize handshakes.
@@ -448,12 +449,54 @@ func (p *Proxy) handleToolCall(b *Backend, toolName string) mcp.ToolHandler {
 		}
 		defer b.releaseToolSlot()
 
+		if err := p.prepareToolCall(ctx, b, corrID, toolName); err != nil {
+			return nil, err
+		}
+		if shouldCorrelate(b) {
+			defer p.completeToolCall(context.Background(), b, corrID)
+		}
+
 		res, callErr := b.CallTool(ctx, toolName, args, req.Params.GetProgressToken())
 		rec.Verdict = audit.VerdictAllow
 		rec.LatencyMs = time.Since(start).Milliseconds()
 		p.logToolCall(rec)
 
 		return res, callErr
+	}
+}
+
+func shouldCorrelate(b *Backend) bool {
+	return b != nil && b.ContainerID != ""
+}
+
+func (p *Proxy) prepareToolCall(ctx context.Context, b *Backend, corrID, toolName string) error {
+	if !shouldCorrelate(b) || p.deps.Enforcer == nil {
+		return nil
+	}
+	_, err := p.deps.Enforcer.PrepareToolCall(ctx, &enforcerapi.PrepareToolCallRequest{
+		CorrelationId: corrID,
+		ContainerId:   b.ContainerID,
+		ToolName:      toolName,
+	})
+	if err != nil {
+		return fmt.Errorf("mcpproxy: preparing tool-call correlation for %s: %w", b.Name, err)
+	}
+	return nil
+}
+
+func (p *Proxy) completeToolCall(ctx context.Context, b *Backend, corrID string) {
+	if !shouldCorrelate(b) || p.deps.Enforcer == nil {
+		return
+	}
+	if _, err := p.deps.Enforcer.CompleteToolCall(ctx, &enforcerapi.CompleteToolCallRequest{
+		CorrelationId: corrID,
+		ContainerId:   b.ContainerID,
+	}); err != nil {
+		p.deps.Logger.Error("tool-call correlation completion failed",
+			zap.String("correlationId", corrID),
+			zap.String("backend", b.Name),
+			zap.Error(err),
+		)
 	}
 }
 

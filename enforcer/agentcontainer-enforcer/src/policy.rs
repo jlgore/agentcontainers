@@ -40,6 +40,8 @@ pub struct EnforcementStats {
 #[derive(Debug, Clone)]
 pub struct EnforcementEvent {
     pub timestamp_ns: u64,
+    pub cgroup_id: u64,
+    pub correlation_id: String,
     pub container_id: String,
     pub domain: EventDomain,
     pub verdict: EventVerdict,
@@ -131,6 +133,21 @@ pub trait PolicyManager: Send + Sync + 'static {
         &self,
         container_id: &str,
     ) -> anyhow::Result<tokio::sync::mpsc::Receiver<EnforcementEvent>>;
+
+    /// Mark the start of a proxied MCP tool call for event correlation.
+    async fn prepare_tool_call(
+        &self,
+        container_id: &str,
+        correlation_id: &str,
+        tool_name: &str,
+    ) -> anyhow::Result<()>;
+
+    /// Mark the end of a proxied MCP tool call for event correlation.
+    async fn complete_tool_call(
+        &self,
+        container_id: &str,
+        correlation_id: &str,
+    ) -> anyhow::Result<()>;
 }
 
 /// Stub policy manager for macOS and tests. All operations succeed as no-ops.
@@ -199,5 +216,22 @@ impl PolicyManager for StubPolicyManager {
     ) -> anyhow::Result<tokio::sync::mpsc::Receiver<EnforcementEvent>> {
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         Ok(rx)
+    }
+
+    async fn prepare_tool_call(
+        &self,
+        _container_id: &str,
+        _correlation_id: &str,
+        _tool_name: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn complete_tool_call(
+        &self,
+        _container_id: &str,
+        _correlation_id: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
     }
 }

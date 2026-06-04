@@ -5,27 +5,42 @@
 
 // --- Network map keys ---
 
-/// Key for IPv4 LPM trie (longest prefix match).
-/// `prefixlen` MUST be the first field for BPF LPM trie compatibility.
+/// Number of leading LPM prefix bits consumed by the cgroup_id in the
+/// per-cgroup LPM data payloads below. Every insert and lookup MUST use
+/// `prefix_len = LPM_CGROUP_PREFIX + cidr_bits` — a prefix shorter than
+/// 64 would treat the cgroup bits as wildcards and match across cgroups.
+pub const LPM_CGROUP_PREFIX: u32 = 64;
+
+/// LPM trie data payload for IPv4, scoped per-cgroup.
+///
+/// `cgroup_id` MUST be the first field: longest-prefix matching consumes
+/// all 64 cgroup bits before any address bits, so entries for different
+/// cgroups can never cross-match. This is the `data` inside aya's
+/// `Key<K>` wrapper (which supplies `prefix_len`), not the full key.
+/// Size = 16 bytes (`_pad` makes the u64-alignment tail padding explicit
+/// and zeroed; it sits beyond the max 96-bit prefix and never matches).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LpmKeyV4 {
-    pub prefixlen: u32,
+pub struct LpmDataV4 {
+    pub cgroup_id: u64,
     pub addr: u32,
+    pub _pad: u32,
 }
 
-/// Key for IPv6 LPM trie (longest prefix match).
+/// LPM trie data payload for IPv6, scoped per-cgroup.
+/// Size = 24 bytes, no padding. Max prefix = 64 + 128 = 192.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LpmKeyV6 {
-    pub prefixlen: u32,
+pub struct LpmDataV6 {
+    pub cgroup_id: u64,
     pub addr: [u32; 4],
 }
 
-/// Key for the allowed ports hash map (IPv4).
+/// Key for the allowed ports hash map (IPv4), scoped per-cgroup.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PortKeyV4 {
+    pub cgroup_id: u64,
     pub ip: u32,
     pub port: u16,
     pub protocol: u8,
@@ -34,13 +49,16 @@ pub struct PortKeyV4 {
 
 // --- Filesystem map keys ---
 
-/// Key for the filesystem inode allow/deny maps.
+/// Key for the filesystem inode allow/deny maps, scoped per-cgroup.
+/// Field order matches `SecretAclKey` (cgroup_id last) — both are
+/// 24 bytes with identical layout.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FsInodeKey {
     pub inode: u64,
     pub dev_major: u32,
     pub dev_minor: u32,
+    pub cgroup_id: u64,
 }
 
 // --- Credential map keys ---
@@ -114,7 +132,7 @@ mod pod_impls {
     unsafe impl aya::Pod for super::FsInodeKey {}
     unsafe impl aya::Pod for super::SecretAclKey {}
     unsafe impl aya::Pod for super::SecretAclValue {}
-    unsafe impl aya::Pod for super::LpmKeyV4 {}
-    unsafe impl aya::Pod for super::LpmKeyV6 {}
+    unsafe impl aya::Pod for super::LpmDataV4 {}
+    unsafe impl aya::Pod for super::LpmDataV6 {}
     unsafe impl aya::Pod for super::CgroupStats {}
 }

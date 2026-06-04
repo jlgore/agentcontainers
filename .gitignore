@@ -41,3 +41,6 @@ docs/node_modules/
 
 # Git worktrees
 .worktrees/
+
+# Rust build output (enforcer workspace)
+enforcer/target/

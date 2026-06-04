@@ -33,7 +33,7 @@ use agentcontainer_common::events::{NetworkEvent, STAT_NET_ALLOWED, STAT_NET_BLO
 use agentcontainer_common::helpers::{
     extract_v4_from_mapped, is_loopback_v4, is_loopback_v6, is_v4_mapped_v6,
 };
-use agentcontainer_common::maps::PortKeyV4;
+use agentcontainer_common::maps::{LpmDataV4, LpmDataV6, PortKeyV4, LPM_CGROUP_PREFIX};
 
 use crate::maps::{
     bump_cgroup_stat, ALLOWED_PORTS, ALLOWED_V4, ALLOWED_V6, BLOCKED_CIDRS_V4, BLOCKED_CIDRS_V6,
@@ -54,7 +54,7 @@ fn bump_stat(idx: u32) {
 
 /// Emit a block event for an IPv4 connection to the NET_EVENTS ring buffer.
 #[inline(always)]
-fn emit_block_event_v4(dst_ip: u32, dst_port: u16, proto: u8, event_type: u32) {
+fn emit_block_event_v4(cgroup_id: u64, dst_ip: u32, dst_port: u16, proto: u8, event_type: u32) {
     if let Some(mut entry) = NET_EVENTS.reserve::<NetworkEvent>(0) {
         let ev = entry.as_mut_ptr();
         unsafe {
@@ -68,6 +68,7 @@ fn emit_block_event_v4(dst_ip: u32, dst_port: u16, proto: u8, event_type: u32) {
 
             (*ev).event_type = event_type;
             (*ev).verdict = 1; // Block
+            (*ev).cgroup_id = cgroup_id;
 
             (*ev).dst_ip4 = dst_ip;
             (*ev).dst_ip6 = [0, 0, 0, 0];
@@ -86,7 +87,7 @@ fn emit_block_event_v4(dst_ip: u32, dst_port: u16, proto: u8, event_type: u32) {
 
 /// Emit a block event for an IPv6 connection to the NET_EVENTS ring buffer.
 #[inline(always)]
-fn emit_block_event_v6(dst_ip6: [u32; 4], dst_port: u16, proto: u8, event_type: u32) {
+fn emit_block_event_v6(cgroup_id: u64, dst_ip6: [u32; 4], dst_port: u16, proto: u8, event_type: u32) {
     if let Some(mut entry) = NET_EVENTS.reserve::<NetworkEvent>(0) {
         let ev = entry.as_mut_ptr();
         unsafe {
@@ -100,6 +101,7 @@ fn emit_block_event_v6(dst_ip6: [u32; 4], dst_port: u16, proto: u8, event_type: 
 
             (*ev).event_type = event_type;
             (*ev).verdict = 1; // Block
+            (*ev).cgroup_id = cgroup_id;
 
             (*ev).dst_ip4 = 0;
             (*ev).dst_ip6 = dst_ip6;
@@ -160,17 +162,25 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
         None => return Ok(1),
     };
 
-    // 3. Check blocked CIDRs (deny list takes priority).
-    let lpm = Key::new(32, dst);
+    // 3. Check blocked CIDRs (deny list takes priority), scoped per-cgroup.
+    let lpm = Key::new(
+        LPM_CGROUP_PREFIX + 32,
+        LpmDataV4 {
+            cgroup_id,
+            addr: dst,
+            _pad: 0,
+        },
+    );
     if unsafe { BLOCKED_CIDRS_V4.get(&lpm) }.is_some() {
         bump_stat(STAT_NET_BLOCKED);
         bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_BLOCKED);
-        emit_block_event_v4(dst, port, proto, EVENT_NET_CONNECT);
+        emit_block_event_v4(cgroup_id, dst, port, proto, EVENT_NET_CONNECT);
         return Ok(0);
     }
 
     // 4. Check allowed ports (specific IP+port+protocol tuples).
     let pk = PortKeyV4 {
+        cgroup_id,
         ip: dst,
         port,
         protocol: proto,
@@ -192,7 +202,7 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
     // 6. Default deny.
     bump_stat(STAT_NET_BLOCKED);
     bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_BLOCKED);
-    emit_block_event_v4(dst, port, proto, EVENT_NET_CONNECT);
+    emit_block_event_v4(cgroup_id, dst, port, proto, EVENT_NET_CONNECT);
     Ok(0)
 }
 
@@ -236,18 +246,26 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
     //    IPv4 blocked/allowed rules to prevent bypass via dual-stack (RT-C3).
     if is_v4_mapped_v6(&dst6) {
         let v4addr = extract_v4_from_mapped(&dst6);
-        let lpm4 = Key::new(32, v4addr);
+        let lpm4 = Key::new(
+            LPM_CGROUP_PREFIX + 32,
+            LpmDataV4 {
+                cgroup_id,
+                addr: v4addr,
+                _pad: 0,
+            },
+        );
 
         // Check IPv4 blocked CIDRs (metadata endpoint, etc.).
         if unsafe { BLOCKED_CIDRS_V4.get(&lpm4) }.is_some() {
             bump_stat(STAT_NET_BLOCKED);
             bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_BLOCKED);
-            emit_block_event_v6(dst6, port, proto, EVENT_NET_CONNECT);
+            emit_block_event_v6(cgroup_id, dst6, port, proto, EVENT_NET_CONNECT);
             return Ok(0);
         }
 
         // Check IPv4 allowed ports.
         let pk = PortKeyV4 {
+            cgroup_id,
             ip: v4addr,
             port,
             protocol: proto,
@@ -270,12 +288,18 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
         // also have ::ffff-mapped entries for defense-in-depth.
     }
 
-    // 4. Check IPv6 blocked CIDRs.
-    let lpm6 = Key::new(128, dst6);
+    // 4. Check IPv6 blocked CIDRs, scoped per-cgroup.
+    let lpm6 = Key::new(
+        LPM_CGROUP_PREFIX + 128,
+        LpmDataV6 {
+            cgroup_id,
+            addr: dst6,
+        },
+    );
     if unsafe { BLOCKED_CIDRS_V6.get(&lpm6) }.is_some() {
         bump_stat(STAT_NET_BLOCKED);
         bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_BLOCKED);
-        emit_block_event_v6(dst6, port, proto, EVENT_NET_CONNECT);
+        emit_block_event_v6(cgroup_id, dst6, port, proto, EVENT_NET_CONNECT);
         return Ok(0);
     }
 
@@ -289,6 +313,6 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
     // 6. Default deny.
     bump_stat(STAT_NET_BLOCKED);
     bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_BLOCKED);
-    emit_block_event_v6(dst6, port, proto, EVENT_NET_CONNECT);
+    emit_block_event_v6(cgroup_id, dst6, port, proto, EVENT_NET_CONNECT);
     Ok(0)
 }

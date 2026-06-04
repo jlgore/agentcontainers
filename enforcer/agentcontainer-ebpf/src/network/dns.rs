@@ -18,6 +18,7 @@ use siphasher::sip128::{Hasher128, SipHasher24};
 
 use aya_ebpf::macros::cgroup_skb;
 use aya_ebpf::programs::SkBuffContext;
+use aya_ebpf::helpers::bpf_get_current_cgroup_id;
 
 use agentcontainer_common::events::{
     DnsEvent, EventType, DNS_CLASS_IN, DNS_FLAG_QR, DNS_HEADER_SIZE, DNS_PORT, DNS_TYPE_A,
@@ -325,6 +326,7 @@ fn try_parse_dns(ctx: &SkBuffContext) -> Result<(), ()> {
                     zero_dns_event(ev);
                     (*ev).event_type = EventType::DnsResponse as u32;
                     (*ev).ttl = ttl;
+                    (*ev).cgroup_id = bpf_get_current_cgroup_id();
                     (*ev).record_type = DNS_TYPE_A as u8;
                     (*ev).domain_hash = domain_hash;
 
@@ -352,6 +354,7 @@ fn try_parse_dns(ctx: &SkBuffContext) -> Result<(), ()> {
                     zero_dns_event(ev);
                     (*ev).event_type = EventType::DnsResponse as u32;
                     (*ev).ttl = ttl;
+                    (*ev).cgroup_id = bpf_get_current_cgroup_id();
                     (*ev).record_type = DNS_TYPE_AAAA as u8;
                     (*ev).domain_hash = domain_hash;
 

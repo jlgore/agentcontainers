@@ -34,6 +34,7 @@ pub struct NetworkEvent {
     pub uid: u32,
     pub event_type: u32,
     pub verdict: u32,
+    pub cgroup_id: u64,
     pub dst_ip4: u32,
     pub dst_ip6: [u32; 4],
     pub dst_port: u16,
@@ -58,6 +59,7 @@ pub struct DnsEvent {
     pub uid: u32,
     pub event_type: u32,
     pub ttl: u32,
+    pub cgroup_id: u64,
     /// SipHash-2-4 128-bit digest of the lowercased, dot-separated domain name.
     /// Stored as [u8; 16] (native-endian) to avoid u128 alignment padding in repr(C).
     pub domain_hash: [u8; 16],
@@ -79,6 +81,7 @@ pub struct FsEvent {
     pub uid: u32,
     pub event_type: u32,
     pub verdict: u32,
+    pub cgroup_id: u64,
     pub inode: u64,
     pub flags: u32,
     pub _pad: u32,
@@ -94,6 +97,7 @@ pub struct ExecEvent {
     pub uid: u32,
     pub event_type: u32,
     pub verdict: u32,
+    pub cgroup_id: u64,
     pub inode: u64,
     pub comm: [u8; COMM_MAX],
     pub binary: [u8; PATH_MAX],
