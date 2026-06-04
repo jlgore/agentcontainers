@@ -14,6 +14,28 @@ import (
 
 const zeroHash = "0000000000000000000000000000000000000000000000000000000000000000"
 
+// entryVersion is the hash-scheme version written on new entries. Version 1
+// hashes the full canonicalized entry (all fields except EntryHash); the
+// legacy version 0 covered only the chain fields, leaving Metadata and
+// Detail outside the hash.
+const entryVersion = 1
+
+// envAuditDir overrides the default audit directory when set.
+const envAuditDir = "AC_AUDIT_DIR"
+
+// DefaultDir returns the audit directory to use when none is specified:
+// $AC_AUDIT_DIR if set, otherwise ~/.ac/audit.
+func DefaultDir() (string, error) {
+	if dir := os.Getenv(envAuditDir); dir != "" {
+		return dir, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("audit: resolving home directory: %w", err)
+	}
+	return filepath.Join(home, ".ac", "audit"), nil
+}
+
 // Logger provides append-only audit logging with hash chain integrity.
 type Logger struct {
 	mu        sync.Mutex
@@ -47,11 +69,11 @@ func NewLogger(sessionID string, opts ...LoggerOption) (*Logger, error) {
 	}
 
 	if l.dir == "" {
-		home, err := os.UserHomeDir()
+		dir, err := DefaultDir()
 		if err != nil {
-			return nil, fmt.Errorf("audit: resolving home directory: %w", err)
+			return nil, err
 		}
-		l.dir = filepath.Join(home, ".ac", "audit")
+		l.dir = dir
 	}
 
 	if err := os.MkdirAll(l.dir, 0o700); err != nil {
@@ -91,11 +113,17 @@ func WithDetail(detail string) LogEntryOption {
 	return func(e *Entry) { e.Detail = detail }
 }
 
-// WithMetadata adds a key-value pair to the entry metadata.
+// WithMetadata adds a string key-value pair to the entry metadata.
 func WithMetadata(key, value string) LogEntryOption {
+	return WithMetadataAny(key, value)
+}
+
+// WithMetadataAny adds a typed value to the entry metadata. Values must be
+// JSON-serializable; they are covered by the entry hash.
+func WithMetadataAny(key string, value any) LogEntryOption {
 	return func(e *Entry) {
 		if e.Metadata == nil {
-			e.Metadata = make(map[string]string)
+			e.Metadata = make(map[string]any)
 		}
 		e.Metadata[key] = value
 	}
@@ -116,6 +144,7 @@ func (l *Logger) Log(eventType EventType, actor Actor, opts ...LogEntryOption) e
 		Sequence:  l.sequence,
 		EventType: eventType,
 		Actor:     actor,
+		Version:   entryVersion,
 		PrevHash:  l.prevHash,
 	}
 
@@ -123,7 +152,11 @@ func (l *Logger) Log(eventType EventType, actor Actor, opts ...LogEntryOption) e
 		opt(&entry)
 	}
 
-	entry.EntryHash = computeHash(entry)
+	hash, err := computeHash(entry)
+	if err != nil {
+		return err
+	}
+	entry.EntryHash = hash
 
 	data, err := json.Marshal(entry)
 	if err != nil {
@@ -159,8 +192,42 @@ func (l *Logger) Path() string {
 	return filepath.Join(l.dir, l.sessionID+".jsonl")
 }
 
-// computeHash computes the SHA-256 hash for an entry using the chain fields.
-func computeHash(e Entry) string {
+// computeHash computes the SHA-256 hash for an entry, dispatching on the
+// entry's hash-scheme version.
+func computeHash(e Entry) (string, error) {
+	if e.Version >= 1 {
+		return computeHashCanonical(e)
+	}
+	return computeHashLegacy(e), nil
+}
+
+// computeHashCanonical hashes the full entry as canonicalized JSON: the
+// entry is serialized, decoded into generic values, and re-serialized so
+// map keys are emitted in sorted order regardless of the in-memory
+// representation (e.g. int vs. float64 after a JSON round trip). EntryHash
+// is zeroed first, since it is the output of this function.
+func computeHashCanonical(e Entry) (string, error) {
+	e.EntryHash = ""
+	raw, err := json.Marshal(e)
+	if err != nil {
+		return "", fmt.Errorf("audit: canonicalizing entry: %w", err)
+	}
+	var generic any
+	if err := json.Unmarshal(raw, &generic); err != nil {
+		return "", fmt.Errorf("audit: canonicalizing entry: %w", err)
+	}
+	canon, err := json.Marshal(generic)
+	if err != nil {
+		return "", fmt.Errorf("audit: canonicalizing entry: %w", err)
+	}
+	sum := sha256.Sum256(canon)
+	return fmt.Sprintf("%x", sum), nil
+}
+
+// computeHashLegacy is the version-0 scheme: only the chain fields are
+// hashed; Metadata and Detail are not covered. Kept verbatim so logs
+// written before the versioned scheme still verify.
+func computeHashLegacy(e Entry) string {
 	h := sha256.New()
 	_, _ = fmt.Fprintf(h, "%s|%s|%s|%d|%s|%s:%s|%s|%s",
 		e.PrevHash,
@@ -223,7 +290,10 @@ func ValidateChain(entries []Entry) error {
 		}
 
 		// Verify the entry's own hash.
-		expected := computeHash(entry)
+		expected, err := computeHash(entry)
+		if err != nil {
+			return fmt.Errorf("audit: entry %d: %w", i, err)
+		}
 		if entry.EntryHash != expected {
 			return fmt.Errorf("audit: entry %d: hash mismatch: expected %s, got %s", i, expected, entry.EntryHash)
 		}
@@ -241,11 +311,11 @@ func ValidateChain(entries []Entry) error {
 // Each returned path is relative to the audit directory.
 func ListLogs(dir string) ([]string, error) {
 	if dir == "" {
-		home, err := os.UserHomeDir()
+		d, err := DefaultDir()
 		if err != nil {
-			return nil, fmt.Errorf("audit: resolving home directory: %w", err)
+			return nil, err
 		}
-		dir = filepath.Join(home, ".ac", "audit")
+		dir = d
 	}
 
 	entries, err := os.ReadDir(dir)

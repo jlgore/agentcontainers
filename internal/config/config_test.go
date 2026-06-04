@@ -1197,6 +1197,248 @@ func TestValidate_MCPToolType(t *testing.T) {
 	}
 }
 
+// mcpToolCfg wraps a single MCP tool entry in a minimal valid config.
+func mcpToolCfg(name string, tool MCPToolConfig) AgentContainer {
+	return AgentContainer{
+		Name:  "test",
+		Image: "alpine:3",
+		Agent: &AgentConfig{
+			Tools: &ToolsConfig{
+				MCP: map[string]MCPToolConfig{name: tool},
+			},
+		},
+	}
+}
+
+func TestValidate_MCPToolTypeMatrix(t *testing.T) {
+	tests := []struct {
+		name     string
+		tool     MCPToolConfig
+		wantErrs []string // all must be present; empty means valid
+	}{
+		// --- remote happy path and required fields ---
+		{
+			name: "remote happy path",
+			tool: MCPToolConfig{
+				Type: "remote",
+				URL:  "http://192.168.1.20:4624/mcp",
+				Policy: &MCPServerPolicy{
+					AllowedTools:       []string{"run_zimmerman"},
+					RequireApproval:    []string{"run_zimmerman_write"},
+					MaxConcurrentTools: 1,
+				},
+			},
+		},
+		{
+			name:     "remote without url is rejected",
+			tool:     MCPToolConfig{Type: "remote"},
+			wantErrs: []string{`agent.tools.mcp["t"].url: url is required for remote-type tools`},
+		},
+		{
+			name:     "remote with invalid url scheme is rejected",
+			tool:     MCPToolConfig{Type: "remote", URL: "ftp://example.com/mcp"},
+			wantErrs: []string{`agent.tools.mcp["t"].url: invalid URL`},
+		},
+		{
+			name:     "remote with image is rejected",
+			tool:     MCPToolConfig{Type: "remote", URL: "http://h:1/mcp", Image: "x:1"},
+			wantErrs: []string{`agent.tools.mcp["t"].image: image is not valid for remote-type tools`},
+		},
+		{
+			name: "remote with kernel-class policy is rejected per field",
+			tool: MCPToolConfig{
+				Type: "remote",
+				URL:  "http://h:1/mcp",
+				Policy: &MCPServerPolicy{
+					Network:      &NetworkCaps{Deny: []string{"0.0.0.0/0"}},
+					Filesystem:   &FilesystemCaps{Read: []string{"/evidence"}},
+					Shell:        &ShellCaps{Commands: []ShellCommand{{Binary: "fls"}}},
+					SecurityYAML: "security.yaml",
+				},
+			},
+			wantErrs: []string{
+				`agent.tools.mcp["t"].policy.network: network policy is not enforceable for remote-type tools`,
+				`agent.tools.mcp["t"].policy.filesystem: filesystem policy is not enforceable for remote-type tools`,
+				`agent.tools.mcp["t"].policy.shell: shell policy is not enforceable for remote-type tools`,
+				`agent.tools.mcp["t"].policy.securityYaml: securityYaml is not enforceable for remote-type tools`,
+			},
+		},
+		{
+			name: "remote with secrets/command/env/mounts/transport/port is rejected",
+			tool: MCPToolConfig{
+				Type: "remote", URL: "http://h:1/mcp",
+				Secrets: []string{"TOKEN"}, Command: []string{"run"},
+				Env: map[string]string{"A": "b"}, Mounts: []string{"/a:/b"},
+				Transport: "stdio", Port: 80,
+			},
+			wantErrs: []string{
+				`agent.tools.mcp["t"].secrets: secrets are not valid for remote-type tools`,
+				`agent.tools.mcp["t"].command: command is only valid for container-type tools`,
+				`agent.tools.mcp["t"].env: env is only valid for container-type tools`,
+				`agent.tools.mcp["t"].mounts: mounts are not valid for remote-type tools`,
+				`agent.tools.mcp["t"].transport: transport is only valid for container-type tools`,
+				`agent.tools.mcp["t"].port: port is only valid for container-type tools`,
+			},
+		},
+		// --- container transport/port ---
+		{
+			name: "container http transport with port is valid",
+			tool: MCPToolConfig{Image: "x:1", Transport: "http", Port: 8080},
+		},
+		{
+			name:     "container http transport without port is rejected",
+			tool:     MCPToolConfig{Image: "x:1", Transport: "http"},
+			wantErrs: []string{`agent.tools.mcp["t"].port: port must be > 0 when transport is "http"`},
+		},
+		{
+			name:     "container stdio transport with port is rejected",
+			tool:     MCPToolConfig{Image: "x:1", Port: 8080},
+			wantErrs: []string{`agent.tools.mcp["t"].port: port is only valid when transport is "http"`},
+		},
+		{
+			name:     "container invalid transport is rejected",
+			tool:     MCPToolConfig{Image: "x:1", Transport: "grpc"},
+			wantErrs: []string{`agent.tools.mcp["t"].transport: invalid value "grpc"`},
+		},
+		{
+			name: "container full policy is valid",
+			tool: MCPToolConfig{
+				Image:   "ghcr.io/appliedr/sift-gateway:latest",
+				Command: []string{"python", "-m", "sift_gateway"},
+				Env:     map[string]string{"SIFT_CASE_DIR": "/cases/active"},
+				Mounts:  []string{"/opt/zimmerman:/opt/zimmerman:ro"},
+				Secrets: []string{"GITHUB_TOKEN"},
+				Policy: &MCPServerPolicy{
+					MaxConcurrentTools: 1,
+					AllowedTools:       []string{"run_command"},
+					RequireApproval:    []string{"run_privileged_command"},
+					Network:            &NetworkCaps{Deny: []string{"0.0.0.0/0"}},
+					Filesystem:         &FilesystemCaps{Read: []string{"/evidence"}},
+					Shell: &ShellCaps{Commands: []ShellCommand{
+						{Binary: "find", DenyArgs: []string{"-exec", "-delete"}},
+					}},
+					SecurityYAML: "security.yaml",
+				},
+			},
+		},
+		// --- component restrictions ---
+		{
+			name: "component with transport/command/env is rejected",
+			tool: MCPToolConfig{
+				Type: "component", Image: "x:1",
+				Transport: "stdio", Command: []string{"run"}, Env: map[string]string{"A": "b"},
+			},
+			wantErrs: []string{
+				`agent.tools.mcp["t"].transport: transport is only valid for container-type tools`,
+				`agent.tools.mcp["t"].command: command is only valid for container-type tools`,
+				`agent.tools.mcp["t"].env: env is only valid for container-type tools`,
+			},
+		},
+		{
+			name: "component with kernel-class policy is rejected",
+			tool: MCPToolConfig{
+				Type: "component", Image: "x:1",
+				Policy: &MCPServerPolicy{Shell: &ShellCaps{Commands: []ShellCommand{{Binary: "x"}}}},
+			},
+			wantErrs: []string{`agent.tools.mcp["t"].policy.shell: shell policy is not enforceable for component-type tools`},
+		},
+		{
+			name: "component with proxy-level policy is valid",
+			tool: MCPToolConfig{
+				Type: "component", Image: "x:1",
+				Policy: &MCPServerPolicy{AllowedTools: []string{"search_sigma"}},
+			},
+		},
+		// --- shared policy validation ---
+		{
+			name:     "negative maxConcurrentTools is rejected",
+			tool:     MCPToolConfig{Image: "x:1", Policy: &MCPServerPolicy{MaxConcurrentTools: -1}},
+			wantErrs: []string{`agent.tools.mcp["t"].policy.maxConcurrentTools: must be >= 0`},
+		},
+		{
+			name: "policy shell command without binary is rejected",
+			tool: MCPToolConfig{
+				Image:  "x:1",
+				Policy: &MCPServerPolicy{Shell: &ShellCaps{Commands: []ShellCommand{{}}}},
+			},
+			wantErrs: []string{`agent.tools.mcp["t"].policy.shell.commands[0]: binary must not be empty`},
+		},
+		{
+			name: "policy egress rule without host is rejected",
+			tool: MCPToolConfig{
+				Image:  "x:1",
+				Policy: &MCPServerPolicy{Network: &NetworkCaps{Egress: []EgressRule{{Port: 443}}}},
+			},
+			wantErrs: []string{`agent.tools.mcp["t"].policy.network.egress[0]: host must not be empty`},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := mcpToolCfg("t", tt.tool)
+			err := cfg.Validate()
+			if len(tt.wantErrs) == 0 {
+				if err != nil {
+					t.Errorf("Validate() unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Validate() expected errors %v, got nil", tt.wantErrs)
+			}
+			for _, want := range tt.wantErrs {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("Validate() error missing %q\ngot: %v", want, err)
+				}
+			}
+		})
+	}
+}
+
+func TestMCPToolConfig_ShellPolicyShorthand(t *testing.T) {
+	// The §4 example mixes string shorthand and {binary, denyArgs} objects;
+	// both must parse through ShellCommand.UnmarshalJSON.
+	raw := `{
+		"image": "alpine:3",
+		"agent": {"tools": {"mcp": {"sift": {
+			"image": "x:1",
+			"policy": {"shell": {"commands": [
+				"fls", "mmls",
+				{"binary": "find", "denyArgs": ["-exec", "-delete"]}
+			]}}
+		}}}}
+	}`
+	var cfg AgentContainer
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	cmds := cfg.Agent.Tools.MCP["sift"].Policy.Shell.Commands
+	if len(cmds) != 3 {
+		t.Fatalf("expected 3 commands, got %d", len(cmds))
+	}
+	if cmds[0].Binary != "fls" {
+		t.Errorf("commands[0].Binary = %q, want fls", cmds[0].Binary)
+	}
+	if cmds[2].Binary != "find" || len(cmds[2].DenyArgs) != 2 || cmds[2].DenyArgs[0] != "-exec" {
+		t.Errorf("commands[2] = %+v, want find with denyArgs [-exec -delete]", cmds[2])
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate() unexpected error: %v", err)
+	}
+}
+
+func TestMCPToolConfig_RemoteOmitsImage(t *testing.T) {
+	// Remote configs must not emit "image":"" when serialized.
+	tool := MCPToolConfig{Type: "remote", URL: "http://h:1/mcp"}
+	data, err := json.Marshal(tool)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if strings.Contains(string(data), `"image"`) {
+		t.Errorf("serialized remote tool contains image field: %s", data)
+	}
+}
+
 func TestValidate_FromTestdata_ComponentTools(t *testing.T) {
 	tests := []struct {
 		name    string

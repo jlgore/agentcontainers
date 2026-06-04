@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"strings"
 	"text/tabwriter"
@@ -45,11 +44,11 @@ func runAuditList(out io.Writer, dir string) error {
 	}
 
 	if dir == "" {
-		home, err := os.UserHomeDir()
+		d, err := audit.DefaultDir()
 		if err != nil {
 			return fmt.Errorf("audit list: %w", err)
 		}
-		dir = filepath.Join(home, ".ac", "audit")
+		dir = d
 	}
 
 	w := tabwriter.NewWriter(out, 0, 0, 3, ' ', 0)
@@ -206,11 +205,11 @@ func runAuditExport(out io.Writer, dir, sessionID string) error {
 // resolveAuditPath resolves an audit log file path from dir and session ID.
 func resolveAuditPath(dir, sessionID string) (string, error) {
 	if dir == "" {
-		home, err := os.UserHomeDir()
+		d, err := audit.DefaultDir()
 		if err != nil {
 			return "", err
 		}
-		dir = filepath.Join(home, ".ac", "audit")
+		dir = d
 	}
 	return filepath.Join(dir, sessionID+".jsonl"), nil
 }

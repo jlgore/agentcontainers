@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -165,14 +166,21 @@ type ToolsConfig struct {
 }
 
 // MCPToolConfig declares an MCP server tool.
+//
+// Validation is type-driven: each type has an allowlist of valid fields
+// (see validateMCPTool). Remote servers must not declare enforcement the
+// runtime cannot deliver — kernel-class policy fields are validation
+// errors on remote, not silent no-ops.
 type MCPToolConfig struct {
-	// Type is the tool hosting model: "container" (default) or "component" (WASM Component).
-	// When empty, "container" is assumed.
+	// Type is the tool hosting model: "container" (default), "component"
+	// (WASM Component), or "remote" (URL endpoint, no container lifecycle,
+	// proxy-only enforcement). When empty, "container" is assumed.
 	Type string `json:"type,omitempty"`
 
 	// Image is the OCI reference. For "container" type, this is a Docker image.
 	// For "component" type, this is a WASM Component OCI artifact.
-	Image        string   `json:"image"`
+	// Unused (rejected) for "remote" type.
+	Image        string   `json:"image,omitempty"`
 	Capabilities []string `json:"capabilities,omitempty"`
 	Secrets      []string `json:"secrets,omitempty"`
 	// Mounts is only valid for container-type tools. It is rejected on component-type tools.
@@ -181,6 +189,54 @@ type MCPToolConfig struct {
 	// Limits applies resource constraints to WASM Components.
 	// Only valid when Type is "component"; rejected for container-type tools.
 	Limits *ComponentLimits `json:"limits,omitempty"`
+
+	// Transport is the MCP transport for container-type tools:
+	// "stdio" (default) or "http".
+	Transport string `json:"transport,omitempty"`
+
+	// Port is the container port for HTTP transport. Required when
+	// transport is "http". Container type only.
+	Port int `json:"port,omitempty"`
+
+	// URL is the endpoint of a "remote" server. Remote type only.
+	URL string `json:"url,omitempty"`
+
+	// Command overrides the container entrypoint. Container type only.
+	Command []string `json:"command,omitempty"`
+
+	// Env sets environment variables. Container type only.
+	Env map[string]string `json:"env,omitempty"`
+
+	// Policy declares per-server enforcement rules. Valid on all types;
+	// which sub-fields are valid depends on type (see validateMCPTool).
+	Policy *MCPServerPolicy `json:"policy,omitempty"`
+}
+
+// MCPServerPolicy declares per-MCP-server enforcement rules evaluated by
+// the MCP proxy (allowedTools, requireApproval, maxConcurrentTools) and,
+// for container-type servers, kernel-enforced capabilities
+// (network/filesystem/shell) plus an optional security YAML policy file.
+type MCPServerPolicy struct {
+	// AllowedTools filters the server's tool list; empty means all tools.
+	AllowedTools []string `json:"allowedTools,omitempty"`
+
+	// RequireApproval lists tools that pause for human confirmation.
+	RequireApproval []string `json:"requireApproval,omitempty"`
+
+	// MaxConcurrentTools serializes tool calls per server. Defaults to 1.
+	// Shadows the agent-level policy.maxConcurrentTools.
+	MaxConcurrentTools int `json:"maxConcurrentTools,omitempty"`
+
+	// Network/Filesystem/Shell are kernel-class capabilities, valid only
+	// on container-type servers (there is no cgroup to enforce against on
+	// component or remote servers).
+	Network    *NetworkCaps    `json:"network,omitempty"`
+	Filesystem *FilesystemCaps `json:"filesystem,omitempty"`
+	Shell      *ShellCaps      `json:"shell,omitempty"`
+
+	// SecurityYAML is a path to a security policy file, resolved relative
+	// to the config file directory. Container type only.
+	SecurityYAML string `json:"securityYaml,omitempty"`
 }
 
 // ComponentLimits constrains WASM Component resource usage per tool invocation.
@@ -375,35 +431,158 @@ func (c *AgentContainer) Validate() error {
 	// Validate MCP tool entries.
 	if c.Agent != nil && c.Agent.Tools != nil {
 		for name, tool := range c.Agent.Tools.MCP {
-			if tool.Image == "" {
-				errs = append(errs, fmt.Errorf("agent.tools.mcp[%q].image: image must not be empty", name))
+			errs = append(errs, validateMCPTool(name, tool)...)
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+// validateMCPTool enforces the per-type field allowlist for an MCP tool
+// entry. Each type permits a distinct field set:
+//
+//	field                                  container  component  remote
+//	image                                  required   required   rejected
+//	url                                    rejected   rejected   required
+//	transport, port                        ok         rejected   rejected
+//	command, env, mounts                   ok         rejected   rejected
+//	secrets                                ok         ok         rejected
+//	limits                                 rejected   ok         rejected
+//	policy.allowedTools/requireApproval/
+//	  maxConcurrentTools                   ok         ok         ok
+//	policy.network/filesystem/shell/
+//	  securityYaml                         ok         rejected   rejected
+func validateMCPTool(name string, tool MCPToolConfig) []error {
+	var errs []error
+	field := func(f string) string { return fmt.Sprintf("agent.tools.mcp[%q].%s", name, f) }
+
+	switch tool.Type {
+	case "", "container", "component", "remote":
+		// Valid values.
+	default:
+		errs = append(errs, fmt.Errorf("%s: invalid value %q (must be \"container\", \"component\", or \"remote\")", field("type"), tool.Type))
+		return errs
+	}
+	isComponent := tool.Type == "component"
+	isRemote := tool.Type == "remote"
+	isContainer := !isComponent && !isRemote
+
+	// Image: required for container/component, rejected for remote.
+	if isRemote {
+		if tool.Image != "" {
+			errs = append(errs, fmt.Errorf("%s: image is not valid for remote-type tools", field("image")))
+		}
+	} else if tool.Image == "" {
+		errs = append(errs, fmt.Errorf("%s: image must not be empty", field("image")))
+	}
+
+	// URL: required for remote, rejected otherwise.
+	if isRemote {
+		if tool.URL == "" {
+			errs = append(errs, fmt.Errorf("%s: url is required for remote-type tools", field("url")))
+		} else if u, err := url.Parse(tool.URL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			errs = append(errs, fmt.Errorf("%s: invalid URL %q (must be http or https)", field("url"), tool.URL))
+		}
+	} else if tool.URL != "" {
+		errs = append(errs, fmt.Errorf("%s: url is only valid for remote-type tools", field("url")))
+	}
+
+	// Transport/port: container only.
+	if isContainer {
+		switch tool.Transport {
+		case "", "stdio", "http":
+			// Valid values.
+		default:
+			errs = append(errs, fmt.Errorf("%s: invalid value %q (must be \"stdio\" or \"http\")", field("transport"), tool.Transport))
+		}
+		if tool.Transport == "http" && tool.Port <= 0 {
+			errs = append(errs, fmt.Errorf("%s: port must be > 0 when transport is \"http\"", field("port")))
+		}
+		if tool.Transport != "http" && tool.Port != 0 {
+			errs = append(errs, fmt.Errorf("%s: port is only valid when transport is \"http\"", field("port")))
+		}
+	} else {
+		if tool.Transport != "" {
+			errs = append(errs, fmt.Errorf("%s: transport is only valid for container-type tools", field("transport")))
+		}
+		if tool.Port != 0 {
+			errs = append(errs, fmt.Errorf("%s: port is only valid for container-type tools", field("port")))
+		}
+	}
+
+	// Command/env/mounts: container only.
+	if !isContainer {
+		if len(tool.Command) > 0 {
+			errs = append(errs, fmt.Errorf("%s: command is only valid for container-type tools", field("command")))
+		}
+		if len(tool.Env) > 0 {
+			errs = append(errs, fmt.Errorf("%s: env is only valid for container-type tools", field("env")))
+		}
+	}
+	if isComponent && len(tool.Mounts) > 0 {
+		errs = append(errs, fmt.Errorf("%s: mounts are not valid for component-type tools", field("mounts")))
+	}
+	if isRemote && len(tool.Mounts) > 0 {
+		errs = append(errs, fmt.Errorf("%s: mounts are not valid for remote-type tools", field("mounts")))
+	}
+
+	// Secrets: rejected on remote (nothing to inject into).
+	if isRemote && len(tool.Secrets) > 0 {
+		errs = append(errs, fmt.Errorf("%s: secrets are not valid for remote-type tools", field("secrets")))
+	}
+
+	// Limits: component only.
+	if !isComponent && tool.Limits != nil {
+		errs = append(errs, fmt.Errorf("%s: limits are only valid for component-type tools", field("limits")))
+	}
+	if tool.Limits != nil {
+		if tool.Limits.MemoryMB < 0 {
+			errs = append(errs, fmt.Errorf("%s: must be >= 0", field("limits.memory_mb")))
+		}
+		if tool.Limits.TimeoutMs < 0 {
+			errs = append(errs, fmt.Errorf("%s: must be >= 0", field("limits.timeout_ms")))
+		}
+		if tool.Limits.Fuel < 0 {
+			errs = append(errs, fmt.Errorf("%s: must be >= 0", field("limits.fuel")))
+		}
+	}
+
+	// Policy: allowedTools/requireApproval/maxConcurrentTools are valid on
+	// all types; kernel-class fields only on container.
+	if p := tool.Policy; p != nil {
+		if p.MaxConcurrentTools < 0 {
+			errs = append(errs, fmt.Errorf("%s: must be >= 0, got %d", field("policy.maxConcurrentTools"), p.MaxConcurrentTools))
+		}
+		if !isContainer {
+			kind := tool.Type
+			if p.Network != nil {
+				errs = append(errs, fmt.Errorf("%s: network policy is not enforceable for %s-type tools", field("policy.network"), kind))
 			}
-			switch tool.Type {
-			case "", "container", "component":
-				// Valid values.
-			default:
-				errs = append(errs, fmt.Errorf("agent.tools.mcp[%q].type: invalid value %q (must be \"container\" or \"component\")", name, tool.Type))
+			if p.Filesystem != nil {
+				errs = append(errs, fmt.Errorf("%s: filesystem policy is not enforceable for %s-type tools", field("policy.filesystem"), kind))
 			}
-			isComponent := tool.Type == "component"
-			if isComponent && len(tool.Mounts) > 0 {
-				errs = append(errs, fmt.Errorf("agent.tools.mcp[%q].mounts: mounts are not valid for component-type tools", name))
+			if p.Shell != nil {
+				errs = append(errs, fmt.Errorf("%s: shell policy is not enforceable for %s-type tools", field("policy.shell"), kind))
 			}
-			if !isComponent && tool.Limits != nil {
-				errs = append(errs, fmt.Errorf("agent.tools.mcp[%q].limits: limits are only valid for component-type tools", name))
+			if p.SecurityYAML != "" {
+				errs = append(errs, fmt.Errorf("%s: securityYaml is not enforceable for %s-type tools", field("policy.securityYaml"), kind))
 			}
-			if tool.Limits != nil {
-				if tool.Limits.MemoryMB < 0 {
-					errs = append(errs, fmt.Errorf("agent.tools.mcp[%q].limits.memory_mb: must be >= 0", name))
+		}
+		if p.Shell != nil {
+			for i, cmd := range p.Shell.Commands {
+				if cmd.Binary == "" {
+					errs = append(errs, fmt.Errorf("%s: binary must not be empty", field(fmt.Sprintf("policy.shell.commands[%d]", i))))
 				}
-				if tool.Limits.TimeoutMs < 0 {
-					errs = append(errs, fmt.Errorf("agent.tools.mcp[%q].limits.timeout_ms: must be >= 0", name))
-				}
-				if tool.Limits.Fuel < 0 {
-					errs = append(errs, fmt.Errorf("agent.tools.mcp[%q].limits.fuel: must be >= 0", name))
+			}
+		}
+		if p.Network != nil {
+			for i, rule := range p.Network.Egress {
+				if rule.Host == "" {
+					errs = append(errs, fmt.Errorf("%s: host must not be empty", field(fmt.Sprintf("policy.network.egress[%d]", i))))
 				}
 			}
 		}
 	}
 
-	return errors.Join(errs...)
+	return errs
 }

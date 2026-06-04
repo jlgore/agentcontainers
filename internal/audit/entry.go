@@ -12,6 +12,7 @@ const (
 	EventEnforcement EventType = "enforcement"
 	EventSecret      EventType = "secret"
 	EventLifecycle   EventType = "lifecycle"
+	EventToolCall    EventType = "tool_call"
 )
 
 // Actor identifies who triggered an event.
@@ -30,17 +31,23 @@ const (
 )
 
 // Entry is a single audit log record.
+//
+// Version selects the hash scheme: 0 (legacy, absent from JSON) covers only
+// the chain fields; 1 hashes the full canonicalized entry, making Metadata
+// and Detail tamper-evident. New entries are always written at the current
+// version; ValidateChain dispatches per entry so legacy logs still verify.
 type Entry struct {
-	Timestamp time.Time         `json:"timestamp"`
-	SessionID string            `json:"sessionId"`
-	Sequence  uint64            `json:"sequence"`
-	EventType EventType         `json:"eventType"`
-	Actor     Actor             `json:"actor"`
-	Verdict   Verdict           `json:"verdict,omitempty"`
-	Command   string            `json:"command,omitempty"`
-	Resource  string            `json:"resource,omitempty"`
-	Detail    string            `json:"detail,omitempty"`
-	Metadata  map[string]string `json:"metadata,omitempty"`
-	PrevHash  string            `json:"prevHash"`
-	EntryHash string            `json:"entryHash"`
+	Timestamp time.Time      `json:"timestamp"`
+	SessionID string         `json:"sessionId"`
+	Sequence  uint64         `json:"sequence"`
+	EventType EventType      `json:"eventType"`
+	Actor     Actor          `json:"actor"`
+	Verdict   Verdict        `json:"verdict,omitempty"`
+	Command   string         `json:"command,omitempty"`
+	Resource  string         `json:"resource,omitempty"`
+	Detail    string         `json:"detail,omitempty"`
+	Metadata  map[string]any `json:"metadata,omitempty"`
+	Version   int            `json:"v,omitempty"`
+	PrevHash  string         `json:"prevHash"`
+	EntryHash string         `json:"entryHash"`
 }
