@@ -933,6 +933,14 @@ shape is authoritative: ported templates are rewritten from sift's flat
 `input.context.*` (`input.tool` stays the MCP tool name), locked by
 golden-file tests.
 
+Native addition (v6): `filesystem.rego` enforces `policy.filesystem`
+(read/write allowlists + deny patterns, plain prefixes or `/`-delimited
+globs like `/cases/*/extractions`) at the proxy on decomposed argument
+paths — the argument-level layer of the same policy the eBPF enforcer
+applies at the kernel in Phase 3. Device paths are exempt from the read
+allowlist (disk-forensics tools address `/dev` specifiers, governed by
+`path_policy` and the kernel layer).
+
 | Template | Source | What it checks |
 |----------|--------|----------------|
 | `denied_binaries.rego` | YAML `denied_binaries` | Binary in denylist |

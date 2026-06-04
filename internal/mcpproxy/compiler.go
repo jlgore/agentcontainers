@@ -215,6 +215,9 @@ func Compile(sec *SecurityPolicy, cfgPolicy *config.MCPServerPolicy) (*CompiledP
 	}
 
 	pkgs := append([]string(nil), securityPolicyPackages...)
+	if cfgPolicy != nil && cfgPolicy.Filesystem != nil {
+		pkgs = append(pkgs, "filesystem")
+	}
 	if cfgPolicy != nil && cfgPolicy.Shell != nil {
 		pkgs = append(pkgs, "capabilities")
 	}
@@ -257,6 +260,17 @@ func Compile(sec *SecurityPolicy, cfgPolicy *config.MCPServerPolicy) (*CompiledP
 
 	// Merge config-derived data on top of the security.yaml data.
 	data := sec.ToData()
+
+	fsRead, fsWrite, fsDeny := []any{}, []any{}, []any{}
+	if cfgPolicy != nil && cfgPolicy.Filesystem != nil {
+		fsRead = sliceAny(cfgPolicy.Filesystem.Read)
+		fsWrite = sliceAny(cfgPolicy.Filesystem.Write)
+		fsDeny = sliceAny(cfgPolicy.Filesystem.Deny)
+	}
+	data["fs_read"] = fsRead
+	data["fs_write"] = fsWrite
+	data["fs_deny"] = fsDeny
+
 	allowedBinaries := []any{}
 	shellCommands := map[string]any{}
 	if cfgPolicy != nil && cfgPolicy.Shell != nil {

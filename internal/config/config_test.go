@@ -1371,6 +1371,36 @@ func TestValidate_MCPToolTypeMatrix(t *testing.T) {
 			},
 			wantErrs: []string{`agent.tools.mcp["t"].policy.network.egress[0]: host must not be empty`},
 		},
+		{
+			name: "shellTools commandArg with binaryArg is rejected",
+			tool: MCPToolConfig{
+				Image: "x:1",
+				Policy: &MCPServerPolicy{ShellTools: map[string]ShellToolSpec{
+					"run_shell": {CommandArg: "command", BinaryArg: "binary"},
+				}},
+			},
+			wantErrs: []string{`agent.tools.mcp["t"].policy.shellTools["run_shell"]: commandArg and binaryArg/argsArg are mutually exclusive`},
+		},
+		{
+			name: "shellTools commandArg with argsArg is rejected",
+			tool: MCPToolConfig{
+				Image: "x:1",
+				Policy: &MCPServerPolicy{ShellTools: map[string]ShellToolSpec{
+					"run_shell": {CommandArg: "command", ArgsArg: "extra_args"},
+				}},
+			},
+			wantErrs: []string{`agent.tools.mcp["t"].policy.shellTools["run_shell"]: commandArg and binaryArg/argsArg are mutually exclusive`},
+		},
+		{
+			name: "shellTools valid forms are accepted",
+			tool: MCPToolConfig{
+				Image: "x:1",
+				Policy: &MCPServerPolicy{ShellTools: map[string]ShellToolSpec{
+					"run_shell":   {CommandArg: "command"},
+					"run_command": {BinaryArg: "binary", ArgsArg: "extra_args"},
+				}},
+			},
+		},
 	}
 
 	for _, tt := range tests {

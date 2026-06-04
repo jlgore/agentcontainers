@@ -405,6 +405,88 @@ func TestCapabilitiesPackage(t *testing.T) {
 	}
 }
 
+// TestFilesystemPackage exercises the agentcontainers-native filesystem
+// policy (SPEC §4 example shapes: plain prefixes and globs).
+func TestFilesystemPackage(t *testing.T) {
+	cp := compileCanonical(t, &config.MCPServerPolicy{
+		Filesystem: &config.FilesystemCaps{
+			Read:  []string{"/evidence", "/opt", "/usr"},
+			Write: []string{"/cases/*/extractions", "/tmp"},
+			Deny:  []string{"/etc/shadow", "/proc/*/mem"},
+		},
+	})
+	if !slicesContains(cp.PolicyPackages, "filesystem") {
+		t.Fatalf("packages = %v, want filesystem included", cp.PolicyPackages)
+	}
+	ev, err := NewEvaluator(t.Context(), "test-server", cp)
+	if err != nil {
+		t.Fatalf("NewEvaluator: %v", err)
+	}
+	cwd, _ := os.Getwd()
+
+	eval := func(t *testing.T, cmd []string) Decision {
+		t.Helper()
+		parsed := DecomposeCommand(cmd, defaultOutputFlags)
+		d, err := ev.Evaluate(t.Context(), buildTestInput(parsed, "", cwd))
+		if err != nil {
+			t.Fatalf("Evaluate: %v", err)
+		}
+		return d
+	}
+	wantFsReason := func(t *testing.T, d Decision, fragment string) {
+		t.Helper()
+		if d.Allowed {
+			t.Fatalf("expected deny, reasons: %v", d.Reasons)
+		}
+		for _, r := range d.Reasons {
+			if strings.HasPrefix(r, "sift.filesystem:") && strings.Contains(r, fragment) {
+				return
+			}
+		}
+		t.Errorf("reasons = %v, want sift.filesystem reason containing %q", d.Reasons, fragment)
+	}
+
+	// Deny pattern, plain path. (path_policy would also block /etc — the
+	// filesystem reason must be independently present.)
+	wantFsReason(t, eval(t, []string{"strings", "/etc/shadow"}), "denied by filesystem policy")
+
+	// Deny pattern with glob: /proc/*/mem.
+	wantFsReason(t, eval(t, []string{"strings", "/proc/1234/mem"}), "'/proc/*/mem'")
+
+	// Read allowlist: a read outside the allowlist denies.
+	wantFsReason(t, eval(t, []string{"strings", "/cases/c/file.bin"}), "outside the filesystem read allowlist")
+
+	// Read inside the allowlist: allowed.
+	if d := eval(t, []string{"strings", "/evidence/disk1/img.E01"}); !d.Allowed {
+		t.Errorf("read inside allowlist denied: %v", d.Reasons)
+	}
+
+	// Write allowlist: a glob descendant passes the FILESYSTEM package
+	// (the sift-level output_path_policy still denies it without an
+	// active case — layered policies stay independent).
+	d := eval(t, []string{"tool", "-o", "/cases/INC-42/extractions/out.csv"})
+	for _, r := range d.Reasons {
+		if strings.HasPrefix(r, "sift.filesystem:") {
+			t.Errorf("write inside glob allowlist denied by filesystem package: %v", r)
+		}
+	}
+	wantFsReason(t, eval(t, []string{"tool", "-o", "/evidence/out.csv"}), "outside the filesystem write allowlist")
+
+	// Device paths are exempt from the read allowlist.
+	if d := eval(t, []string{"fls", "/dev/sda1"}); !d.Allowed {
+		t.Errorf("device path denied by read allowlist: %v", d.Reasons)
+	}
+}
+
+func slicesContains(s []string, v string) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
 // TestEmptyParsedIsNoOp: a non-shell tool (e.g. record_finding) evaluates
 // with an empty parsed document — no security package fires.
 func TestEmptyParsedIsNoOp(t *testing.T) {
