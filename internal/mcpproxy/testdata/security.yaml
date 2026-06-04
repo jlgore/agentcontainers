@@ -1,0 +1,84 @@
+# Security policy: flags and binaries blocked by the execution sandbox.
+# Loaded by catalog.load_security_policy() and consumed by security.py.
+
+dangerous_flags:
+  - "-e"
+  - "--exec"
+  - "--command"
+  - "-enc"
+  - "-encodedcommand"
+  - "--script"
+  - "--invoke"
+
+tool_allowed_flags:
+  run_bulk_extractor:
+    - "-e"
+    - "-x"
+  grep:
+    - "-e"
+    - "-E"
+  egrep:
+    - "-e"
+    - "-E"
+  zgrep:
+    - "-e"
+    - "-E"
+
+tool_blocked_flags:
+  find:
+    - "-exec"
+    - "-execdir"
+    - "-delete"
+    - "-fls"
+    - "-fprint"
+    - "-fprint0"
+    - "-fprintf"
+  sed:
+    - "-i"
+    - "--in-place"
+  tar:
+    - "-x"
+    - "--extract"
+    - "--get"
+    - "-c"
+    - "--create"
+    - "--delete"
+    - "--append"
+    - "--checkpoint-action"
+    - "--use-compress-program"
+    - "--to-command"
+  unzip:
+    - "-o"
+    - "-n"
+
+output_flags:
+  - "--csv"
+  - "--csvf"
+  - "-o"
+  - "--output"
+  - "--json"
+  - "--jsonl"
+
+denied_binaries:
+  # Filesystem destruction — no forensic use, no unblocked equivalent
+  - "mkfs"
+  - "mkfs.ext4"
+  - "mkfs.xfs"
+  - "mkfs.btrfs"
+  - "mkfs.ntfs"
+  # System state — no forensic use
+  - "shutdown"
+  - "reboot"
+  - "poweroff"
+  - "halt"
+  - "init"
+  # Process termination — timeouts handle hung tools
+  - "kill"
+  - "killall"
+  - "pkill"
+  # Environment leak — dumps gateway tokens
+  - "env"
+  - "printenv"
+  # Raw sockets — no forensic use via run_command
+  - "nc"
+  - "ncat"

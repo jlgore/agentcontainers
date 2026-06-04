@@ -1,0 +1,20 @@
+{{.Header}}
+package sift.dangerous_flags
+
+import rego.v1
+
+# Global dangerous flags, with per-tool exceptions (security.yaml:
+# dangerous_flags + tool_allowed_flags). Mirrors sanitize_extra_args().
+# Split out from sift-mcp's tool_blocked_flags template so it appears as
+# its own entry in policies_evaluated (SPEC §6).
+deny contains msg if {
+	some flag in input.parsed.flags
+	lower(flag) in {lower(d) | some d in data.dangerous_flags}
+	not _has_exception(input.parsed.binary, flag)
+	msg := sprintf("flag '%s' is globally dangerous", [flag])
+}
+
+_has_exception(tool, flag) if {
+	exceptions := data.tool_allowed_flags[tool]
+	lower(flag) in {lower(e) | some e in exceptions}
+}

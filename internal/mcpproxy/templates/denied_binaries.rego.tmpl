@@ -1,0 +1,11 @@
+{{.Header}}
+package sift.denied_binaries
+
+import rego.v1
+
+# Hard denylist — the binary itself is forbidden regardless of args.
+# Mirrors sift-mcp security.is_denied(): case-insensitive membership.
+deny contains msg if {
+	lower(input.parsed.binary) in data.denied_binaries
+	msg := sprintf("binary '%s' is blocked by security policy and cannot be overridden", [input.parsed.binary])
+}

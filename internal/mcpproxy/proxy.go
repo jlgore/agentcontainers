@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -29,6 +30,20 @@ type Options struct {
 	// AuditDir overrides the audit directory (default: $AC_AUDIT_DIR or
 	// ~/.ac/audit).
 	AuditDir string
+
+	// ConfigDir anchors relative policy.securityYaml paths (the directory
+	// containing agentcontainer.json).
+	ConfigDir string
+}
+
+// serverPolicy is the per-server policy machinery compiled at startup:
+// the OPA evaluator plus the decomposition settings it evaluates against.
+// Servers that declare nothing the engine evaluates have no entry and
+// skip Rego entirely (the Go-side allowedTools gate still applies).
+type serverPolicy struct {
+	eval        *Evaluator
+	outputFlags []string
+	shellTools  map[string]config.ShellToolSpec
 }
 
 // Proxy is an MCP reverse proxy: one client-facing mcp.Server aggregating
@@ -43,6 +58,10 @@ type Proxy struct {
 
 	server *mcp.Server
 	audit  *AuditSink
+
+	// policies maps server name to its compiled policy machinery
+	// (immutable after New).
+	policies map[string]*serverPolicy
 
 	mu       sync.Mutex
 	backends map[string]*Backend
@@ -89,6 +108,7 @@ func New(ctx context.Context, deps Deps, cfg *config.AgentContainer, sessionID s
 		cfg:              cfg,
 		sessionID:        sessionID,
 		audit:            sink,
+		policies:         make(map[string]*serverPolicy),
 		backends:         make(map[string]*Backend),
 		toolRoutes:       make(map[string]*Backend),
 		resourceRoutes:   make(map[string]*Backend),
@@ -113,6 +133,30 @@ func New(ctx context.Context, deps Deps, cfg *config.AgentContainer, sessionID s
 		names = append(names, name)
 	}
 	sort.Strings(names)
+
+	// Compile per-server policies before launching anything: a broken
+	// policy must fail startup, not fall open after containers exist.
+	for _, name := range names {
+		tool := cfg.Agent.Tools.MCP[name]
+		cp, err := CompileServerPolicy(tool, opts.ConfigDir)
+		if err != nil {
+			_ = sink.Close()
+			return nil, err
+		}
+		if cp == nil {
+			continue
+		}
+		ev, err := NewEvaluator(ctx, name, cp)
+		if err != nil {
+			_ = sink.Close()
+			return nil, err
+		}
+		sp := &serverPolicy{eval: ev, outputFlags: cp.OutputFlags}
+		if tool.Policy != nil {
+			sp.shellTools = tool.Policy.ShellTools
+		}
+		p.policies[name] = sp
+	}
 
 	for _, name := range names {
 		tool := cfg.Agent.Tools.MCP[name]
@@ -358,48 +402,249 @@ func (p *Proxy) aggregateBackend(ctx context.Context, b *Backend, strict bool) e
 	return nil
 }
 
-// handleToolCall is the proxied tools/call hot path. Phase 1 is
-// allow-passthrough: no policy engine yet, but every call gets a
-// correlation ID and an audit entry. Phase 2 inserts policy evaluation
-// before the forward; Phase 3 brackets it with PrepareToolCall /
-// CompleteToolCall on the enforcer.
+// handleToolCall is the proxied tools/call hot path: decompose the
+// arguments, evaluate the server's compiled policy per sub-command (deny
+// if ANY denies; an engine error fails CLOSED), then forward on allow.
+// Every call gets a correlation ID and an audit entry. Phase 3 brackets
+// the forward with PrepareToolCall / CompleteToolCall on the enforcer.
 func (p *Proxy) handleToolCall(b *Backend, toolName string) mcp.ToolHandler {
 	return func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		corrID := newCorrelationID()
 		args := req.Params.Arguments
-		summary := argsSummary(args)
+		start := time.Now()
+
+		sp := p.policies[b.Name]
+		decision, parsedList := p.evaluatePolicy(ctx, sp, b.Name, toolName, corrID, args)
+		summary := commandSummary(parsedList, args)
+
+		rec := ToolCallRecord{
+			CorrelationID:     corrID,
+			Server:            b.Name,
+			ContainerID:       b.ContainerID,
+			Enforcement:       b.Enforcement(),
+			Tool:              toolName,
+			ArgsSummary:       summary,
+			Reasons:           decision.Reasons,
+			PoliciesEvaluated: decision.PoliciesEvaluated,
+		}
+
+		if !decision.Allowed {
+			rec.Verdict = audit.VerdictDeny
+			rec.LatencyMs = time.Since(start).Milliseconds()
+			p.logToolCall(rec)
+			// Denials are in-band tool results, not protocol errors
+			// (SPEC §6). The client-facing text drops the package
+			// prefixes; the audit metadata keeps them.
+			return &mcp.CallToolResult{
+				IsError: true,
+				Content: []mcp.Content{&mcp.TextContent{
+					Text: "Policy denial: " + strings.Join(deprefixReasons(decision.Reasons), "; "),
+				}},
+			}, nil
+		}
 
 		if err := b.acquireToolSlot(ctx); err != nil {
 			return nil, err
 		}
 		defer b.releaseToolSlot()
 
-		start := time.Now()
 		res, callErr := b.CallTool(ctx, toolName, args, req.Params.GetProgressToken())
-		latency := time.Since(start).Milliseconds()
-
-		rec := ToolCallRecord{
-			CorrelationID: corrID,
-			Server:        b.Name,
-			ContainerID:   b.ContainerID,
-			Enforcement:   b.Enforcement(),
-			Tool:          toolName,
-			ArgsSummary:   summary,
-			Verdict:       audit.VerdictAllow,
-			LatencyMs:     latency,
-		}
-		if err := p.audit.LogToolCall(rec); err != nil {
-			// The call already executed; an audit failure must be loud but
-			// cannot retract the response.
-			p.deps.Logger.Error("audit write failed",
-				zap.String("correlationId", corrID),
-				zap.String("backend", b.Name),
-				zap.Error(err),
-			)
-		}
+		rec.Verdict = audit.VerdictAllow
+		rec.LatencyMs = time.Since(start).Milliseconds()
+		p.logToolCall(rec)
 
 		return res, callErr
 	}
+}
+
+// logToolCall writes the audit entry, loudly surfacing failures (the call
+// outcome is already determined; an audit failure cannot retract it).
+func (p *Proxy) logToolCall(rec ToolCallRecord) {
+	if err := p.audit.LogToolCall(rec); err != nil {
+		p.deps.Logger.Error("audit write failed",
+			zap.String("correlationId", rec.CorrelationID),
+			zap.String("backend", rec.Server),
+			zap.Error(err),
+		)
+	}
+}
+
+// evaluatePolicy decomposes the tool arguments and evaluates each
+// sub-command against the server's compiled policy. Servers without an
+// evaluator allow by construction (nothing declared to evaluate). The
+// overall decision denies if any sub-command denies; reasons are the
+// deduplicated union. An evaluation error fails closed.
+func (p *Proxy) evaluatePolicy(ctx context.Context, sp *serverPolicy, server, toolName, corrID string, args json.RawMessage) (Decision, []Parsed) {
+	if sp == nil {
+		return Decision{Allowed: true}, nil
+	}
+
+	parsedList := decomposeToolArgs(sp, toolName, args)
+	if len(parsedList) == 0 {
+		// Not a shell-like tool: evaluate once with an empty parsed
+		// document. The security packages no-op on it, but the decision
+		// (and policiesEvaluated) is still real and audited.
+		parsedList = []Parsed{{}}
+	}
+
+	pctx := policyContext(corrID)
+	agg := Decision{Allowed: true, PoliciesEvaluated: sp.eval.PoliciesEvaluated()}
+	seen := make(map[string]bool)
+
+	for _, parsed := range parsedList {
+		input := map[string]any{
+			"server":  server,
+			"tool":    toolName,
+			"args":    rawArgsValue(args),
+			"parsed":  parsed.toInput(),
+			"context": pctx,
+		}
+		d, err := sp.eval.Evaluate(ctx, input)
+		if err != nil {
+			// Fail CLOSED: a broken policy engine never falls open.
+			p.deps.Logger.Error("policy evaluation failed",
+				zap.String("backend", server),
+				zap.String("tool", toolName),
+				zap.Error(err),
+			)
+			return Decision{
+				Allowed:           false,
+				Reasons:           []string{"policy engine error: " + err.Error()},
+				PoliciesEvaluated: agg.PoliciesEvaluated,
+			}, parsedList
+		}
+		if !d.Allowed {
+			agg.Allowed = false
+		}
+		for _, r := range d.Reasons {
+			if !seen[r] {
+				seen[r] = true
+				agg.Reasons = append(agg.Reasons, r)
+			}
+		}
+	}
+	return agg, parsedList
+}
+
+// decomposeToolArgs maps an MCP tool's arguments onto shell commands for
+// policy decomposition: an explicit policy.shellTools declaration wins;
+// otherwise the default heuristic treats an argument object with a string
+// "binary" field (plus optional "extra_args" array) as a shell command —
+// the sift-mcp run_command contract. Non-matching tools return nil.
+func decomposeToolArgs(sp *serverPolicy, toolName string, raw json.RawMessage) []Parsed {
+	var argMap map[string]any
+	if err := json.Unmarshal(raw, &argMap); err != nil || argMap == nil {
+		return nil
+	}
+
+	if spec, ok := sp.shellTools[toolName]; ok {
+		if spec.CommandArg != "" {
+			line, _ := argMap[spec.CommandArg].(string)
+			if line == "" {
+				return nil
+			}
+			return DecomposeShellLine(line, sp.outputFlags)
+		}
+		binaryArg := spec.BinaryArg
+		if binaryArg == "" {
+			binaryArg = "binary"
+		}
+		argsArg := spec.ArgsArg
+		if argsArg == "" {
+			argsArg = "extra_args"
+		}
+		return decomposeStructuredArgs(argMap, binaryArg, argsArg, sp.outputFlags)
+	}
+
+	// Default heuristic: the sift-mcp run_command shape.
+	return decomposeStructuredArgs(argMap, "binary", "extra_args", sp.outputFlags)
+}
+
+func decomposeStructuredArgs(argMap map[string]any, binaryArg, argsArg string, outputFlags []string) []Parsed {
+	binary, _ := argMap[binaryArg].(string)
+	if binary == "" {
+		return nil
+	}
+	command := []string{binary}
+	if extra, ok := argMap[argsArg].([]any); ok {
+		for _, a := range extra {
+			if s, ok := a.(string); ok {
+				command = append(command, s)
+			}
+		}
+	}
+	return []Parsed{DecomposeCommand(command, outputFlags)}
+}
+
+// policyContext builds the runtime context for the policy input document
+// (SPEC §5): active case dir, cwd, examiner identity, correlation ID.
+func policyContext(corrID string) map[string]any {
+	cwd, _ := os.Getwd()
+	examiner := os.Getenv("VHIR_EXAMINER")
+	if examiner == "" {
+		examiner = os.Getenv("VHIR_ANALYST")
+	}
+	if examiner == "" {
+		examiner = os.Getenv("USER")
+	}
+	return map[string]any{
+		"case_dir":      os.Getenv("VHIR_CASE_DIR"),
+		"cwd":           cwd,
+		"examiner":      examiner,
+		"correlationId": corrID,
+		"timestamp":     time.Now().UTC().Format(time.RFC3339),
+	}
+}
+
+// rawArgsValue decodes the raw arguments for the policy input's `args`
+// field (generic JSON; empty object when absent).
+func rawArgsValue(raw json.RawMessage) any {
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil || v == nil {
+		return map[string]any{}
+	}
+	return v
+}
+
+// deprefixReasons strips the "sift.<pkg>: " prefixes for the
+// client-facing denial text (SPEC §6 example); audit keeps the prefixed
+// forms.
+func deprefixReasons(reasons []string) []string {
+	out := make([]string, len(reasons))
+	for i, r := range reasons {
+		if strings.HasPrefix(r, "sift.") {
+			if _, rest, ok := strings.Cut(r, ": "); ok {
+				out[i] = rest
+				continue
+			}
+		}
+		out[i] = r
+	}
+	return out
+}
+
+// commandSummary renders the audited command: the decomposed command line
+// when the tool is shell-like (SPEC §7.1 shows "find /evidence -name
+// *.evtx"), the compact raw JSON otherwise.
+func commandSummary(parsedList []Parsed, raw json.RawMessage) string {
+	const maxLen = 512
+	if len(parsedList) > 0 && parsedList[0].Binary != "" {
+		p := parsedList[0]
+		var s string
+		if p.Via == "structured" {
+			s = strings.Join(append([]string{p.Binary}, p.Args...), " ")
+		} else if len(p.Args) > 0 {
+			// shell/fallback segments carry the original raw line last.
+			s = p.Args[len(p.Args)-1]
+		}
+		if len(s) > maxLen {
+			s = s[:maxLen] + "…"
+		}
+		if s != "" {
+			return s
+		}
+	}
+	return argsSummary(raw)
 }
 
 // handleReadResource relays resources/read to the owning backend.

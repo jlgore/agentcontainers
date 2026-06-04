@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -108,7 +109,10 @@ func runMCPStart(cmd *cobra.Command, port int, sessionID, auditDir string) error
 	}
 	defer depCleanup()
 
-	proxy, err := mcpproxy.New(ctx, deps, cfg, sessionID, &mcpproxy.Options{AuditDir: auditDir})
+	proxy, err := mcpproxy.New(ctx, deps, cfg, sessionID, &mcpproxy.Options{
+		AuditDir:  auditDir,
+		ConfigDir: filepath.Dir(cfgPath),
+	})
 	if err != nil {
 		return fmt.Errorf("mcp start: %w", err)
 	}

@@ -237,6 +237,27 @@ type MCPServerPolicy struct {
 	// SecurityYAML is a path to a security policy file, resolved relative
 	// to the config file directory. Container type only.
 	SecurityYAML string `json:"securityYaml,omitempty"`
+
+	// ShellTools declares which of the server's MCP tools take shell
+	// commands as arguments, and how to map the arguments for policy
+	// decomposition. Tools not declared here fall back to a heuristic: an
+	// argument object with a string "binary" field (plus optional
+	// "extra_args" array) is treated as a shell command.
+	ShellTools map[string]ShellToolSpec `json:"shellTools,omitempty"`
+}
+
+// ShellToolSpec maps an MCP tool's arguments onto a shell command for
+// policy decomposition. Either CommandArg (a single free-form command
+// string) or BinaryArg/ArgsArg (pre-tokenized) — not both.
+type ShellToolSpec struct {
+	// BinaryArg names the argument holding the binary (default "binary").
+	BinaryArg string `json:"binaryArg,omitempty"`
+	// ArgsArg names the argument holding the argument array
+	// (default "extra_args").
+	ArgsArg string `json:"argsArg,omitempty"`
+	// CommandArg names an argument holding a free-form shell command
+	// string, parsed with a real shell parser.
+	CommandArg string `json:"commandArg,omitempty"`
 }
 
 // ComponentLimits constrains WASM Component resource usage per tool invocation.
@@ -573,6 +594,11 @@ func validateMCPTool(name string, tool MCPToolConfig) []error {
 				if cmd.Binary == "" {
 					errs = append(errs, fmt.Errorf("%s: binary must not be empty", field(fmt.Sprintf("policy.shell.commands[%d]", i))))
 				}
+			}
+		}
+		for toolName, spec := range p.ShellTools {
+			if spec.CommandArg != "" && (spec.BinaryArg != "" || spec.ArgsArg != "") {
+				errs = append(errs, fmt.Errorf("%s: commandArg and binaryArg/argsArg are mutually exclusive", field(fmt.Sprintf("policy.shellTools[%q]", toolName))))
 			}
 		}
 		if p.Network != nil {

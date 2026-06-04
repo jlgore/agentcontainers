@@ -1,0 +1,16 @@
+{{.Header}}
+package sift.shell_metacharacters
+
+import rego.v1
+
+# Shell metacharacters anywhere in any argument (sift-mcp
+# security.py:_DANGEROUS_PATTERNS). Scans the full args list so substrings
+# like "foo; rm" are caught. (The sift-mcp harness-hook exemption is
+# dropped: the proxy has no harness-hook source; free-form shell strings
+# are decomposed into sub-commands and each is evaluated.)
+deny contains msg if {
+	some arg in input.parsed.args
+	some pattern in data.shell_metacharacters
+	contains(arg, pattern)
+	msg := sprintf("shell metacharacter '%s' detected in argument", [pattern])
+}

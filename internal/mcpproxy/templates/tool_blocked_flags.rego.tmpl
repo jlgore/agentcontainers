@@ -1,0 +1,12 @@
+{{.Header}}
+package sift.tool_blocked_flags
+
+import rego.v1
+
+# Per-tool blocked flags (security.yaml: tool_blocked_flags).
+deny contains msg if {
+	blocked := data.tool_blocked_flags[input.parsed.binary]
+	some flag in input.parsed.flags
+	lower(flag) in {lower(b) | some b in blocked}
+	msg := sprintf("flag '%s' is not permitted on '%s'", [flag, input.parsed.binary])
+}

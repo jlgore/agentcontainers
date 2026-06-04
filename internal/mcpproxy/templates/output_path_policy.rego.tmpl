@@ -1,0 +1,55 @@
+{{.Header}}
+package sift.output_path_policy
+
+import rego.v1
+
+# Output path validation — STATEFUL. The decision depends on runtime
+# context injected at evaluation time: input.context.case_dir and
+# input.context.cwd.
+#
+#   case_dir active -> output MUST be inside the case directory, else deny.
+#   no case_dir     -> allow /tmp and cwd; deny blocked dirs (specific
+#                      message) and everything else (generic message).
+
+# Case dir active: anything outside it is denied.
+deny contains msg if {
+	input.context.case_dir != ""
+	some path in input.parsed.output_paths
+	not _inside(path, input.context.case_dir)
+	msg := sprintf("output path '%s' is outside the case directory '%s'", [path, input.context.case_dir])
+}
+
+# No case dir, output lands in a known-blocked system directory.
+deny contains msg if {
+	input.context.case_dir == ""
+	some path in input.parsed.output_paths
+	not _tmp_or_cwd(path)
+	some blocked in data.blocked_output_dirs
+	_inside(path, blocked)
+	msg := sprintf("output denied: '%s' is inside blocked directory '%s'", [path, blocked])
+}
+
+# No case dir, output is somewhere else not permitted without a case.
+deny contains msg if {
+	input.context.case_dir == ""
+	some path in input.parsed.output_paths
+	not _tmp_or_cwd(path)
+	not _in_blocked_output(path)
+	msg := sprintf("output denied: '%s' — without an active case, output is only allowed in /tmp or the current working directory", [path])
+}
+
+_tmp_or_cwd(path) if _inside(path, "/tmp")
+
+_tmp_or_cwd(path) if {
+	input.context.cwd != ""
+	_inside(path, input.context.cwd)
+}
+
+_in_blocked_output(path) if {
+	some blocked in data.blocked_output_dirs
+	_inside(path, blocked)
+}
+
+_inside(path, dir) if path == dir
+
+_inside(path, dir) if startswith(path, sprintf("%s/", [dir]))

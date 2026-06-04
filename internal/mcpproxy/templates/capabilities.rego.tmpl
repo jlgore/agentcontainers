@@ -1,0 +1,25 @@
+{{.Header}}
+package sift.capabilities
+
+import rego.v1
+
+# agentcontainers-native: binary allowlist + per-binary denied args from
+# agentcontainer.json policy.shell.commands. Overlaps tool_blocked_flags
+# conceptually but sources from the workspace config rather than
+# security.yaml — defense in depth; reasons distinguish the source.
+
+# If a shell allowlist is declared, a decomposed binary must be in it.
+deny contains msg if {
+	count(data.allowed_binaries) > 0
+	input.parsed.binary != ""
+	not lower(input.parsed.binary) in {lower(b) | some b in data.allowed_binaries}
+	msg := sprintf("binary '%s' is not in the shell command allowlist", [input.parsed.binary])
+}
+
+# Per-binary denied args.
+deny contains msg if {
+	denied := data.shell_commands[input.parsed.binary].denyArgs
+	some flag in input.parsed.flags
+	lower(flag) in {lower(d) | some d in denied}
+	msg := sprintf("arg '%s' is denied for '%s'", [flag, input.parsed.binary])
+}

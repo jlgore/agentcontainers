@@ -1,0 +1,11 @@
+{{.Header}}
+package sift.network
+
+import rego.v1
+
+# Informational only (SPEC §12): egress policy is not observable from tool
+# arguments, so this package never denies a tools/call — real network
+# enforcement is the eBPF layer (Phase 3). It exists so the egress policy
+# is visible in policies_evaluated for audit completeness.
+#
+# data.network_egress / data.network_deny carry the declared policy.

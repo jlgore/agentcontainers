@@ -1,0 +1,35 @@
+{{.Header}}
+package sift.rm_protection
+
+import rego.v1
+
+# rm is allowed for general cleanup but blocked inside evidence/case
+# storage and at filesystem root. input.parsed.paths already holds the
+# resolved deletion targets for rm.
+deny contains msg if {
+	input.parsed.binary == "rm"
+	some path in input.parsed.paths
+	some protected in data.protected_rm_dirs
+	_inside(path, protected)
+	msg := sprintf("rm in protected directory '%s'. File deletion in case/evidence directories requires human action outside the AI session.", [protected])
+}
+
+deny contains msg if {
+	input.parsed.binary == "rm"
+	some path in input.parsed.paths
+	path == "/"
+	msg := "rm targeting filesystem root"
+}
+
+# Active case directory, injected at evaluation time via input.context.
+deny contains msg if {
+	input.parsed.binary == "rm"
+	input.context.case_dir != ""
+	some path in input.parsed.paths
+	_inside(path, input.context.case_dir)
+	msg := sprintf("rm in case directory '%s'. File deletion in case/evidence directories requires human action outside the AI session.", [input.context.case_dir])
+}
+
+_inside(path, dir) if path == dir
+
+_inside(path, dir) if startswith(path, sprintf("%s/", [dir]))

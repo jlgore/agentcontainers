@@ -520,6 +520,209 @@ func readFirstLine(path string) ([]byte, error) {
 	return json.Marshal(entries[0])
 }
 
+// newPolicyFixtureServer is a backend exposing a sift-style run_command
+// tool plus a non-shell tool.
+func newPolicyFixtureServer(name string) *mcp.Server {
+	srv := mcp.NewServer(&mcp.Implementation{Name: name, Version: "0.0.1"}, nil)
+	echoHandler := func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: "ran:" + string(req.Params.Arguments)}},
+		}, nil
+	}
+	srv.AddTool(&mcp.Tool{Name: "run_command", InputSchema: map[string]any{"type": "object"}}, echoHandler)
+	srv.AddTool(&mcp.Tool{Name: "run_shell", InputSchema: map[string]any{"type": "object"}}, echoHandler)
+	srv.AddTool(&mcp.Tool{Name: "record_finding", InputSchema: map[string]any{"type": "object"}}, echoHandler)
+	return srv
+}
+
+// policyTestProxy builds a proxy whose backend carries the canonical
+// security.yaml policy (the proxy compiles policy regardless of backend
+// type, so the in-process remote fixture exercises the full wiring).
+func policyTestProxy(t *testing.T) (*Proxy, *mcp.ClientSession) {
+	t.Helper()
+	url := startBackendHTTP(t, newPolicyFixtureServer("sift-gateway"))
+	cfg := remoteCfg(map[string]config.MCPToolConfig{
+		"sift-gateway": {
+			Type: "remote",
+			URL:  url,
+			Policy: &config.MCPServerPolicy{
+				SecurityYAML: "testdata/security.yaml",
+				ShellTools: map[string]config.ShellToolSpec{
+					"run_shell": {CommandArg: "command"},
+				},
+			},
+		},
+	})
+	p := newTestProxy(t, cfg, Deps{})
+	return p, connectClient(t, p)
+}
+
+func TestProxyPolicyDenial(t *testing.T) {
+	p, session := policyTestProxy(t)
+
+	// The SPEC §6 example through the full proxy path.
+	res, err := session.CallTool(t.Context(), &mcp.CallToolParams{
+		Name: "run_command",
+		Arguments: map[string]any{
+			"binary":     "find",
+			"extra_args": []string{"/evidence", "-exec", "rm", "{}", ";"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("expected isError denial")
+	}
+	text := res.Content[0].(*mcp.TextContent).Text
+	if !strings.HasPrefix(text, "Policy denial: ") {
+		t.Errorf("denial text = %q", text)
+	}
+	// Client-facing text is de-prefixed.
+	if strings.Contains(text, "sift.") {
+		t.Errorf("denial text leaks package prefixes: %q", text)
+	}
+	if !strings.Contains(text, "-exec") || !strings.Contains(text, "shell metacharacter") {
+		t.Errorf("denial text = %q, want -exec and metachar reasons", text)
+	}
+
+	// Audit entry: deny verdict, prefixed reasons, policiesEvaluated.
+	entries, err := audit.ReadLog(p.AuditPath())
+	if err != nil {
+		t.Fatalf("ReadLog: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 audit entry, got %d", len(entries))
+	}
+	e := entries[0]
+	if e.Verdict != audit.VerdictDeny {
+		t.Errorf("verdict = %q, want deny", e.Verdict)
+	}
+	if !strings.Contains(e.Command, "find /evidence -exec rm {} ;") {
+		t.Errorf("command = %q, want decomposed command line", e.Command)
+	}
+	reasons, _ := e.Metadata["reasons"].([]any)
+	if len(reasons) == 0 {
+		t.Fatal("audit reasons empty")
+	}
+	var prefixed bool
+	for _, r := range reasons {
+		if strings.HasPrefix(r.(string), "sift.") {
+			prefixed = true
+		}
+	}
+	if !prefixed {
+		t.Errorf("audit reasons lost package prefixes: %v", reasons)
+	}
+	pols, _ := e.Metadata["policiesEvaluated"].([]any)
+	if len(pols) != 8 {
+		t.Errorf("policiesEvaluated = %v, want 8 packages", pols)
+	}
+	if err := audit.ValidateChain(entries); err != nil {
+		t.Errorf("ValidateChain: %v", err)
+	}
+}
+
+func TestProxyPolicyAllow(t *testing.T) {
+	p, session := policyTestProxy(t)
+
+	res, err := session.CallTool(t.Context(), &mcp.CallToolParams{
+		Name: "run_command",
+		Arguments: map[string]any{
+			"binary":     "fls",
+			"extra_args": []string{"/cases/c/img.dd"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected allow, got error: %v", res.Content)
+	}
+
+	entries, err := audit.ReadLog(p.AuditPath())
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("entries=%d err=%v", len(entries), err)
+	}
+	if entries[0].Verdict != audit.VerdictAllow {
+		t.Errorf("verdict = %q, want allow", entries[0].Verdict)
+	}
+	if pols, _ := entries[0].Metadata["policiesEvaluated"].([]any); len(pols) != 8 {
+		t.Errorf("allow entry policiesEvaluated = %v", pols)
+	}
+}
+
+func TestProxyPolicyShellToolFreeForm(t *testing.T) {
+	_, session := policyTestProxy(t)
+
+	// run_shell is declared commandArg: a compound free-form line is
+	// decomposed and denied (rm in /evidence + metachar from raw line).
+	res, err := session.CallTool(t.Context(), &mcp.CallToolParams{
+		Name:      "run_shell",
+		Arguments: map[string]any{"command": "ls /cases && rm -rf /evidence"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("expected denial of compound shell line")
+	}
+	text := res.Content[0].(*mcp.TextContent).Text
+	if !strings.Contains(text, "rm in protected directory") {
+		t.Errorf("denial text = %q, want rm protection reason", text)
+	}
+}
+
+func TestProxyPolicyNonShellToolPasses(t *testing.T) {
+	_, session := policyTestProxy(t)
+
+	// record_finding has no binary arg: empty parsed document, policy
+	// no-ops, the call forwards.
+	res, err := session.CallTool(t.Context(), &mcp.CallToolParams{
+		Name:      "record_finding",
+		Arguments: map[string]any{"title": "Mimikatz found; ${weird} chars don't matter here"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("expected allow for non-shell tool, got: %v", res.Content)
+	}
+}
+
+func TestDecomposeToolArgs(t *testing.T) {
+	sp := &serverPolicy{
+		outputFlags: defaultOutputFlags,
+		shellTools: map[string]config.ShellToolSpec{
+			"custom": {BinaryArg: "prog", ArgsArg: "argv"},
+			"shelly": {CommandArg: "line"},
+		},
+	}
+
+	// Default heuristic: binary + extra_args.
+	got := decomposeToolArgs(sp, "run_command", json.RawMessage(`{"binary":"fls","extra_args":["/x"]}`))
+	if len(got) != 1 || got[0].Binary != "fls" {
+		t.Errorf("default heuristic = %+v", got)
+	}
+
+	// Explicit mapping.
+	got = decomposeToolArgs(sp, "custom", json.RawMessage(`{"prog":"mmls","argv":["/dev/sda"]}`))
+	if len(got) != 1 || got[0].Binary != "mmls" {
+		t.Errorf("custom mapping = %+v", got)
+	}
+
+	// Free-form command string.
+	got = decomposeToolArgs(sp, "shelly", json.RawMessage(`{"line":"a | b"}`))
+	if len(got) != 2 {
+		t.Errorf("free-form = %+v", got)
+	}
+
+	// Non-shell tool: nil.
+	if got := decomposeToolArgs(sp, "record_finding", json.RawMessage(`{"title":"x"}`)); got != nil {
+		t.Errorf("non-shell = %+v, want nil", got)
+	}
+}
+
 func TestToolAllowed(t *testing.T) {
 	if !toolAllowed(nil, "anything") {
 		t.Error("nil policy must allow")

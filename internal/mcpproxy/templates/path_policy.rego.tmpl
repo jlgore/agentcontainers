@@ -1,0 +1,25 @@
+{{.Header}}
+package sift.path_policy
+
+import rego.v1
+
+# Input path validation: block reads from sensitive system dirs, except
+# evidence-data exceptions. input.parsed.paths holds the resolved input
+# paths; /dev specifiers for disk-forensics tools are already excluded by
+# the decomposer (they land in input.parsed.device_paths).
+deny contains msg if {
+	some path in input.parsed.paths
+	some blocked in data.blocked_input_dirs
+	_inside(path, blocked)
+	not _exception(path)
+	msg := sprintf("input path '%s' is inside blocked system directory '%s'", [path, blocked])
+}
+
+_exception(path) if {
+	some exc in data.blocked_input_exceptions
+	_inside(path, exc)
+}
+
+_inside(path, dir) if path == dir
+
+_inside(path, dir) if startswith(path, sprintf("%s/", [dir]))
