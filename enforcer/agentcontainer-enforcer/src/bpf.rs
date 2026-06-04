@@ -69,12 +69,15 @@ mod linux {
     use crate::events::{parse_cred_event, parse_exec_event, parse_fs_event, parse_network_event};
     use agentcontainer_common::events as bpf_events;
     use agentcontainer_common::maps::{
-        CgroupStats, FsInodeKey, LpmDataV4, LpmDataV6, PortKeyV4, SecretAclKey, SecretAclValue,
-        FS_PERM_READ, FS_PERM_WRITE, LPM_CGROUP_PREFIX,
+        CgroupStats, DomainKey, FsInodeKey, LpmDataV4, LpmDataV6, PortKeyV4, SecretAclKey,
+        SecretAclValue, FS_PERM_READ, FS_PERM_WRITE, LPM_CGROUP_PREFIX,
     };
+    use agentcontainer_common::siphash::{siphash128_bytes, SipHashKey};
     use aya::maps::lpm_trie::Key as LpmKey;
-    use aya::maps::{HashMap as AyaHashMap, LpmTrie, PerCpuHashMap, RingBuf};
-    use aya::Ebpf;
+    use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, LpmTrie, PerCpuHashMap, RingBuf};
+    use aya::programs::{CgroupAttachMode, CgroupSkb, CgroupSkbAttachType, CgroupSockAddr, Lsm};
+    use aya::{Btf, Ebpf};
+    use std::io::Read;
     use std::os::unix::fs::MetadataExt;
 
     /// Well-known paths where the BPF ELF may be found, in priority order.
@@ -124,6 +127,11 @@ mod linux {
         /// Per-cgroup tool-call windows used to attach MCP correlation IDs
         /// to asynchronous kernel events by event timestamp.
         correlations: CorrelationWindows,
+
+        /// SipHash-2-4 key shared with the BPF DNS parser (written to the
+        /// SIPHASH_KEY map at startup). Used to hash policy domains when
+        /// populating TRACKED_DOMAINS.
+        siphash_key: SipHashKey,
     }
 
     impl BpfPolicyManager {
@@ -150,7 +158,16 @@ mod linux {
                 warn!("BPF logger initialization failed (non-fatal): {e}");
             }
 
-            info!("BPF programs loaded successfully");
+            // Attach the programs — Ebpf::load only places them in the
+            // kernel; nothing enforces until each program is attached.
+            Self::attach_programs(&mut bpf)?;
+
+            // Generate and publish the SipHash key shared with the BPF DNS
+            // parser. Kept on the manager so apply_network can hash policy
+            // domains identically when populating TRACKED_DOMAINS.
+            let siphash_key = Self::init_siphash_key(&mut bpf)?;
+
+            info!("BPF programs loaded and attached successfully");
 
             let registry = ContainerRegistry::new();
             let event_bus = EventBus::new();
@@ -161,12 +178,118 @@ mod linux {
                 event_bus,
                 container_cgroups: RwLock::new(HashMap::new()),
                 correlations: std::sync::Arc::new(RwLock::new(HashMap::new())),
+                siphash_key,
             };
 
             // Spawn background ring buffer readers for all event sources.
             mgr.spawn_event_readers();
 
             Ok(mgr)
+        }
+
+        /// Attach all BPF programs.
+        ///
+        /// Network hooks (connect4/6, sendmsg4/6) and the DNS parser attach
+        /// to the cgroup2 root — they self-filter via ENFORCED_CGROUPS, so
+        /// non-registered cgroups pay one map lookup and pass through.
+        /// `AllowMultiple` so we coexist with other cgroup BPF programs
+        /// (e.g. systemd socket filtering).
+        ///
+        /// LSM hooks (file_open, bprm_check) attach system-wide via BTF.
+        /// LSM attach failure is tolerated with a loud warning: kernels
+        /// without CONFIG_BPF_LSM (or "bpf" missing from the lsm= cmdline)
+        /// can still enforce the network boundary.
+        fn attach_programs(bpf: &mut Ebpf) -> anyhow::Result<()> {
+            let cgroup = std::fs::File::open("/sys/fs/cgroup")
+                .map_err(|e| anyhow::anyhow!("opening cgroup2 root /sys/fs/cgroup: {e}"))?;
+
+            for name in ["ac_connect4", "ac_connect6", "ac_sendmsg4", "ac_sendmsg6"] {
+                let prog: &mut CgroupSockAddr = bpf
+                    .program_mut(name)
+                    .ok_or_else(|| anyhow::anyhow!("BPF program {name} not found"))?
+                    .try_into()
+                    .map_err(|e| anyhow::anyhow!("program {name} type mismatch: {e}"))?;
+                prog.load()
+                    .map_err(|e| anyhow::anyhow!("loading {name}: {e}"))?;
+                prog.attach(&cgroup, CgroupAttachMode::AllowMultiple)
+                    .map_err(|e| anyhow::anyhow!("attaching {name} to cgroup root: {e}"))?;
+                info!(program = name, "attached network enforcement hook");
+            }
+
+            let dns: &mut CgroupSkb = bpf
+                .program_mut("ac_dns_ingress")
+                .ok_or_else(|| anyhow::anyhow!("BPF program ac_dns_ingress not found"))?
+                .try_into()
+                .map_err(|e| anyhow::anyhow!("program ac_dns_ingress type mismatch: {e}"))?;
+            dns.load()
+                .map_err(|e| anyhow::anyhow!("loading ac_dns_ingress: {e}"))?;
+            dns.attach(
+                &cgroup,
+                CgroupSkbAttachType::Ingress,
+                CgroupAttachMode::AllowMultiple,
+            )
+            .map_err(|e| anyhow::anyhow!("attaching ac_dns_ingress: {e}"))?;
+            info!("attached DNS observation hook");
+
+            match Btf::from_sys_fs() {
+                Ok(btf) => {
+                    for (name, hook) in [
+                        ("ac_file_open", "file_open"),
+                        ("ac_bprm_check", "bprm_check_security"),
+                    ] {
+                        let attach = (|| -> anyhow::Result<()> {
+                            let prog: &mut Lsm = bpf
+                                .program_mut(name)
+                                .ok_or_else(|| anyhow::anyhow!("BPF program {name} not found"))?
+                                .try_into()
+                                .map_err(|e| anyhow::anyhow!("type mismatch: {e}"))?;
+                            prog.load(hook, &btf)
+                                .map_err(|e| anyhow::anyhow!("loading: {e}"))?;
+                            prog.attach()
+                                .map_err(|e| anyhow::anyhow!("attaching: {e}"))?;
+                            Ok(())
+                        })();
+                        match attach {
+                            Ok(()) => info!(program = name, hook, "attached LSM hook"),
+                            Err(e) => warn!(
+                                program = name,
+                                hook,
+                                error = %e,
+                                "LSM hook NOT attached — kernel deny-list filesystem/exec \
+                                 enforcement and exec audit events are inactive (requires \
+                                 CONFIG_BPF_LSM and 'bpf' in the lsm= kernel cmdline)"
+                            ),
+                        }
+                    }
+                }
+                Err(e) => warn!(
+                    error = %e,
+                    "BTF unavailable — LSM hooks not attached; kernel deny-list \
+                     filesystem/exec enforcement and exec audit events are inactive"
+                ),
+            }
+
+            Ok(())
+        }
+
+        /// Generate a random SipHash-2-4 key and write it to the SIPHASH_KEY
+        /// map so the BPF DNS parser and userspace hash domains identically.
+        fn init_siphash_key(bpf: &mut Ebpf) -> anyhow::Result<SipHashKey> {
+            let mut kb = [0u8; 16];
+            std::fs::File::open("/dev/urandom")
+                .and_then(|mut f| f.read_exact(&mut kb))
+                .map_err(|e| anyhow::anyhow!("reading /dev/urandom for SipHash key: {e}"))?;
+            let key = SipHashKey {
+                k0: u64::from_ne_bytes(kb[..8].try_into().unwrap()),
+                k1: u64::from_ne_bytes(kb[8..].try_into().unwrap()),
+            };
+
+            let map_data = bpf
+                .map_mut("SIPHASH_KEY")
+                .ok_or_else(|| anyhow::anyhow!("BPF map SIPHASH_KEY not found"))?;
+            let mut map: AyaArray<_, SipHashKey> = AyaArray::try_from(map_data)?;
+            map.set(0, key, 0)?;
+            Ok(key)
         }
 
         /// Spawn background tasks that drain all BPF ring buffers and publish
@@ -437,6 +560,33 @@ mod linux {
             }
         }
 
+        /// Insert a policy host into TRACKED_DOMAINS for DNS observation.
+        /// IP literals are skipped (they never appear in DNS questions).
+        /// The hash matches the BPF DNS parser: SipHash-2-4 over the
+        /// lowercased dotted name without a trailing dot.
+        fn track_domain(
+            bpf: &mut Ebpf,
+            sip_key: &SipHashKey,
+            cgroup_id: u64,
+            host: &str,
+        ) -> anyhow::Result<()> {
+            if host.is_empty() || host.parse::<std::net::IpAddr>().is_ok() {
+                return Ok(());
+            }
+            let canon = host.trim_end_matches('.').to_ascii_lowercase();
+            let key = DomainKey {
+                cgroup_id,
+                hash: siphash128_bytes(sip_key, canon.as_bytes()),
+            };
+            let map_data = bpf
+                .map_mut("TRACKED_DOMAINS")
+                .ok_or_else(|| anyhow::anyhow!("BPF map TRACKED_DOMAINS not found"))?;
+            let mut map: AyaHashMap<_, DomainKey, u8> = AyaHashMap::try_from(map_data)?;
+            map.insert(key, 1, 0)?;
+            info!(host = %canon, cgroup_id, "tracking domain for DNS observation");
+            Ok(())
+        }
+
         /// Remove all per-cgroup policy entries for `cgroup_id`.
         ///
         /// cgroup IDs are kernfs inode numbers and can be recycled after a
@@ -470,6 +620,9 @@ mod linux {
                 cgroup_id,
                 |k| k.cgroup_id,
             );
+            Self::cleanup_hash_entries::<DomainKey, u8>(bpf, "TRACKED_DOMAINS", cgroup_id, |k| {
+                k.cgroup_id
+            });
         }
     }
 
@@ -565,6 +718,24 @@ mod linux {
         ) -> anyhow::Result<()> {
             let cgroup_id = self.lookup_cgroup(container_id)?;
             info!(container_id, cgroup_id, hosts = ?policy.allowed_hosts, "applying network policy to BPF maps");
+
+            // Track hostname-typed policy entries for DNS observation: the
+            // BPF DNS parser only emits events for (cgroup_id, domain_hash)
+            // pairs present in TRACKED_DOMAINS.
+            {
+                let mut bpf = self.programs.lock().unwrap();
+                let hosts = policy
+                    .allowed_hosts
+                    .iter()
+                    .chain(policy.egress_rules.iter().map(|r| &r.host));
+                for host in hosts {
+                    if let Err(e) =
+                        Self::track_domain(&mut bpf, &self.siphash_key, cgroup_id, host)
+                    {
+                        warn!(host, error = %e, "failed to add domain to TRACKED_DOMAINS");
+                    }
+                }
+            }
 
             // Resolve allowed_hosts to IPs and insert into ALLOWED_V4 LPM trie.
             for host in &policy.allowed_hosts {

@@ -79,6 +79,10 @@ type Proxy struct {
 	backendResources map[string][]string
 	backendTemplates map[string][]string
 	backendPrompts   map[string][]string
+
+	// refreshCancel stops the periodic network-policy hostname
+	// re-resolution goroutine (nil when no enforcer is connected).
+	refreshCancel context.CancelFunc
 }
 
 // New connects all configured MCP backends, aggregates their tools,
@@ -177,6 +181,15 @@ func New(ctx context.Context, deps Deps, cfg *config.AgentContainer, sessionID s
 		}
 	}
 
+	// Periodically re-resolve network policy hostnames so kernel egress
+	// rules track CDN/cloud IP rotation across long forensic sessions.
+	// Bound to the proxy lifetime (not the startup ctx).
+	if deps.Enforcer != nil {
+		refreshCtx, cancel := context.WithCancel(context.Background())
+		p.refreshCancel = cancel
+		go p.refreshNetworkPolicies(refreshCtx)
+	}
+
 	return p, nil
 }
 
@@ -204,6 +217,9 @@ func (p *Proxy) Backends() []string {
 
 // Close tears down all backends and the audit sink.
 func (p *Proxy) Close(ctx context.Context) error {
+	if p.refreshCancel != nil {
+		p.refreshCancel()
+	}
 	p.mu.Lock()
 	backends := make([]*Backend, 0, len(p.backends))
 	for _, b := range p.backends {

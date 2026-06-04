@@ -47,6 +47,16 @@ pub struct PortKeyV4 {
     pub _pad: u8,
 }
 
+/// Key for the tracked-domains DNS observation map, scoped per-cgroup.
+/// `hash` is the SipHash-2-4 128-bit digest of the lowercased dotted
+/// domain name (see `siphash::DomainHasher`). Size = 24 bytes, no padding.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DomainKey {
+    pub cgroup_id: u64,
+    pub hash: [u8; 16],
+}
+
 // --- Filesystem map keys ---
 
 /// Key for the filesystem inode allow/deny maps, scoped per-cgroup.
@@ -134,5 +144,7 @@ mod pod_impls {
     unsafe impl aya::Pod for super::SecretAclValue {}
     unsafe impl aya::Pod for super::LpmDataV4 {}
     unsafe impl aya::Pod for super::LpmDataV6 {}
+    unsafe impl aya::Pod for super::DomainKey {}
     unsafe impl aya::Pod for super::CgroupStats {}
+    unsafe impl aya::Pod for crate::siphash::SipHashKey {}
 }

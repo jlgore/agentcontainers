@@ -77,6 +77,11 @@ type Backend struct {
 	// component routes tool calls to the enforcer (component backends).
 	component *componentClient
 
+	// netPolicy is the enforcer network policy applied at registration,
+	// kept for periodic hostname re-resolution (container backends with an
+	// enforcer connection only).
+	netPolicy *enforcerapi.NetworkPolicyRequest
+
 	cleanup []func(context.Context) error
 }
 
@@ -225,6 +230,20 @@ func newBackend(ctx context.Context, deps Deps, mcpClient *mcp.Client, name stri
 		}
 		b.ContainerID = containerID
 		b.cleanup = append(b.cleanup, cleanup)
+
+		// Register with the eBPF enforcer BEFORE the MCP handshake so
+		// kernel policy is in place before the server handles anything.
+		// Fail closed: with an enforcer connected, a backend that cannot
+		// be brought under enforcement does not start.
+		if deps.Enforcer != nil {
+			unregister, err := registerBackendEnforcement(ctx, deps, b, tool)
+			if err != nil {
+				_ = b.Close(ctx)
+				return nil, err
+			}
+			b.cleanup = append(b.cleanup, unregister)
+		}
+
 		session, err := mcpClient.Connect(ctx, tr, nil)
 		if err != nil {
 			_ = b.Close(ctx)

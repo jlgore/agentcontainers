@@ -18,12 +18,12 @@ use siphasher::sip128::{Hasher128, SipHasher24};
 
 use aya_ebpf::macros::cgroup_skb;
 use aya_ebpf::programs::SkBuffContext;
-use aya_ebpf::helpers::bpf_get_current_cgroup_id;
 
 use agentcontainer_common::events::{
     DnsEvent, EventType, DNS_CLASS_IN, DNS_FLAG_QR, DNS_HEADER_SIZE, DNS_PORT, DNS_TYPE_A,
     DNS_TYPE_AAAA, MAX_COMPRESSION_JUMPS,
 };
+use agentcontainer_common::maps::DomainKey;
 
 use crate::maps::{DNS_EVENTS, SIPHASH_KEY, TRACKED_DOMAINS};
 
@@ -288,11 +288,17 @@ fn try_parse_dns(ctx: &SkBuffContext) -> Result<(), ()> {
         pos = name_end + 4;
     }
 
-    // Check if this domain is one we're tracking. If not, skip entirely —
-    // no ring buffer event, no wasted bandwidth.
-    let tracked = unsafe { TRACKED_DOMAINS.get(&domain_hash) };
+    // Check if this domain is tracked for the cgroup that owns this socket.
+    // cgroup_skb runs in softirq context, so the *current task* cgroup is
+    // unrelated — use the skb's socket cgroup instead.
+    let cgroup_id = unsafe { aya_ebpf::helpers::bpf_skb_cgroup_id(ctx.skb.skb) };
+    let tracked_key = DomainKey {
+        cgroup_id,
+        hash: domain_hash,
+    };
+    let tracked = unsafe { TRACKED_DOMAINS.get(&tracked_key) };
     if tracked.is_none() {
-        return Ok(()); // Not a tracked domain, silently ignore
+        return Ok(()); // Not a tracked domain for this cgroup, silently ignore
     }
 
     // Parse answer section for A and AAAA records.
@@ -326,7 +332,7 @@ fn try_parse_dns(ctx: &SkBuffContext) -> Result<(), ()> {
                     zero_dns_event(ev);
                     (*ev).event_type = EventType::DnsResponse as u32;
                     (*ev).ttl = ttl;
-                    (*ev).cgroup_id = bpf_get_current_cgroup_id();
+                    (*ev).cgroup_id = cgroup_id;
                     (*ev).record_type = DNS_TYPE_A as u8;
                     (*ev).domain_hash = domain_hash;
 
@@ -354,7 +360,7 @@ fn try_parse_dns(ctx: &SkBuffContext) -> Result<(), ()> {
                     zero_dns_event(ev);
                     (*ev).event_type = EventType::DnsResponse as u32;
                     (*ev).ttl = ttl;
-                    (*ev).cgroup_id = bpf_get_current_cgroup_id();
+                    (*ev).cgroup_id = cgroup_id;
                     (*ev).record_type = DNS_TYPE_AAAA as u8;
                     (*ev).domain_hash = domain_hash;
 

@@ -15,11 +15,11 @@ use aya_ebpf::helpers::{
 use aya_ebpf::macros::lsm;
 use aya_ebpf::programs::LsmContext;
 
-use agentcontainer_common::events::{ExecEvent, STAT_PROC_ALLOWED, STAT_PROC_BLOCKED};
-use agentcontainer_common::maps::{FsInodeKey, LSM_ALLOW, LSM_DENY};
+use agentcontainer_common::events::{ExecEvent, STAT_PROC_ALLOWED};
+use agentcontainer_common::maps::{FsInodeKey, LSM_ALLOW};
 
 use crate::maps::{
-    bump_cgroup_stat, ALLOWED_EXECS, CGROUP_STAT_PROC_ALLOWED, CGROUP_STAT_PROC_BLOCKED,
+    bump_cgroup_stat, ALLOWED_EXECS, CGROUP_STAT_PROC_ALLOWED,
     ENFORCED_CGROUPS, PROC_EVENTS, PROC_STATS,
 };
 
@@ -85,9 +85,10 @@ fn get_enforced_cgroup() -> Option<u64> {
     }
 }
 
-/// Emit a block event for a denied process execution to the PROC_EVENTS ring buffer.
+/// Emit a process execution event to the PROC_EVENTS ring buffer.
+/// `verdict` follows `events::Verdict`: 0 = allow, 1 = block.
 #[inline(always)]
-fn emit_exec_block_event(cgroup_id: u64, ino: u64) {
+fn emit_exec_event(cgroup_id: u64, ino: u64, verdict: u32) {
     if let Some(mut entry) = PROC_EVENTS.reserve::<ExecEvent>(0) {
         let ev = entry.as_mut_ptr();
         unsafe {
@@ -100,7 +101,7 @@ fn emit_exec_block_event(cgroup_id: u64, ino: u64) {
             (*ev).uid = uid_gid as u32;
 
             (*ev).event_type = 4; // EventType::ProcessExec
-            (*ev).verdict = 1; // Verdict::Block
+            (*ev).verdict = verdict;
             (*ev).cgroup_id = cgroup_id;
 
             (*ev).inode = ino;
@@ -196,16 +197,16 @@ fn try_bprm_check(ctx: &LsmContext) -> Result<i32, i64> {
         cgroup_id,
     };
 
-    // 1. Check allowed executables map.
-    if unsafe { ALLOWED_EXECS.get(&key) }.is_some() {
-        bump_stat(STAT_PROC_ALLOWED);
-        bump_cgroup_stat(cgroup_id, CGROUP_STAT_PROC_ALLOWED);
-        return Ok(LSM_ALLOW);
-    }
-
-    // 2. Default deny -- block execution, emit audit event.
-    bump_stat(STAT_PROC_BLOCKED);
-    bump_cgroup_stat(cgroup_id, CGROUP_STAT_PROC_BLOCKED);
-    emit_exec_block_event(cgroup_id, ino);
-    Ok(LSM_DENY)
+    // Deny-list mode: every exec inside an enforced cgroup is ALLOWED and
+    // audited — the forensic exec trail (kernel_execve events with tool-call
+    // correlation) must be complete. Kernel exec *allowlist* enforcement is
+    // deferred until inode-ancestry matching lands: exact-inode default-deny
+    // would block container-image binaries that policy paths cannot resolve
+    // from the host. ALLOWED_EXECS is still consulted so listed binaries are
+    // distinguishable in stats when allowlist enforcement returns.
+    let _listed = unsafe { ALLOWED_EXECS.get(&key) }.is_some();
+    bump_stat(STAT_PROC_ALLOWED);
+    bump_cgroup_stat(cgroup_id, CGROUP_STAT_PROC_ALLOWED);
+    emit_exec_event(cgroup_id, ino, 0 /* Verdict::Allow */);
+    Ok(LSM_ALLOW)
 }

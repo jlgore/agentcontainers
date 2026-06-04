@@ -10,7 +10,8 @@ use aya_ebpf::macros::map;
 use aya_ebpf::maps::{Array, HashMap, LpmTrie, PerCpuArray, PerCpuHashMap, RingBuf};
 
 use agentcontainer_common::maps::{
-    CgroupStats, FsInodeKey, LpmDataV4, LpmDataV6, PortKeyV4, SecretAclKey, SecretAclValue,
+    CgroupStats, DomainKey, FsInodeKey, LpmDataV4, LpmDataV6, PortKeyV4, SecretAclKey,
+    SecretAclValue,
 };
 use agentcontainer_common::siphash::SipHashKey;
 
@@ -65,13 +66,14 @@ pub static NET_STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(16, 0);
 #[map]
 pub static SIPHASH_KEY: Array<SipHashKey> = Array::with_max_entries(1, 0);
 
-/// Set of tracked domain hashes. Userspace inserts SipHash-128 digests of
-/// domains it cares about (from the network policy allowed_hosts list).
-/// BPF DNS parser hashes each response domain and only emits a ring buffer
-/// event if the hash is found in this map — unrelated DNS traffic is dropped
-/// silently, reducing ring buffer bandwidth.
+/// Set of tracked domain hashes, scoped per-cgroup. Userspace inserts
+/// SipHash-128 digests of domains it cares about (from the network policy
+/// allowed_hosts list) keyed by the owning container's cgroup_id. The BPF
+/// DNS parser hashes each response domain and only emits a ring buffer
+/// event if (cgroup_id, hash) is found in this map — unrelated DNS traffic
+/// is dropped silently, reducing ring buffer bandwidth.
 #[map]
-pub static TRACKED_DOMAINS: HashMap<[u8; 16], u8> = HashMap::with_max_entries(4096, 0);
+pub static TRACKED_DOMAINS: HashMap<DomainKey, u8> = HashMap::with_max_entries(4096, 0);
 
 /// Ring buffer for DNS response events.
 #[map]

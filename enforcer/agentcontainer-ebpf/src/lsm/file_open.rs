@@ -423,9 +423,16 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
         return Ok(LSM_ALLOW);
     }
 
-    // 4. Default deny.
-    bump_fs_stat(agentcontainer_common::events::STAT_FS_BLOCKED);
-    bump_cgroup_stat(cgid, CGROUP_STAT_FS_BLOCKED);
-    emit_fs_block_event(cgid, ino, flags);
-    Ok(LSM_DENY)
+    // 4. Deny-list mode default: ALLOW. Kernel read/write *allowlist*
+    //    enforcement (default-deny) is deferred until inode-ancestry
+    //    matching lands — exact-inode matching cannot cover files beneath
+    //    allowed directories, so default-deny would block every container
+    //    file not explicitly listed (libc, /etc/ld.so.cache, ...).
+    //    DENIED_INODES, SECRET_ACLS, /proc/*/environ, and write-protection
+    //    on explicitly listed read-only inodes remain enforced above.
+    //    No event emission here: allow-path file opens are far too frequent
+    //    for the ring buffer.
+    bump_fs_stat(agentcontainer_common::events::STAT_FS_ALLOWED);
+    bump_cgroup_stat(cgid, CGROUP_STAT_FS_ALLOWED);
+    Ok(LSM_ALLOW)
 }
