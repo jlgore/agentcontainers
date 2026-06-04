@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -325,6 +326,67 @@ func TestProxyToolListChangedReaggregation(t *testing.T) {
 			t.Fatalf("tools = %v after list_changed, want [echo late_tool]", names)
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestProxySerializesToolCallsPerBackendByDefault(t *testing.T) {
+	var mu sync.Mutex
+	active := 0
+	maxActive := 0
+
+	srv := mcp.NewServer(&mcp.Implementation{Name: "slow-backend", Version: "0.0.1"}, nil)
+	srv.AddTool(&mcp.Tool{Name: "slow", InputSchema: map[string]any{"type": "object"}}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		mu.Lock()
+		active++
+		if active > maxActive {
+			maxActive = active
+		}
+		mu.Unlock()
+
+		time.Sleep(75 * time.Millisecond)
+
+		mu.Lock()
+		active--
+		mu.Unlock()
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "ok"}}}, nil
+	})
+
+	url := startBackendHTTP(t, srv)
+	cfg := remoteCfg(map[string]config.MCPToolConfig{
+		"backend-a": {Type: "remote", URL: url},
+	})
+	p := newTestProxy(t, cfg, Deps{})
+	session := connectClient(t, p)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "slow"}); err != nil {
+				t.Errorf("CallTool: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if maxActive != 1 {
+		t.Fatalf("max concurrent backend calls = %d, want 1", maxActive)
+	}
+}
+
+func TestMaxConcurrentToolsResolution(t *testing.T) {
+	if got := maxConcurrentTools(nil, nil); got != 1 {
+		t.Fatalf("default maxConcurrentTools = %d, want 1", got)
+	}
+	cfg := &config.AgentContainer{Agent: &config.AgentConfig{Policy: &config.PolicyConfig{MaxConcurrentTools: 3}}}
+	if got := maxConcurrentTools(cfg, nil); got != 3 {
+		t.Fatalf("agent maxConcurrentTools = %d, want 3", got)
+	}
+	if got := maxConcurrentTools(cfg, &config.MCPServerPolicy{MaxConcurrentTools: 2}); got != 2 {
+		t.Fatalf("server maxConcurrentTools = %d, want 2", got)
 	}
 }
 

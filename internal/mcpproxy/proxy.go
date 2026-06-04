@@ -117,7 +117,7 @@ func New(ctx context.Context, deps Deps, cfg *config.AgentContainer, sessionID s
 	for _, name := range names {
 		tool := cfg.Agent.Tools.MCP[name]
 		mcpClient := mcp.NewClient(proxyImpl, p.clientOptions(name))
-		b, err := newBackend(ctx, deps, mcpClient, name, tool, sessionID, networkName)
+		b, err := newBackend(ctx, deps, mcpClient, name, tool, sessionID, networkName, maxConcurrentTools(cfg, tool.Policy))
 		if err != nil {
 			_ = p.Close(ctx)
 			return nil, err
@@ -369,6 +369,11 @@ func (p *Proxy) handleToolCall(b *Backend, toolName string) mcp.ToolHandler {
 		args := req.Params.Arguments
 		summary := argsSummary(args)
 
+		if err := b.acquireToolSlot(ctx); err != nil {
+			return nil, err
+		}
+		defer b.releaseToolSlot()
+
 		start := time.Now()
 		res, callErr := b.CallTool(ctx, toolName, args, req.Params.GetProgressToken())
 		latency := time.Since(start).Milliseconds()
@@ -445,6 +450,16 @@ func toolAllowed(policy *config.MCPServerPolicy, name string) bool {
 		}
 	}
 	return false
+}
+
+func maxConcurrentTools(cfg *config.AgentContainer, policy *config.MCPServerPolicy) int {
+	if policy != nil && policy.MaxConcurrentTools > 0 {
+		return policy.MaxConcurrentTools
+	}
+	if cfg != nil && cfg.Agent != nil && cfg.Agent.Policy != nil && cfg.Agent.Policy.MaxConcurrentTools > 0 {
+		return cfg.Agent.Policy.MaxConcurrentTools
+	}
+	return 1
 }
 
 // newCorrelationID returns a UUIDv7 (monotonic within a millisecond, so

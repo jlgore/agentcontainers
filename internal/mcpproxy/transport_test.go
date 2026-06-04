@@ -3,11 +3,20 @@ package mcpproxy
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
+	"errors"
 	"io"
+	"net"
 	"testing"
 
 	"github.com/moby/moby/api/pkg/stdcopy"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.uber.org/zap/zaptest"
+
+	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/config"
 )
 
 // muxFrame writes one stdcopy frame: an 8-byte header
@@ -89,5 +98,110 @@ func TestBackendEnforcement(t *testing.T) {
 	}
 	if (&Backend{Kind: KindStdio}).Enforcement() != "" {
 		t.Error("container backend must report empty enforcement")
+	}
+}
+
+type fakeDockerClient struct {
+	client.APIClient
+
+	createdConfig *container.Config
+	networkName   string
+	started       bool
+	removed       bool
+	containerConn net.Conn
+}
+
+func (f *fakeDockerClient) ImageInspect(context.Context, string, ...client.ImageInspectOption) (client.ImageInspectResult, error) {
+	return client.ImageInspectResult{}, nil
+}
+
+func (f *fakeDockerClient) ImagePull(context.Context, string, client.ImagePullOptions) (client.ImagePullResponse, error) {
+	return nil, errors.New("unexpected image pull")
+}
+
+func (f *fakeDockerClient) NetworkInspect(context.Context, string, client.NetworkInspectOptions) (client.NetworkInspectResult, error) {
+	return client.NetworkInspectResult{}, errors.New("network not found")
+}
+
+func (f *fakeDockerClient) NetworkCreate(_ context.Context, name string, _ client.NetworkCreateOptions) (client.NetworkCreateResult, error) {
+	f.networkName = name
+	return client.NetworkCreateResult{ID: "network-1"}, nil
+}
+
+func (f *fakeDockerClient) ContainerCreate(_ context.Context, opts client.ContainerCreateOptions) (client.ContainerCreateResult, error) {
+	f.createdConfig = opts.Config
+	return client.ContainerCreateResult{ID: "container-1"}, nil
+}
+
+func (f *fakeDockerClient) ContainerAttach(context.Context, string, client.ContainerAttachOptions) (client.ContainerAttachResult, error) {
+	hostConn, containerConn := net.Pipe()
+	f.containerConn = containerConn
+	return client.ContainerAttachResult{HijackedResponse: client.NewHijackedResponse(hostConn, "")}, nil
+}
+
+func (f *fakeDockerClient) ContainerStart(context.Context, string, client.ContainerStartOptions) (client.ContainerStartResult, error) {
+	f.started = true
+	go func() {
+		var muxed bytes.Buffer
+		muxFrame(&muxed, stdcopy.Stderr, "log noise\n")
+		muxFrame(&muxed, stdcopy.Stdout, `{"jsonrpc":"2.0","id":1,"result":{}}`+"\n")
+		_, _ = f.containerConn.Write(muxed.Bytes())
+		_ = f.containerConn.Close()
+	}()
+	return client.ContainerStartResult{}, nil
+}
+
+func (f *fakeDockerClient) ContainerStop(context.Context, string, client.ContainerStopOptions) (client.ContainerStopResult, error) {
+	return client.ContainerStopResult{}, nil
+}
+
+func (f *fakeDockerClient) ContainerRemove(context.Context, string, client.ContainerRemoveOptions) (client.ContainerRemoveResult, error) {
+	f.removed = true
+	return client.ContainerRemoveResult{}, nil
+}
+
+func TestDialStdioContainerUsesDockerAttachDemux(t *testing.T) {
+	docker := &fakeDockerClient{}
+	tr, containerID, cleanup, err := dialStdioContainer(t.Context(), Deps{Docker: docker, Logger: zaptest.NewLogger(t)}, "sift", config.MCPToolConfig{
+		Image:   "example/mcp:latest",
+		Command: []string{"mcp-server"},
+		Env:     map[string]string{"B": "2", "A": "1"},
+	}, "sessionabcdef", "ac-mcp-sessiona")
+	if err != nil {
+		t.Fatalf("dialStdioContainer: %v", err)
+	}
+	if containerID != "container-1" {
+		t.Fatalf("containerID = %q, want container-1", containerID)
+	}
+	if docker.networkName != "ac-mcp-sessiona" {
+		t.Fatalf("network = %q, want ac-mcp-sessiona", docker.networkName)
+	}
+	if !docker.started {
+		t.Fatal("container was not started")
+	}
+	if docker.createdConfig == nil || docker.createdConfig.Tty {
+		t.Fatalf("container config = %+v, want non-TTY config", docker.createdConfig)
+	}
+	if got := docker.createdConfig.Env; len(got) != 2 || got[0] != "A=1" || got[1] != "B=2" {
+		t.Fatalf("env = %v, want sorted [A=1 B=2]", got)
+	}
+
+	ioTr, ok := tr.(*mcp.IOTransport)
+	if !ok {
+		t.Fatalf("transport = %T, want *mcp.IOTransport", tr)
+	}
+	line, err := bufio.NewReader(ioTr.Reader).ReadString('\n')
+	if err != nil {
+		t.Fatalf("reading demuxed stdout: %v", err)
+	}
+	if line != `{"jsonrpc":"2.0","id":1,"result":{}}`+"\n" {
+		t.Fatalf("stdout = %q", line)
+	}
+
+	if err := cleanup(t.Context()); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if !docker.removed {
+		t.Fatal("container was not removed during cleanup")
 	}
 }

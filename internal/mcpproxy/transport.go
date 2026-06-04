@@ -70,6 +70,7 @@ type Backend struct {
 	Kind        string
 	ContainerID string // empty for remote and component backends
 	Policy      *config.MCPServerPolicy
+	concurrency chan struct{}
 
 	// session is the SDK client session (stdio/http/remote backends).
 	session *mcp.ClientSession
@@ -136,6 +137,25 @@ func (b *Backend) CallTool(ctx context.Context, name string, args json.RawMessag
 	return b.session.CallTool(ctx, params)
 }
 
+func (b *Backend) acquireToolSlot(ctx context.Context) error {
+	if b.concurrency == nil {
+		b.concurrency = make(chan struct{}, 1)
+	}
+	select {
+	case b.concurrency <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (b *Backend) releaseToolSlot() {
+	if b.concurrency == nil {
+		return
+	}
+	<-b.concurrency
+}
+
 // Close tears down the backend connection and any owned container.
 func (b *Backend) Close(ctx context.Context) error {
 	var errs []string
@@ -158,8 +178,8 @@ func (b *Backend) Close(ctx context.Context) error {
 
 // newBackend connects a single backend per its declared type and transport.
 // The mcp.Client is supplied by the proxy with relay handlers already wired.
-func newBackend(ctx context.Context, deps Deps, mcpClient *mcp.Client, name string, tool config.MCPToolConfig, sessionID, networkName string) (*Backend, error) {
-	b := &Backend{Name: name, Policy: tool.Policy}
+func newBackend(ctx context.Context, deps Deps, mcpClient *mcp.Client, name string, tool config.MCPToolConfig, sessionID, networkName string, concurrency int) (*Backend, error) {
+	b := &Backend{Name: name, Policy: tool.Policy, concurrency: make(chan struct{}, concurrency)}
 
 	switch tool.Type {
 	case "component":
