@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/approval"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/config"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/enforcerapi"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/mcpproxy"
@@ -52,9 +53,11 @@ per-session bridge network.`,
 
 func newMCPStartCmd() *cobra.Command {
 	var (
-		port      int
-		sessionID string
-		auditDir  string
+		port            int
+		sessionID       string
+		auditDir        string
+		approvalTimeout time.Duration
+		approvalSocket  string
 	)
 
 	cmd := &cobra.Command{
@@ -62,21 +65,28 @@ func newMCPStartCmd() *cobra.Command {
 		Short: "Start the MCP proxy in the foreground",
 		Long: `Loads agentcontainer.json from the working directory, connects all
 configured MCP backends, and serves MCP Streamable HTTP until interrupted.
-Point an MCP client at http://localhost:<port>/ to use the proxied tools.`,
+Point an MCP client at http://localhost:<port>/ to use the proxied tools.
+
+Tools listed in policy.requireApproval pause for human confirmation:
+interactively on this terminal when one is attached, and always via
+'agentcontainer approve' over the approval socket. Unanswered requests are
+denied after the approval timeout.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runMCPStart(cmd, port, sessionID, auditDir)
+			return runMCPStart(cmd, port, sessionID, auditDir, approvalTimeout, approvalSocket)
 		},
 	}
 
 	cmd.Flags().IntVar(&port, "port", defaultMCPPort, "Listen port for MCP Streamable HTTP")
 	cmd.Flags().StringVar(&sessionID, "session", "", "Session ID (default: random)")
 	cmd.Flags().StringVar(&auditDir, "audit-dir", "", "Audit log directory (default: $AC_AUDIT_DIR or ~/.ac/audit)")
+	cmd.Flags().DurationVar(&approvalTimeout, "approval-timeout", approval.DefaultToolCallTimeout, "How long requireApproval tools wait for a decision before denying")
+	cmd.Flags().StringVar(&approvalSocket, "approval-socket", "", "Approval socket path (default: ~/.agentcontainers/approval.sock)")
 
 	return cmd
 }
 
-func runMCPStart(cmd *cobra.Command, port int, sessionID, auditDir string) error {
+func runMCPStart(cmd *cobra.Command, port int, sessionID, auditDir string, approvalTimeout time.Duration, approvalSocket string) error {
 	ctx := cmd.Context()
 	out := cmd.OutOrStdout()
 
@@ -109,9 +119,20 @@ func runMCPStart(cmd *cobra.Command, port int, sessionID, auditDir string) error
 	}
 	defer depCleanup()
 
+	// Human-in-the-loop approval channels (Phase 4): only stood up when a
+	// server actually declares requireApproval tools. The socket always
+	// serves (so `agentcontainer approve` works either way); the TTY
+	// prompt is added when a controlling terminal is attached.
+	broker, approvalCleanup, approvalDesc, err := buildApprovalChannels(ctx, cfg, approvalTimeout, approvalSocket)
+	if err != nil {
+		return fmt.Errorf("mcp start: %w", err)
+	}
+	defer approvalCleanup()
+
 	proxy, err := mcpproxy.New(ctx, deps, cfg, sessionID, &mcpproxy.Options{
 		AuditDir:  auditDir,
 		ConfigDir: filepath.Dir(cfgPath),
+		Approval:  broker,
 	})
 	if err != nil {
 		return fmt.Errorf("mcp start: %w", err)
@@ -144,6 +165,10 @@ func runMCPStart(cmd *cobra.Command, port int, sessionID, auditDir string) error
 	_, _ = fmt.Fprintf(out, "Audit:    %s\n", proxy.AuditPath())
 	if enforcerAudit != nil {
 		_, _ = fmt.Fprintf(out, "Enforcer: %s\n", enforcerAudit.Path())
+	}
+	if approvalDesc != "" {
+		_, _ = fmt.Fprintf(out, "Approval: %s\n", approvalDesc)
+		_, _ = fmt.Fprintf(out, "          %s\n", proxy.ApprovalAuditPath())
 	}
 	_, _ = fmt.Fprintln(out, "Press Ctrl-C to stop.")
 
@@ -226,6 +251,50 @@ func buildMCPDeps(cfg *config.AgentContainer, log *zap.Logger) (mcpproxy.Deps, f
 	}
 
 	return deps, cleanup, nil
+}
+
+// buildApprovalChannels stands up the HITL broker and its channels when any
+// configured server declares requireApproval tools. Returns a nil broker
+// (and no-op cleanup) when nothing requires approval. At least one channel
+// must come up — a session whose approvals can only ever time out is a
+// startup error, not a degraded mode.
+func buildApprovalChannels(ctx context.Context, cfg *config.AgentContainer, timeout time.Duration, socketPath string) (*approval.ToolCallBroker, func(), string, error) {
+	required := false
+	for _, tool := range cfg.Agent.Tools.MCP {
+		if tool.Policy != nil && len(tool.Policy.RequireApproval) > 0 {
+			required = true
+			break
+		}
+	}
+	if !required {
+		return nil, func() {}, "", nil
+	}
+
+	broker := approval.NewToolCallBroker(timeout)
+	var cleanups []func()
+	cleanup := func() {
+		for _, f := range cleanups {
+			f()
+		}
+	}
+	var channels []string
+
+	if tty, err := approval.OpenTTYChannel(broker); err == nil {
+		go tty.Run(ctx)
+		cleanups = append(cleanups, func() { _ = tty.Close() })
+		channels = append(channels, "interactive (this terminal)")
+	}
+
+	sock, err := approval.ListenSocket(socketPath, broker)
+	if err == nil {
+		cleanups = append(cleanups, func() { _ = sock.Close() })
+		channels = append(channels, "agentcontainer approve ("+sock.Path()+")")
+	} else if len(channels) == 0 {
+		cleanup()
+		return nil, func() {}, "", fmt.Errorf("no approval channel available (no TTY, and %v)", err)
+	}
+
+	return broker, cleanup, strings.Join(channels, ", "), nil
 }
 
 func mcpEnforcerDisabled(cfg *config.AgentContainer) bool {

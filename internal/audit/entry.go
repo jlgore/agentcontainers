@@ -13,6 +13,9 @@ const (
 	EventSecret      EventType = "secret"
 	EventLifecycle   EventType = "lifecycle"
 	EventToolCall    EventType = "tool_call"
+	// EventApprovalDecision records a human approve/deny verdict on a
+	// proxied tools/call (the `<sessionId>-approval` chain, SPEC §7.3).
+	EventApprovalDecision EventType = "approval_decision"
 )
 
 // Actor identifies who triggered an event.

@@ -15,6 +15,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.uber.org/zap"
 
+	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/approval"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/audit"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/config"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/enforcerapi"
@@ -35,6 +36,12 @@ type Options struct {
 	// ConfigDir anchors relative policy.securityYaml paths (the directory
 	// containing agentcontainer.json).
 	ConfigDir string
+
+	// Approval resolves tools listed in policy.requireApproval. Required
+	// when any configured server declares requireApproval — the HITL gate
+	// is structural, so a missing broker is a startup error, not a
+	// silent passthrough.
+	Approval *approval.ToolCallBroker
 }
 
 // serverPolicy is the per-server policy machinery compiled at startup:
@@ -59,6 +66,12 @@ type Proxy struct {
 
 	server *mcp.Server
 	audit  *AuditSink
+
+	// approvals is the HITL broker for requireApproval tools; nil when no
+	// server declares any. approvalAudit is the `<sessionId>-approval`
+	// chain (SPEC §7.3), created alongside the broker.
+	approvals     *approval.ToolCallBroker
+	approvalAudit *ApprovalAuditSink
 
 	// policies maps server name to its compiled policy machinery
 	// (immutable after New).
@@ -103,9 +116,26 @@ func New(ctx context.Context, deps Deps, cfg *config.AgentContainer, sessionID s
 		opts = &Options{}
 	}
 
+	// The HITL gate is structural: a server declaring requireApproval
+	// without a broker to resolve it is a startup error, never a silent
+	// passthrough.
+	needsApproval := anyRequireApproval(cfg)
+	if needsApproval && opts.Approval == nil {
+		return nil, fmt.Errorf("mcpproxy: policy.requireApproval is configured but no approval broker is available")
+	}
+
 	sink, err := NewAuditSink(sessionID, opts.AuditDir)
 	if err != nil {
 		return nil, err
+	}
+
+	var approvalSink *ApprovalAuditSink
+	if needsApproval {
+		approvalSink, err = NewApprovalAuditSink(sessionID, opts.AuditDir)
+		if err != nil {
+			_ = sink.Close()
+			return nil, err
+		}
 	}
 
 	p := &Proxy{
@@ -113,6 +143,8 @@ func New(ctx context.Context, deps Deps, cfg *config.AgentContainer, sessionID s
 		cfg:              cfg,
 		sessionID:        sessionID,
 		audit:            sink,
+		approvals:        opts.Approval,
+		approvalAudit:    approvalSink,
 		policies:         make(map[string]*serverPolicy),
 		backends:         make(map[string]*Backend),
 		toolRoutes:       make(map[string]*Backend),
@@ -141,11 +173,17 @@ func New(ctx context.Context, deps Deps, cfg *config.AgentContainer, sessionID s
 
 	// Compile per-server policies before launching anything: a broken
 	// policy must fail startup, not fall open after containers exist.
+	closeSinks := func() {
+		_ = sink.Close()
+		if approvalSink != nil {
+			_ = approvalSink.Close()
+		}
+	}
 	for _, name := range names {
 		tool := cfg.Agent.Tools.MCP[name]
 		cp, err := CompileServerPolicy(tool, opts.ConfigDir)
 		if err != nil {
-			_ = sink.Close()
+			closeSinks()
 			return nil, err
 		}
 		if cp == nil {
@@ -153,7 +191,7 @@ func New(ctx context.Context, deps Deps, cfg *config.AgentContainer, sessionID s
 		}
 		ev, err := NewEvaluator(ctx, name, cp)
 		if err != nil {
-			_ = sink.Close()
+			closeSinks()
 			return nil, err
 		}
 		sp := &serverPolicy{eval: ev, outputFlags: cp.OutputFlags}
@@ -203,6 +241,15 @@ func (p *Proxy) AuditPath() string {
 	return p.audit.Path()
 }
 
+// ApprovalAuditPath returns the approval.jsonl audit file path, or "" when
+// no server requires approval.
+func (p *Proxy) ApprovalAuditPath() string {
+	if p.approvalAudit == nil {
+		return ""
+	}
+	return p.approvalAudit.Path()
+}
+
 // Backends returns the connected backend names (sorted).
 func (p *Proxy) Backends() []string {
 	p.mu.Lock()
@@ -236,6 +283,11 @@ func (p *Proxy) Close(ctx context.Context) error {
 	}
 	if p.audit != nil {
 		if err := p.audit.Close(); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+	if p.approvalAudit != nil {
+		if err := p.approvalAudit.Close(); err != nil {
 			errs = append(errs, err.Error())
 		}
 	}
@@ -460,6 +512,27 @@ func (p *Proxy) handleToolCall(b *Backend, toolName string) mcp.ToolHandler {
 			}, nil
 		}
 
+		// Human-in-the-loop gate (Phase 4): tools in requireApproval pause
+		// for a decision before the tool slot is acquired (a human wait
+		// must not serialize other tool calls). approval.jsonl is the
+		// authoritative record; the proxy entry only summarizes.
+		if toolRequiresApproval(b.Policy, toolName) {
+			rec.ApprovalRequired = true
+			hd := p.awaitApproval(ctx, req, b.Name, toolName, corrID, summary)
+			if !hd.Approved {
+				rec.Verdict = audit.VerdictDeny
+				rec.Reasons = append(rec.Reasons, "approval: "+hd.Reason)
+				rec.LatencyMs = time.Since(start).Milliseconds()
+				p.logToolCall(rec)
+				return &mcp.CallToolResult{
+					IsError: true,
+					Content: []mcp.Content{&mcp.TextContent{
+						Text: "Approval denied: " + hd.Reason,
+					}},
+				}, nil
+			}
+		}
+
 		if err := b.acquireToolSlot(ctx); err != nil {
 			return nil, err
 		}
@@ -479,6 +552,102 @@ func (p *Proxy) handleToolCall(b *Backend, toolName string) mcp.ToolHandler {
 
 		return res, callErr
 	}
+}
+
+// awaitApproval blocks on the HITL broker for a requireApproval tool and
+// logs the decision to the approval chain. While waiting it sends MCP
+// progress notifications to the client (when the call carries a progress
+// token) so long approval waits don't look like a hung connection. Timeout
+// and client disconnect both deny — the gate fails closed.
+func (p *Proxy) awaitApproval(ctx context.Context, req *mcp.CallToolRequest, server, toolName, corrID, summary string) approval.ToolCallDecision {
+	if p.approvals == nil {
+		// Unreachable when New validated the config, but never fall open.
+		return approval.ToolCallDecision{Approved: false, Reason: "no approval broker configured"}
+	}
+
+	if token := req.Params.GetProgressToken(); token != nil && req.Session != nil {
+		keepaliveCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		go func() {
+			ticker := time.NewTicker(approvalProgressInterval)
+			defer ticker.Stop()
+			n := 0.0
+			for {
+				select {
+				case <-keepaliveCtx.Done():
+					return
+				case <-ticker.C:
+					n++
+					if err := req.Session.NotifyProgress(keepaliveCtx, &mcp.ProgressNotificationParams{
+						ProgressToken: token,
+						Progress:      n,
+						Message:       fmt.Sprintf("awaiting human approval for %s (deny after %s)", toolName, p.approvals.Timeout()),
+					}); err != nil {
+						p.deps.Logger.Debug("approval keepalive failed", zap.Error(err))
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	promptStart := time.Now()
+	d := p.approvals.Request(ctx, approval.ToolCallRequest{
+		ID:          corrID,
+		Server:      server,
+		Tool:        toolName,
+		ArgsSummary: summary,
+		RequestedAt: promptStart.UTC(),
+	})
+
+	if p.approvalAudit != nil {
+		if err := p.approvalAudit.LogDecision(ApprovalRecord{
+			CorrelationID:    corrID,
+			Server:           server,
+			Tool:             toolName,
+			ArgsSummary:      summary,
+			Approved:         d.Approved,
+			Reason:           d.Reason,
+			Decider:          d.Decider,
+			PromptDurationMs: time.Since(promptStart).Milliseconds(),
+		}); err != nil {
+			p.deps.Logger.Error("approval audit write failed",
+				zap.String("correlationId", corrID),
+				zap.String("backend", server),
+				zap.Error(err),
+			)
+		}
+	}
+	return d
+}
+
+// approvalProgressInterval is how often the proxy reassures a waiting
+// client that the call is paused on a human, not hung.
+const approvalProgressInterval = 10 * time.Second
+
+// toolRequiresApproval reports whether the per-server policy pauses this
+// tool for human confirmation.
+func toolRequiresApproval(policy *config.MCPServerPolicy, name string) bool {
+	if policy == nil {
+		return false
+	}
+	for _, t := range policy.RequireApproval {
+		if t == name {
+			return true
+		}
+	}
+	return false
+}
+
+// anyRequireApproval reports whether any configured server declares
+// requireApproval tools.
+func anyRequireApproval(cfg *config.AgentContainer) bool {
+	for _, tool := range cfg.Agent.Tools.MCP {
+		if tool.Policy != nil && len(tool.Policy.RequireApproval) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func shouldCorrelate(b *Backend) bool {
