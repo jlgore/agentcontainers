@@ -651,6 +651,24 @@ mod linux {
             Ok(())
         }
 
+        /// Remove the per-cgroup *network* policy entries for `cgroup_id` —
+        /// the maps `apply_network` owns. Called both on unregister and at
+        /// the top of every `apply_network` so a re-apply REPLACES the
+        /// previous resolution instead of accumulating: without this, the
+        /// 5-minute hostname refresh only ever adds, and the egress
+        /// allowlist monotonically widens to every IP a CDN hostname ever
+        /// resolved to.
+        fn cleanup_network_entries(bpf: &mut Ebpf, cgroup_id: u64) {
+            Self::cleanup_lpm_entries::<LpmDataV4>(bpf, "ALLOWED_V4", cgroup_id, |k| k.cgroup_id);
+            Self::cleanup_lpm_entries::<LpmDataV6>(bpf, "ALLOWED_V6", cgroup_id, |k| k.cgroup_id);
+            Self::cleanup_hash_entries::<PortKeyV4, u8>(bpf, "ALLOWED_PORTS", cgroup_id, |k| {
+                k.cgroup_id
+            });
+            Self::cleanup_hash_entries::<DomainKey, u8>(bpf, "TRACKED_DOMAINS", cgroup_id, |k| {
+                k.cgroup_id
+            });
+        }
+
         /// Remove all per-cgroup policy entries for `cgroup_id`.
         ///
         /// cgroup IDs are kernfs inode numbers and can be recycled after a
@@ -658,15 +676,11 @@ mod linux {
         /// policy to whichever cgroup reuses the ID. With per-cgroup map
         /// keys this cleanup is mandatory, not best-effort.
         fn cleanup_cgroup_entries(bpf: &mut Ebpf, cgroup_id: u64) {
-            Self::cleanup_lpm_entries::<LpmDataV4>(bpf, "ALLOWED_V4", cgroup_id, |k| k.cgroup_id);
-            Self::cleanup_lpm_entries::<LpmDataV6>(bpf, "ALLOWED_V6", cgroup_id, |k| k.cgroup_id);
+            Self::cleanup_network_entries(bpf, cgroup_id);
             Self::cleanup_lpm_entries::<LpmDataV4>(bpf, "BLOCKED_CIDRS_V4", cgroup_id, |k| {
                 k.cgroup_id
             });
             Self::cleanup_lpm_entries::<LpmDataV6>(bpf, "BLOCKED_CIDRS_V6", cgroup_id, |k| {
-                k.cgroup_id
-            });
-            Self::cleanup_hash_entries::<PortKeyV4, u8>(bpf, "ALLOWED_PORTS", cgroup_id, |k| {
                 k.cgroup_id
             });
             Self::cleanup_hash_entries::<FsInodeKey, u8>(bpf, "ALLOWED_INODES", cgroup_id, |k| {
@@ -684,9 +698,6 @@ mod linux {
                 cgroup_id,
                 |k| k.cgroup_id,
             );
-            Self::cleanup_hash_entries::<DomainKey, u8>(bpf, "TRACKED_DOMAINS", cgroup_id, |k| {
-                k.cgroup_id
-            });
         }
     }
 
@@ -791,47 +802,17 @@ mod linux {
             let cgroup_id = self.lookup_cgroup(container_id)?;
             info!(container_id, cgroup_id, hosts = ?policy.allowed_hosts, "applying network policy to BPF maps");
 
-            // Track hostname-typed policy entries for DNS observation: the
-            // BPF DNS parser only emits events for (cgroup_id, domain_hash)
-            // pairs present in TRACKED_DOMAINS.
-            {
-                let mut bpf = self.programs.lock().unwrap();
-                let hosts = policy
-                    .allowed_hosts
-                    .iter()
-                    .chain(policy.egress_rules.iter().map(|r| &r.host));
-                for host in hosts {
-                    if let Err(e) = Self::track_domain(&mut bpf, &self.siphash_key, cgroup_id, host)
-                    {
-                        warn!(host, error = %e, "failed to add domain to TRACKED_DOMAINS");
-                    }
-                }
-            }
-
-            // Resolve allowed_hosts to IPs and insert into ALLOWED_V4 LPM trie.
+            // Phase 1 — resolve every hostname BEFORE touching any map. DNS
+            // can take seconds; the swap below must not leave the cgroup
+            // swept (default-deny on previously-allowed destinations) while
+            // lookups are in flight.
+            let mut host_addrs: Vec<(&str, std::net::Ipv4Addr)> = Vec::new();
             for host in &policy.allowed_hosts {
                 match tokio::net::lookup_host(format!("{host}:0")).await {
                     Ok(addrs) => {
-                        let mut bpf = self.programs.lock().unwrap();
                         for addr in addrs {
                             if let std::net::IpAddr::V4(ip) = addr.ip() {
-                                // Per-cgroup LPM key: prefix covers all 64 cgroup
-                                // bits plus the full /32 host address.
-                                let key = LpmKey::new(
-                                    LPM_CGROUP_PREFIX + 32,
-                                    LpmDataV4 {
-                                        cgroup_id,
-                                        addr: u32::from(ip).to_be(),
-                                        _pad: 0,
-                                    },
-                                );
-                                let map_data = bpf.map_mut("ALLOWED_V4").ok_or_else(|| {
-                                    anyhow::anyhow!("BPF map ALLOWED_V4 not found")
-                                })?;
-                                let mut map: LpmTrie<_, LpmDataV4, u8> =
-                                    LpmTrie::try_from(map_data)?;
-                                map.insert(&key, 1, 0)?;
-                                info!(host, ip = %ip, cgroup_id, "added IP to ALLOWED_V4");
+                                host_addrs.push((host, ip));
                             }
                         }
                     }
@@ -840,42 +821,22 @@ mod linux {
                     }
                 }
             }
-
-            // Insert egress rules into ALLOWED_PORTS map.
+            let mut rule_addrs: Vec<(&crate::policy::EgressRule, std::net::Ipv4Addr, u8)> =
+                Vec::new();
             for rule in &policy.egress_rules {
+                let proto = match rule.protocol.to_lowercase().as_str() {
+                    "tcp" => 6u8,
+                    "udp" => 17u8,
+                    _ => {
+                        warn!(protocol = %rule.protocol, "unknown protocol in egress rule, skipping");
+                        continue;
+                    }
+                };
                 match tokio::net::lookup_host(format!("{}:0", rule.host)).await {
                     Ok(addrs) => {
-                        let proto = match rule.protocol.to_lowercase().as_str() {
-                            "tcp" => 6u8,
-                            "udp" => 17u8,
-                            _ => {
-                                warn!(protocol = %rule.protocol, "unknown protocol in egress rule, skipping");
-                                continue;
-                            }
-                        };
-                        let mut bpf = self.programs.lock().unwrap();
                         for addr in addrs {
                             if let std::net::IpAddr::V4(ip) = addr.ip() {
-                                let key = PortKeyV4 {
-                                    cgroup_id,
-                                    ip: u32::from(ip).to_be(),
-                                    port: rule.port,
-                                    protocol: proto,
-                                    _pad: 0,
-                                };
-                                let map_data = bpf.map_mut("ALLOWED_PORTS").ok_or_else(|| {
-                                    anyhow::anyhow!("BPF map ALLOWED_PORTS not found")
-                                })?;
-                                let mut map: AyaHashMap<_, PortKeyV4, u8> =
-                                    AyaHashMap::try_from(map_data)?;
-                                map.insert(key, 1, 0)?;
-                                info!(
-                                    host = %rule.host,
-                                    ip = %ip,
-                                    port = rule.port,
-                                    protocol = %rule.protocol,
-                                    "added port rule to ALLOWED_PORTS"
-                                );
+                                rule_addrs.push((rule, ip, proto));
                             }
                         }
                     }
@@ -887,6 +848,69 @@ mod linux {
                         );
                     }
                 }
+            }
+
+            // Phase 2 — swap under one lock: sweep this cgroup's previous
+            // network entries, then insert the fresh resolution. A re-apply
+            // (the 5-minute hostname refresh) thereby REPLACES the prior IP
+            // set; insert-only semantics would accumulate every IP a CDN
+            // hostname ever resolved to, monotonically widening egress for
+            // the whole session. The deny window is map-operation-sized.
+            let mut bpf = self.programs.lock().unwrap();
+            Self::cleanup_network_entries(&mut bpf, cgroup_id);
+
+            // Track hostname-typed policy entries for DNS observation: the
+            // BPF DNS parser only emits events for (cgroup_id, domain_hash)
+            // pairs present in TRACKED_DOMAINS.
+            let hosts = policy
+                .allowed_hosts
+                .iter()
+                .chain(policy.egress_rules.iter().map(|r| &r.host));
+            for host in hosts {
+                if let Err(e) = Self::track_domain(&mut bpf, &self.siphash_key, cgroup_id, host) {
+                    warn!(host, error = %e, "failed to add domain to TRACKED_DOMAINS");
+                }
+            }
+
+            for (host, ip) in host_addrs {
+                // Per-cgroup LPM key: prefix covers all 64 cgroup bits plus
+                // the full /32 host address.
+                let key = LpmKey::new(
+                    LPM_CGROUP_PREFIX + 32,
+                    LpmDataV4 {
+                        cgroup_id,
+                        addr: u32::from(ip).to_be(),
+                        _pad: 0,
+                    },
+                );
+                let map_data = bpf
+                    .map_mut("ALLOWED_V4")
+                    .ok_or_else(|| anyhow::anyhow!("BPF map ALLOWED_V4 not found"))?;
+                let mut map: LpmTrie<_, LpmDataV4, u8> = LpmTrie::try_from(map_data)?;
+                map.insert(&key, 1, 0)?;
+                info!(host, ip = %ip, cgroup_id, "added IP to ALLOWED_V4");
+            }
+
+            for (rule, ip, proto) in rule_addrs {
+                let key = PortKeyV4 {
+                    cgroup_id,
+                    ip: u32::from(ip).to_be(),
+                    port: rule.port,
+                    protocol: proto,
+                    _pad: 0,
+                };
+                let map_data = bpf
+                    .map_mut("ALLOWED_PORTS")
+                    .ok_or_else(|| anyhow::anyhow!("BPF map ALLOWED_PORTS not found"))?;
+                let mut map: AyaHashMap<_, PortKeyV4, u8> = AyaHashMap::try_from(map_data)?;
+                map.insert(key, 1, 0)?;
+                info!(
+                    host = %rule.host,
+                    ip = %ip,
+                    port = rule.port,
+                    protocol = %rule.protocol,
+                    "added port rule to ALLOWED_PORTS"
+                );
             }
 
             Ok(())

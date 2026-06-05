@@ -990,7 +990,7 @@ allowlist (disk-forensics tools address `/dev` specifiers, governed by
 | Gap | Scope | Mitigation |
 |-----|-------|------------|
 | Audit patch is a fork divergence until upstreamed | Audit | Fork-local patch (Phase 1, §3.4): typed metadata + full-entry computeHash, written PR-clean; track on rebases; PR after PoC |
-| Hostname egress is IP-refresh-based until TRACKED_DOMAINS rekeyed (Phase 3 step 7) | Phase 3 | Periodic IP re-resolution (5 min); note staleness for CDN/cloud |
+| Hostname egress is IP-resolution-based (kernel maps hold IPs, not names) | Phase 3 | Periodic re-resolution (5 min) replaces the cgroup's IP set, so rotated-away IPs lose access; between refreshes a rotated-to IP is briefly denied until the next refresh |
 | Full argv not at kernel level initially | Phase 3 stretch | Binary path + comm; full argv is later |
 | ENFORCED_CGROUPS cap 256 | Scale | Fine for forensic; document limit |
 | Default serialize per-server | Throughput | maxConcurrentTools override; window exact at 1 |
