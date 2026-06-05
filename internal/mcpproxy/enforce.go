@@ -21,8 +21,8 @@ import (
 
 // networkPolicyRefreshInterval is how often hostname-based network policies
 // are re-applied so the enforcer re-resolves DNS (CDN/cloud IPs rotate
-// during long forensic sessions). Stale IPs are not removed until the
-// container unregisters — a documented limitation (SPEC §14).
+// during long forensic sessions). Each re-apply REPLACES the cgroup's
+// previous IP set on the enforcer side, so rotated-away IPs lose access.
 const networkPolicyRefreshInterval = 5 * time.Minute
 
 // registerBackendEnforcement registers a freshly started container backend
@@ -34,9 +34,6 @@ const networkPolicyRefreshInterval = 5 * time.Minute
 // backend that needs egress declares it in policy.network. Operators who
 // want no kernel enforcement set enforcer.required: false.
 func registerBackendEnforcement(ctx context.Context, deps Deps, b *Backend, tool config.MCPToolConfig) (func(context.Context) error, error) {
-	ec := deps.Enforcer
-	log := deps.Logger
-
 	inspect, err := deps.Docker.ContainerInspect(ctx, b.ContainerID, client.ContainerInspectOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("mcpproxy: backend %s: inspecting container for enforcement: %w", b.Name, err)
@@ -51,6 +48,15 @@ func registerBackendEnforcement(ctx context.Context, deps Deps, b *Backend, tool
 		return nil, fmt.Errorf("mcpproxy: backend %s: resolving cgroup path: %w", b.Name, err)
 	}
 
+	return applyBackendEnforcement(ctx, deps.Enforcer, deps.Logger, b, tool, cgroupPath, initPid)
+}
+
+// applyBackendEnforcement registers the container and applies its policies.
+// After RegisterContainer succeeds, EVERY failure path unregisters before
+// returning: a partially-registered cgroup left in ENFORCED_CGROUPS would
+// keep its half-applied policy alive past the container — and cgroup IDs
+// recycle, so a later unrelated cgroup could inherit it.
+func applyBackendEnforcement(ctx context.Context, ec enforcerapi.EnforcerClient, log *zap.Logger, b *Backend, tool config.MCPToolConfig, cgroupPath string, initPid uint32) (func(context.Context) error, error) {
 	resp, err := ec.RegisterContainer(ctx, &enforcerapi.RegisterContainerRequest{
 		ContainerId: b.ContainerID,
 		CgroupPath:  cgroupPath,
@@ -64,13 +70,37 @@ func registerBackendEnforcement(ctx context.Context, deps Deps, b *Backend, tool
 		zap.String("containerID", b.ContainerID),
 		zap.Uint64("cgroupID", resp.GetCgroupId()))
 
+	unregister := func(cctx context.Context) error {
+		if _, err := ec.UnregisterContainer(cctx, &enforcerapi.UnregisterContainerRequest{
+			ContainerId: b.ContainerID,
+		}); err != nil {
+			return fmt.Errorf("mcpproxy: backend %s: unregistering from enforcer: %w", b.Name, err)
+		}
+		return nil
+	}
+
+	// fail rolls back the registration before surfacing err. Uses a fresh
+	// context: the caller's ctx may already be cancelled mid-abort, and the
+	// rollback must still reach the enforcer.
+	fail := func(err error) (func(context.Context) error, error) {
+		cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if uerr := unregister(cctx); uerr != nil {
+			log.Error("rollback after partial enforcement registration failed — cgroup may remain enforced until enforcer restart",
+				zap.String("backend", b.Name),
+				zap.String("containerID", b.ContainerID),
+				zap.Error(uerr))
+		}
+		return nil, err
+	}
+
 	// Network policy is applied unconditionally: an absent or empty
 	// policy.network means default-deny egress (loopback excepted) — the
 	// spec's intent for forensic MCP servers.
 	netReq := translateNetworkCaps(b.ContainerID, tool.Policy)
 	b.netPolicy = netReq
 	if _, err := ec.ApplyNetworkPolicy(ctx, netReq); err != nil {
-		return nil, fmt.Errorf("mcpproxy: backend %s: applying network policy: %w", b.Name, err)
+		return fail(fmt.Errorf("mcpproxy: backend %s: applying network policy: %w", b.Name, err))
 	}
 
 	// Filesystem policy: deny_paths are kernel-enforced (DENIED_INODES);
@@ -85,18 +115,10 @@ func registerBackendEnforcement(ctx context.Context, deps Deps, b *Backend, tool
 			WritePaths:  fs.Write,
 			DenyPaths:   fs.Deny,
 		}); err != nil {
-			return nil, fmt.Errorf("mcpproxy: backend %s: applying filesystem policy: %w", b.Name, err)
+			return fail(fmt.Errorf("mcpproxy: backend %s: applying filesystem policy: %w", b.Name, err))
 		}
 	}
 
-	unregister := func(cctx context.Context) error {
-		if _, err := ec.UnregisterContainer(cctx, &enforcerapi.UnregisterContainerRequest{
-			ContainerId: b.ContainerID,
-		}); err != nil {
-			return fmt.Errorf("mcpproxy: backend %s: unregistering from enforcer: %w", b.Name, err)
-		}
-		return nil
-	}
 	return unregister, nil
 }
 

@@ -1,7 +1,12 @@
 package mcpproxy
 
 import (
+	"context"
+	"fmt"
 	"testing"
+
+	"go.uber.org/zap/zaptest"
+	"google.golang.org/grpc"
 
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/config"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/enforcerapi"
@@ -90,5 +95,119 @@ func TestHasHostnames(t *testing.T) {
 				t.Errorf("hasHostnames() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// recordingEnforcer is an EnforcerClient fake for registration-lifecycle
+// tests. Unset RPCs panic via the embedded nil interface — these tests only
+// exercise register/apply/unregister.
+type recordingEnforcer struct {
+	enforcerapi.EnforcerClient
+
+	netPolicyErr error
+	fsPolicyErr  error
+
+	registered   []string
+	unregistered []string
+}
+
+func (f *recordingEnforcer) RegisterContainer(ctx context.Context, req *enforcerapi.RegisterContainerRequest, opts ...grpc.CallOption) (*enforcerapi.RegisterContainerResponse, error) {
+	f.registered = append(f.registered, req.ContainerId)
+	return &enforcerapi.RegisterContainerResponse{CgroupId: 42}, nil
+}
+
+func (f *recordingEnforcer) UnregisterContainer(ctx context.Context, req *enforcerapi.UnregisterContainerRequest, opts ...grpc.CallOption) (*enforcerapi.UnregisterContainerResponse, error) {
+	f.unregistered = append(f.unregistered, req.ContainerId)
+	return &enforcerapi.UnregisterContainerResponse{}, nil
+}
+
+func (f *recordingEnforcer) ApplyNetworkPolicy(ctx context.Context, req *enforcerapi.NetworkPolicyRequest, opts ...grpc.CallOption) (*enforcerapi.PolicyResponse, error) {
+	if f.netPolicyErr != nil {
+		return nil, f.netPolicyErr
+	}
+	return &enforcerapi.PolicyResponse{Success: true}, nil
+}
+
+func (f *recordingEnforcer) ApplyFilesystemPolicy(ctx context.Context, req *enforcerapi.FilesystemPolicyRequest, opts ...grpc.CallOption) (*enforcerapi.PolicyResponse, error) {
+	if f.fsPolicyErr != nil {
+		return nil, f.fsPolicyErr
+	}
+	return &enforcerapi.PolicyResponse{Success: true}, nil
+}
+
+func enforcementTestTool() config.MCPToolConfig {
+	return config.MCPToolConfig{
+		Policy: &config.MCPServerPolicy{
+			Filesystem: &config.FilesystemCaps{Deny: []string{"/etc/shadow"}},
+		},
+	}
+}
+
+func TestApplyBackendEnforcementSuccess(t *testing.T) {
+	ec := &recordingEnforcer{}
+	b := &Backend{Name: "sift", ContainerID: "ctr-1"}
+
+	unregister, err := applyBackendEnforcement(context.Background(), ec, zaptest.NewLogger(t), b, enforcementTestTool(), "/sys/fs/cgroup/test", 123)
+	if err != nil {
+		t.Fatalf("applyBackendEnforcement: %v", err)
+	}
+	if len(ec.unregistered) != 0 {
+		t.Fatalf("unexpected unregister during successful registration: %v", ec.unregistered)
+	}
+	if err := unregister(context.Background()); err != nil {
+		t.Fatalf("unregister: %v", err)
+	}
+	if len(ec.unregistered) != 1 || ec.unregistered[0] != "ctr-1" {
+		t.Errorf("unregistered = %v, want [ctr-1]", ec.unregistered)
+	}
+}
+
+// A failure after RegisterContainer must roll the registration back: a
+// leaked cgroup in ENFORCED_CGROUPS outlives the container, and cgroup IDs
+// recycle (issue: partial-registration leak).
+func TestApplyBackendEnforcementRollsBackOnNetworkPolicyFailure(t *testing.T) {
+	ec := &recordingEnforcer{netPolicyErr: fmt.Errorf("boom")}
+	b := &Backend{Name: "sift", ContainerID: "ctr-1"}
+
+	_, err := applyBackendEnforcement(context.Background(), ec, zaptest.NewLogger(t), b, enforcementTestTool(), "/sys/fs/cgroup/test", 123)
+	if err == nil {
+		t.Fatal("expected network policy failure")
+	}
+	if len(ec.registered) != 1 {
+		t.Fatalf("registered = %v, want one registration", ec.registered)
+	}
+	if len(ec.unregistered) != 1 || ec.unregistered[0] != "ctr-1" {
+		t.Errorf("unregistered = %v, want rollback of ctr-1", ec.unregistered)
+	}
+}
+
+func TestApplyBackendEnforcementRollsBackOnFilesystemPolicyFailure(t *testing.T) {
+	ec := &recordingEnforcer{fsPolicyErr: fmt.Errorf("boom")}
+	b := &Backend{Name: "sift", ContainerID: "ctr-1"}
+
+	_, err := applyBackendEnforcement(context.Background(), ec, zaptest.NewLogger(t), b, enforcementTestTool(), "/sys/fs/cgroup/test", 123)
+	if err == nil {
+		t.Fatal("expected filesystem policy failure")
+	}
+	if len(ec.unregistered) != 1 || ec.unregistered[0] != "ctr-1" {
+		t.Errorf("unregistered = %v, want rollback of ctr-1", ec.unregistered)
+	}
+}
+
+// Rollback must work even when the caller's context is already cancelled
+// (registration aborts mid-startup) — it uses a fresh context internally.
+func TestApplyBackendEnforcementRollsBackWithCancelledContext(t *testing.T) {
+	ec := &recordingEnforcer{fsPolicyErr: fmt.Errorf("boom")}
+	b := &Backend{Name: "sift", ContainerID: "ctr-1"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := applyBackendEnforcement(ctx, ec, zaptest.NewLogger(t), b, enforcementTestTool(), "/sys/fs/cgroup/test", 123)
+	if err == nil {
+		t.Fatal("expected filesystem policy failure")
+	}
+	if len(ec.unregistered) != 1 {
+		t.Errorf("unregistered = %v, want rollback despite cancelled caller context", ec.unregistered)
 	}
 }
