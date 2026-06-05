@@ -91,16 +91,25 @@ fn test_domain_key_hash_matches_dns_parser() {
     // The userspace hash (siphash128_bytes over the lowercased dotted name)
     // must equal the BPF DNS parser's incremental label hashing.
     use agentcontainer_common::siphash::{DomainHasher, SipHashKey};
-    let key = SipHashKey { k0: 0x0123_4567_89AB_CDEF, k1: 0xFEDC_BA98_7654_3210 };
+    let key = SipHashKey {
+        k0: 0x0123_4567_89AB_CDEF,
+        k1: 0xFEDC_BA98_7654_3210,
+    };
 
     // Incremental, as the BPF parser feeds it: labels + dots, lowercased.
     let mut h = DomainHasher::new(&key);
     h.dot();
-    for b in b"www" { h.write_byte(*b); }
+    for b in b"www" {
+        h.write_byte(*b);
+    }
     h.dot();
-    for b in b"example" { h.write_byte(*b); }
+    for b in b"example" {
+        h.write_byte(*b);
+    }
     h.dot();
-    for b in b"com" { h.write_byte(*b); }
+    for b in b"com" {
+        h.write_byte(*b);
+    }
     let incremental = h.finish128_bytes();
 
     // One-shot, as track_domain hashes policy hosts.

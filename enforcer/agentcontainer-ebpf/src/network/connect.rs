@@ -87,7 +87,13 @@ fn emit_block_event_v4(cgroup_id: u64, dst_ip: u32, dst_port: u16, proto: u8, ev
 
 /// Emit a block event for an IPv6 connection to the NET_EVENTS ring buffer.
 #[inline(always)]
-fn emit_block_event_v6(cgroup_id: u64, dst_ip6: [u32; 4], dst_port: u16, proto: u8, event_type: u32) {
+fn emit_block_event_v6(
+    cgroup_id: u64,
+    dst_ip6: [u32; 4],
+    dst_port: u16,
+    proto: u8,
+    event_type: u32,
+) {
     if let Some(mut entry) = NET_EVENTS.reserve::<NetworkEvent>(0) {
         let ev = entry.as_mut_ptr();
         unsafe {

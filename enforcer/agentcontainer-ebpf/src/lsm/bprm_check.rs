@@ -19,8 +19,8 @@ use agentcontainer_common::events::{ExecEvent, STAT_PROC_ALLOWED};
 use agentcontainer_common::maps::{FsInodeKey, LSM_ALLOW};
 
 use crate::maps::{
-    bump_cgroup_stat, ALLOWED_EXECS, CGROUP_STAT_PROC_ALLOWED,
-    ENFORCED_CGROUPS, PROC_EVENTS, PROC_STATS,
+    bump_cgroup_stat, ALLOWED_EXECS, CGROUP_STAT_PROC_ALLOWED, ENFORCED_CGROUPS, PROC_EVENTS,
+    PROC_STATS,
 };
 
 // ---------------------------------------------------------------------------
