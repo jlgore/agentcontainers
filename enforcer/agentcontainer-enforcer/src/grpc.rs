@@ -127,11 +127,13 @@ impl Enforcer for EnforcerService {
 
         let handle = self
             .manager
-            .register(&req.container_id, &req.cgroup_path)
+            .register(&req.container_id, &req.cgroup_path, req.init_pid)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
         // Store init PID if provided (non-zero means caller supplied it).
+        // The manager keeps its own copy for policy-path resolution; this
+        // one serves inject_secrets.
         if req.init_pid != 0 {
             self.container_pids
                 .write()

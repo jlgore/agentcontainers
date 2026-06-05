@@ -188,7 +188,12 @@ inserted with `prefix_len < 64` (that would match across cgroups).
 **Server registration:** Use the existing `RegisterContainer` →
 `ApplyNetworkPolicy` / `ApplyProcessPolicy` / `ApplyCredentialPolicy` /
 `InjectSecrets` RPCs. Stays inside the `LoadPolicyBundle` content-trust
-flow.
+flow. `RegisterContainer` carries the container's init PID; filesystem,
+exec, and credential policy paths are container-namespace paths and are
+resolved to inodes through `/proc/<init_pid>/root` (the container's mount
+namespace, same mechanism as `InjectSecrets`) — resolving them in the
+enforcer's own namespace would pin host files, which on overlayfs are
+different inodes than the ones the container's LSM hooks observe.
 
 **New gRPC endpoints (two RPCs):**
 
@@ -993,3 +998,5 @@ allowlist (disk-forensics tools address `/dev` specifiers, governed by
 | Approval socket is security boundary | Phase 4 | 0600 perms + SO_PEERCRED UID check |
 | DNS exfiltration when DNS allowed | Upstream | Filtering resolver as compensating control |
 | /proc/pid/mem bypasses file_open LSM | Upstream | Container boundary is primary isolation |
+| Inode pinning is a point-in-time snapshot: overlayfs copy-up (container writes a lower-layer file) gives the file a new backing inode, and files created after registration are never covered | Phase 3 | Deny-lists pin inodes at `ApplyFilesystemPolicy` time, resolved via `/proc/<init_pid>/root` (container mount namespace). Re-apply policy to re-pin; the proxy filesystem.rego layer (§12) checks paths, not inodes, and is unaffected |
+| Filesystem/exec LSM hooks run deny-list-first with a default-allow verdict: `policy.filesystem.read`/`write` allowlists and exec allowlists populate maps but do not confine unlisted inodes | Phase 3 | `deny` entries and SECRET_ACLS are kernel-enforced; read/write allowlists are enforced at the proxy (filesystem.rego). Kernel-level allowlist confinement needs inode-ancestry matching (future work) — until then, declared allowlists are proxy-enforced only |

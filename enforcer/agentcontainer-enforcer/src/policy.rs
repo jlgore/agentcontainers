@@ -93,10 +93,18 @@ impl EventVerdict {
 pub trait PolicyManager: Send + Sync + 'static {
     /// Register a container for enforcement. Resolves the cgroup path to an ID
     /// and inserts it into the ENFORCED_CGROUPS map.
+    ///
+    /// `init_pid` is the container's init process PID; when non-zero,
+    /// filesystem/process/credential policy paths are resolved through
+    /// `/proc/<init_pid>/root` (the container's mount namespace) so the
+    /// pinned inodes are the ones its LSM hooks actually observe. Zero
+    /// falls back to resolving in the enforcer's own namespace (host-side
+    /// callers).
     async fn register(
         &self,
         container_id: &str,
         cgroup_path: &str,
+        init_pid: u32,
     ) -> anyhow::Result<ContainerHandle>;
 
     /// Unregister a container. Removes all map entries for this cgroup.
@@ -159,6 +167,7 @@ impl PolicyManager for StubPolicyManager {
         &self,
         container_id: &str,
         _cgroup_path: &str,
+        _init_pid: u32,
     ) -> anyhow::Result<ContainerHandle> {
         tracing::warn!("stub policy manager: register is a no-op");
         Ok(ContainerHandle {

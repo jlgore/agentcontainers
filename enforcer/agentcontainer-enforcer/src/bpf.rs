@@ -33,7 +33,10 @@ type CorrelationWindows = std::sync::Arc<RwLock<HashMap<u64, Vec<ToolWindow>>>>;
 
 #[cfg(target_os = "linux")]
 fn monotonic_ns() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     unsafe {
         libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
     }
@@ -43,7 +46,23 @@ fn monotonic_ns() -> u64 {
 #[cfg(not(target_os = "linux"))]
 fn monotonic_ns() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos() as u64
+}
+
+/// Decode a userspace `stat.st_dev` into the true (major, minor) pair.
+///
+/// `st_dev` carries glibc's expanded dev_t encoding (major split across bits
+/// 8–19 and 32+, minor across bits 0–7 and 20–31) — NOT the kernel's internal
+/// `sb->s_dev` layout (`major << 20 | minor`) that the BPF LSM hooks decode.
+/// Both sides must reduce to the same true (major, minor) or every
+/// FsInodeKey/SecretAclKey lookup silently misses, leaving the inode
+/// deny-list and credential gating inert (fail-open).
+#[cfg(target_os = "linux")]
+fn decode_dev(st_dev: u64) -> (u32, u32) {
+    (libc::major(st_dev), libc::minor(st_dev))
 }
 
 fn assign_correlation(event: &mut EnforcementEvent, windows: &CorrelationWindows) {
@@ -52,7 +71,8 @@ fn assign_correlation(event: &mut EnforcementEvent, windows: &CorrelationWindows
         return;
     };
     for w in items.iter().rev() {
-        if event.timestamp_ns >= w.start_ns && w.end_ns.is_none_or(|end| event.timestamp_ns <= end) {
+        if event.timestamp_ns >= w.start_ns && w.end_ns.is_none_or(|end| event.timestamp_ns <= end)
+        {
             event.correlation_id = w.correlation_id.clone();
             return;
         }
@@ -124,6 +144,12 @@ mod linux {
         /// so we can clean up all related map entries on unregister.
         container_cgroups: RwLock<HashMap<String, u64>>,
 
+        /// Container init PIDs supplied at registration. Policy paths for a
+        /// container with a known PID resolve through `/proc/<pid>/root` —
+        /// its mount namespace — so pinned inodes match what the LSM hooks
+        /// observe (overlayfs files differ from same-named host paths).
+        container_pids: RwLock<HashMap<String, u32>>,
+
         /// Per-cgroup tool-call windows used to attach MCP correlation IDs
         /// to asynchronous kernel events by event timestamp.
         correlations: CorrelationWindows,
@@ -177,6 +203,7 @@ mod linux {
                 registry,
                 event_bus,
                 container_cgroups: RwLock::new(HashMap::new()),
+                container_pids: RwLock::new(HashMap::new()),
                 correlations: std::sync::Arc::new(RwLock::new(HashMap::new())),
                 siphash_key,
             };
@@ -489,14 +516,46 @@ mod linux {
         }
 
         /// Resolve a filesystem path to an (inode, dev_major, dev_minor) triple.
+        /// Device numbers are decoded from the glibc st_dev encoding so they
+        /// match what the BPF hooks decode from the kernel's `sb->s_dev`.
         fn resolve_inode(path: &str) -> anyhow::Result<(u64, u32, u32)> {
             let meta = std::fs::metadata(path)
                 .map_err(|e| anyhow::anyhow!("failed to stat {path}: {e}"))?;
-            let dev = meta.dev();
-            // major/minor device numbers from the combined dev_t.
-            let dev_major = ((dev >> 8) & 0xfff) as u32;
-            let dev_minor = (dev & 0xff) as u32;
+            let (dev_major, dev_minor) = super::decode_dev(meta.dev());
             Ok((meta.ino(), dev_major, dev_minor))
+        }
+
+        /// Resolve a *container-namespace* policy path to the inode triple
+        /// the container's LSM hooks will observe.
+        ///
+        /// Policy paths (`policy.filesystem`, exec allowlists, secret ACLs)
+        /// are what the containerized tool sees, so they must be resolved
+        /// through `/proc/<init_pid>/root` — the container's mount
+        /// namespace. Stat'ing the same string in the enforcer's namespace
+        /// pins a *different* file for anything on the container's
+        /// overlayfs (only bind-mounted host paths coincide). Mirrors the
+        /// `/proc/<pid>/root` mechanism `inject_secrets` already uses.
+        ///
+        /// Falls back to the enforcer's own namespace when no init PID was
+        /// supplied at registration (host-side callers).
+        fn resolve_container_inode(
+            &self,
+            container_id: &str,
+            path: &str,
+        ) -> anyhow::Result<(u64, u32, u32)> {
+            match self.container_pids.read().unwrap().get(container_id) {
+                Some(&pid) => Self::resolve_inode(&format!("/proc/{pid}/root{path}")),
+                None => {
+                    warn!(
+                        container_id,
+                        path,
+                        "no init PID registered; resolving policy path in the \
+                         enforcer's own namespace (container-image paths will \
+                         not match)"
+                    );
+                    Self::resolve_inode(path)
+                }
+            }
         }
 
         /// Remove entries belonging to `cgroup_id` from a hash map whose key
@@ -525,7 +584,12 @@ mod linux {
                 }
             }
             if !stale.is_empty() {
-                info!(map = name, cgroup_id, removed = stale.len(), "cleaned per-cgroup entries");
+                info!(
+                    map = name,
+                    cgroup_id,
+                    removed = stale.len(),
+                    "cleaned per-cgroup entries"
+                );
             }
         }
 
@@ -632,11 +696,12 @@ mod linux {
             &self,
             container_id: &str,
             cgroup_path: &str,
+            init_pid: u32,
         ) -> anyhow::Result<ContainerHandle> {
             let cgroup_id = Self::resolve_cgroup_id(cgroup_path)?;
             info!(
                 container_id,
-                cgroup_id, cgroup_path, "registering cgroup for BPF enforcement"
+                cgroup_id, cgroup_path, init_pid, "registering cgroup for BPF enforcement"
             );
 
             // Insert into ENFORCED_CGROUPS BPF map.
@@ -658,6 +723,12 @@ mod linux {
                 .write()
                 .unwrap()
                 .insert(container_id.to_string(), cgroup_id);
+            if init_pid != 0 {
+                self.container_pids
+                    .write()
+                    .unwrap()
+                    .insert(container_id.to_string(), init_pid);
+            }
 
             Ok(ContainerHandle {
                 container_id: container_id.to_string(),
@@ -666,6 +737,7 @@ mod linux {
         }
 
         async fn unregister(&self, container_id: &str) -> anyhow::Result<()> {
+            self.container_pids.write().unwrap().remove(container_id);
             let cgroup_id = self.container_cgroups.write().unwrap().remove(container_id);
 
             if let Some(cgroup_id) = cgroup_id {
@@ -729,8 +801,7 @@ mod linux {
                     .iter()
                     .chain(policy.egress_rules.iter().map(|r| &r.host));
                 for host in hosts {
-                    if let Err(e) =
-                        Self::track_domain(&mut bpf, &self.siphash_key, cgroup_id, host)
+                    if let Err(e) = Self::track_domain(&mut bpf, &self.siphash_key, cgroup_id, host)
                     {
                         warn!(host, error = %e, "failed to add domain to TRACKED_DOMAINS");
                     }
@@ -836,7 +907,7 @@ mod linux {
 
             // Insert read-only paths.
             for path in &policy.read_paths {
-                match Self::resolve_inode(path) {
+                match self.resolve_container_inode(container_id, path) {
                     Ok((inode, dev_major, dev_minor)) => {
                         let key = FsInodeKey {
                             inode,
@@ -860,7 +931,7 @@ mod linux {
 
             // Insert read+write paths.
             for path in &policy.write_paths {
-                match Self::resolve_inode(path) {
+                match self.resolve_container_inode(container_id, path) {
                     Ok((inode, dev_major, dev_minor)) => {
                         let key = FsInodeKey {
                             inode,
@@ -885,7 +956,7 @@ mod linux {
             // Insert denied paths (checked by the LSM hook BEFORE the allow
             // list, so a deny entry overrides any allow for the same inode).
             for path in &policy.deny_paths {
-                match Self::resolve_inode(path) {
+                match self.resolve_container_inode(container_id, path) {
                     Ok((inode, dev_major, dev_minor)) => {
                         let key = FsInodeKey {
                             inode,
@@ -921,7 +992,7 @@ mod linux {
             let mut bpf = self.programs.lock().unwrap();
 
             for binary in &policy.allowed_binaries {
-                match Self::resolve_inode(binary) {
+                match self.resolve_container_inode(container_id, binary) {
                     Ok((inode, dev_major, dev_minor)) => {
                         let key = FsInodeKey {
                             inode,
@@ -962,7 +1033,7 @@ mod linux {
             let mut bpf = self.programs.lock().unwrap();
 
             for acl in &policy.secret_acls {
-                match Self::resolve_inode(&acl.path) {
+                match self.resolve_container_inode(container_id, &acl.path) {
                     Ok((inode, dev_major, dev_minor)) => {
                         let key = SecretAclKey {
                             inode,
@@ -1154,6 +1225,7 @@ mod stub {
             &self,
             container_id: &str,
             cgroup_path: &str,
+            _init_pid: u32,
         ) -> anyhow::Result<ContainerHandle> {
             let cgroup_id = {
                 let mut id = self.next_fake_id.write().unwrap();
@@ -1310,17 +1382,52 @@ mod tests {
     use super::*;
     use crate::policy::PolicyManager;
 
+    /// The userspace st_dev decode and the BPF-side s_dev decode
+    /// (lsm/file_open.rs, lsm/bprm_check.rs: `(s_dev >> 20) & 0xfff`,
+    /// `s_dev & 0xfffff`) must reduce to the same (major, minor) for the
+    /// same device, or FsInodeKey/SecretAclKey lookups never match.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_decode_dev_matches_kernel_side() {
+        // Includes minors > 0xff and majors > 0xff to exercise glibc's
+        // split encoding — exactly where the old legacy decode broke.
+        for &(major, minor) in &[
+            (8u32, 1u32),
+            (253, 3),
+            (259, 0x1234),
+            (0, 38),
+            (4095, 0xfffff),
+        ] {
+            // Userspace view: glibc-encoded stat.st_dev.
+            let st_dev = libc::makedev(major, minor);
+            let user = decode_dev(st_dev);
+
+            // Kernel view: sb->s_dev (MKDEV layout), decoded as the BPF
+            // hooks do.
+            let s_dev: u32 = (major << 20) | minor;
+            let kernel = ((s_dev >> 20) & 0xfff, s_dev & 0xfffff);
+
+            assert_eq!(user, kernel, "major={major} minor={minor}");
+        }
+    }
+
     #[cfg(not(target_os = "linux"))]
     #[tokio::test]
     async fn test_stub_register_unregister() {
         let mgr = BpfPolicyManager::new().unwrap();
 
-        let handle = mgr.register("ctr-1", "/sys/fs/cgroup/test").await.unwrap();
+        let handle = mgr
+            .register("ctr-1", "/sys/fs/cgroup/test", 0)
+            .await
+            .unwrap();
         assert_eq!(handle.container_id, "ctr-1");
         assert!(handle.cgroup_id > 0);
 
         // Second register gets a different cgroup ID.
-        let handle2 = mgr.register("ctr-2", "/sys/fs/cgroup/test2").await.unwrap();
+        let handle2 = mgr
+            .register("ctr-2", "/sys/fs/cgroup/test2", 0)
+            .await
+            .unwrap();
         assert_ne!(handle.cgroup_id, handle2.cgroup_id);
 
         // Unregister should succeed.
@@ -1334,7 +1441,9 @@ mod tests {
     #[tokio::test]
     async fn test_stub_apply_policies() {
         let mgr = BpfPolicyManager::new().unwrap();
-        mgr.register("ctr-1", "/sys/fs/cgroup/test").await.unwrap();
+        mgr.register("ctr-1", "/sys/fs/cgroup/test", 0)
+            .await
+            .unwrap();
 
         // All apply methods should succeed as no-ops.
         mgr.apply_network(

@@ -51,7 +51,7 @@ async fn test_register_own_cgroup() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    let handle = mgr.register("test-ctr-1", &cgroup).await.unwrap();
+    let handle = mgr.register("test-ctr-1", &cgroup, 0).await.unwrap();
     assert_eq!(handle.container_id, "test-ctr-1");
     assert!(handle.cgroup_id > 0, "cgroup_id should be non-zero");
 
@@ -64,7 +64,7 @@ async fn test_register_unregister_roundtrip() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    let handle = mgr.register("test-ctr-rt", &cgroup).await.unwrap();
+    let handle = mgr.register("test-ctr-rt", &cgroup, 0).await.unwrap();
     assert!(handle.cgroup_id > 0);
 
     mgr.unregister("test-ctr-rt").await.unwrap();
@@ -90,7 +90,7 @@ async fn test_network_apply_allowed_host() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-net-host", &cgroup).await.unwrap();
+    mgr.register("test-net-host", &cgroup, 0).await.unwrap();
 
     let policy = NetworkPolicy {
         allowed_hosts: vec!["127.0.0.1".into()],
@@ -111,7 +111,7 @@ async fn test_network_apply_egress_rule() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-net-egress", &cgroup).await.unwrap();
+    mgr.register("test-net-egress", &cgroup, 0).await.unwrap();
 
     let policy = NetworkPolicy {
         allowed_hosts: vec![],
@@ -134,7 +134,7 @@ async fn test_network_apply_empty_policy() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-net-empty", &cgroup).await.unwrap();
+    mgr.register("test-net-empty", &cgroup, 0).await.unwrap();
 
     let policy = NetworkPolicy {
         allowed_hosts: vec![],
@@ -153,7 +153,7 @@ async fn test_network_apply_multiple_hosts() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-net-multi", &cgroup).await.unwrap();
+    mgr.register("test-net-multi", &cgroup, 0).await.unwrap();
 
     let policy = NetworkPolicy {
         allowed_hosts: vec!["127.0.0.1".into(), "10.0.0.1".into()],
@@ -172,7 +172,7 @@ async fn test_network_apply_unresolvable_host() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-net-unres", &cgroup).await.unwrap();
+    mgr.register("test-net-unres", &cgroup, 0).await.unwrap();
 
     let policy = NetworkPolicy {
         allowed_hosts: vec!["this.host.definitely.does.not.exist.invalid".into()],
@@ -196,7 +196,7 @@ async fn test_filesystem_apply_read_path() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-fs-read", &cgroup).await.unwrap();
+    mgr.register("test-fs-read", &cgroup, 0).await.unwrap();
 
     let policy = FilesystemPolicy {
         read_paths: vec!["/tmp".into()],
@@ -215,7 +215,7 @@ async fn test_filesystem_apply_write_path() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-fs-write", &cgroup).await.unwrap();
+    mgr.register("test-fs-write", &cgroup, 0).await.unwrap();
 
     let policy = FilesystemPolicy {
         read_paths: vec![],
@@ -236,7 +236,7 @@ async fn test_filesystem_apply_empty_policy() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-fs-empty", &cgroup).await.unwrap();
+    mgr.register("test-fs-empty", &cgroup, 0).await.unwrap();
 
     let policy = FilesystemPolicy {
         read_paths: vec![],
@@ -261,7 +261,7 @@ async fn test_process_apply_allowed_binary() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-proc-bin", &cgroup).await.unwrap();
+    mgr.register("test-proc-bin", &cgroup, 0).await.unwrap();
 
     // /bin/true or /usr/bin/true — must exist on any Linux system.
     let binary = if std::path::Path::new("/bin/true").exists() {
@@ -289,7 +289,7 @@ async fn test_process_apply_multiple_binaries() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-proc-multi", &cgroup).await.unwrap();
+    mgr.register("test-proc-multi", &cgroup, 0).await.unwrap();
 
     // Collect binaries that actually exist on this system.
     let candidates = ["/bin/sh", "/bin/ls", "/bin/cat", "/usr/bin/env"];
@@ -319,7 +319,7 @@ async fn test_process_apply_nonexistent_binary() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-proc-noent", &cgroup).await.unwrap();
+    mgr.register("test-proc-noent", &cgroup, 0).await.unwrap();
 
     let policy = ProcessPolicy {
         allowed_binaries: vec!["/nonexistent/binary/path/should/not/exist".into()],
@@ -341,7 +341,7 @@ async fn test_credential_apply_secret_acl() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-cred-acl", &cgroup).await.unwrap();
+    mgr.register("test-cred-acl", &cgroup, 0).await.unwrap();
 
     // Create a temporary file to use as a secret path.
     let tmp = tempfile::NamedTempFile::new().expect("failed to create temp file");
@@ -368,7 +368,7 @@ async fn test_credential_apply_ttl() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-cred-ttl", &cgroup).await.unwrap();
+    mgr.register("test-cred-ttl", &cgroup, 0).await.unwrap();
 
     let tmp = tempfile::NamedTempFile::new().expect("failed to create temp file");
     let path = tmp.path().to_str().unwrap().to_string();
@@ -399,7 +399,7 @@ async fn test_get_stats_returns_defaults() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-stats", &cgroup).await.unwrap();
+    mgr.register("test-stats", &cgroup, 0).await.unwrap();
 
     let stats = mgr.get_stats("test-stats").await.unwrap();
     assert_eq!(stats.network_allowed, 0);
@@ -418,7 +418,7 @@ async fn test_subscribe_events_returns_receiver() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-events", &cgroup).await.unwrap();
+    mgr.register("test-events", &cgroup, 0).await.unwrap();
 
     let _rx = mgr.subscribe_events("test-events").await.unwrap();
     // Receiver is valid. No events expected without actual BPF hook triggers.
@@ -436,7 +436,7 @@ async fn test_get_stats_includes_credential_fields() {
     let mgr = BpfPolicyManager::new().unwrap();
     let cgroup = own_cgroup_path();
 
-    mgr.register("test-cred-stats", &cgroup).await.unwrap();
+    mgr.register("test-cred-stats", &cgroup, 0).await.unwrap();
 
     let stats = mgr.get_stats("test-cred-stats").await.unwrap();
 
@@ -484,7 +484,7 @@ async fn test_secret_acl_enforcement() {
 
     // 1. Register the current process cgroup for enforcement.
     let handle = mgr
-        .register("test-secret-acl", &cgroup)
+        .register("test-secret-acl", &cgroup, 0)
         .await
         .expect("register should succeed");
     assert!(handle.cgroup_id > 0);
@@ -586,5 +586,200 @@ async fn test_apply_to_unregistered_container_errors() {
     assert!(
         err_msg.contains("not registered"),
         "error should mention 'not registered', got: {err_msg}"
+    );
+}
+
+// ===========================================================================
+// Tier 8: Overlayfs inode resolution (issue #2 regression)
+// ===========================================================================
+
+/// End-to-end proof that container-namespace policy paths pin the inodes the
+/// LSM hooks actually observe on overlayfs.
+///
+/// A child process is chrooted into a freshly mounted overlayfs (standing in
+/// for a container rootfs: same chroot-visible-through-`/proc/<pid>/root`
+/// shape Docker init has). The parent registers the cgroup with the child's
+/// PID and applies a deny on the *container* path `/secret.txt`, which must
+/// resolve through `/proc/<pid>/root` to the overlay inode. The child then
+/// opens the file: EPERM proves registration-time stat and the in-kernel
+/// `d_inode` agree on overlayfs. A sibling `/allowed.txt` must still open,
+/// proving the deny is inode-exact.
+///
+/// Requires root (mounts an overlay) on top of the usual BPF capabilities —
+/// skipped (not failed) when not root, since plain CAP_BPF runners can't
+/// mount.
+#[tokio::test]
+#[serial]
+async fn test_overlayfs_deny_resolves_via_proc_root() {
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!(
+            "skipping test_overlayfs_deny_resolves_via_proc_root: requires root to mount overlayfs"
+        );
+        return;
+    }
+    // The deny verdict needs the BPF LSM active (lsm=...,bpf on the kernel
+    // command line); without it the file_open hook never fires and the test
+    // would fail for environmental reasons, not code ones.
+    let active_lsms = std::fs::read_to_string("/sys/kernel/security/lsm").unwrap_or_default();
+    if !active_lsms.trim_end().split(',').any(|l| l == "bpf") {
+        eprintln!(
+            "skipping test_overlayfs_deny_resolves_via_proc_root: BPF LSM not active (lsm={active_lsms})"
+        );
+        return;
+    }
+
+    // --- Overlay rootfs: lower with two files, empty upper. ---
+    let base = std::env::temp_dir().join(format!("ac-ovl-test-{}", std::process::id()));
+    let (lower, upper, work, merged) = (
+        base.join("lower"),
+        base.join("upper"),
+        base.join("work"),
+        base.join("merged"),
+    );
+    for d in [&lower, &upper, &work, &merged] {
+        std::fs::create_dir_all(d).expect("mkdir");
+    }
+    std::fs::write(lower.join("secret.txt"), b"deny me").unwrap();
+    std::fs::write(lower.join("allowed.txt"), b"open me").unwrap();
+
+    let opts = std::ffi::CString::new(format!(
+        "lowerdir={},upperdir={},workdir={}",
+        lower.display(),
+        upper.display(),
+        work.display()
+    ))
+    .unwrap();
+    let merged_c = std::ffi::CString::new(merged.to_str().unwrap()).unwrap();
+    let fstype = std::ffi::CString::new("overlay").unwrap();
+    let rc = unsafe {
+        libc::mount(
+            fstype.as_ptr(),
+            merged_c.as_ptr(),
+            fstype.as_ptr(),
+            0,
+            opts.as_ptr() as *const libc::c_void,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "overlay mount failed: {}",
+        std::io::Error::last_os_error()
+    );
+
+    // Everything the child touches is prepared before fork (no allocation
+    // after fork — only async-signal-safe calls).
+    let root_c = std::ffi::CString::new("/").unwrap();
+    let secret_c = std::ffi::CString::new("/secret.txt").unwrap();
+    let allowed_c = std::ffi::CString::new("/allowed.txt").unwrap();
+
+    // ready pipe: child -> parent ("I have chrooted").
+    // go pipe: parent -> child ("policy applied, try the open").
+    let mut ready = [0i32; 2];
+    let mut go = [0i32; 2];
+    unsafe {
+        assert_eq!(libc::pipe(ready.as_mut_ptr()), 0);
+        assert_eq!(libc::pipe(go.as_mut_ptr()), 0);
+    }
+
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0, "fork failed");
+    if child == 0 {
+        // Child: chroot into the overlay, signal readiness, await the go
+        // byte, then probe both files. Exit code encodes the outcome.
+        unsafe {
+            libc::close(ready[0]);
+            libc::close(go[1]);
+            if libc::chroot(merged_c.as_ptr()) != 0 || libc::chdir(root_c.as_ptr()) != 0 {
+                libc::_exit(10);
+            }
+            libc::write(ready[1], b"r".as_ptr() as *const libc::c_void, 1);
+            let mut b = 0u8;
+            libc::read(go[0], &mut b as *mut u8 as *mut libc::c_void, 1);
+
+            let denied = libc::open(secret_c.as_ptr(), libc::O_RDONLY);
+            let denied_errno = *libc::__errno_location();
+            let allowed = libc::open(allowed_c.as_ptr(), libc::O_RDONLY);
+
+            if denied >= 0 {
+                libc::_exit(1); // deny did not fire: inode key mismatch
+            }
+            if denied_errno != libc::EPERM {
+                libc::_exit(2); // failed for the wrong reason
+            }
+            if allowed < 0 {
+                libc::_exit(3); // collateral damage: deny was not inode-exact
+            }
+            libc::_exit(0);
+        }
+    }
+
+    // Parent.
+    unsafe {
+        libc::close(ready[1]);
+        libc::close(go[0]);
+        let mut b = 0u8;
+        assert_eq!(
+            libc::read(ready[0], &mut b as *mut u8 as *mut libc::c_void, 1),
+            1,
+            "child never signalled readiness"
+        );
+    }
+
+    let mgr = BpfPolicyManager::new().expect("BPF programs should load");
+    let cgroup = own_cgroup_path();
+    // The child shares this process's cgroup; its PID drives /proc/<pid>/root
+    // resolution exactly as a Docker init PID does in production.
+    mgr.register("test-ovl-deny", &cgroup, child as u32)
+        .await
+        .expect("register should succeed");
+
+    // Sanity: the proc-root view of the container path must exist.
+    let proc_path = format!("/proc/{child}/root/secret.txt");
+    assert!(
+        std::path::Path::new(&proc_path).exists(),
+        "{proc_path} should resolve into the chrooted overlay"
+    );
+
+    mgr.apply_filesystem(
+        "test-ovl-deny",
+        &FilesystemPolicy {
+            read_paths: vec![],
+            write_paths: vec![],
+            deny_paths: vec!["/secret.txt".into()],
+        },
+    )
+    .await
+    .expect("apply_filesystem should succeed");
+
+    // Release the child and collect its verdict.
+    let status = unsafe {
+        libc::write(go[1], b"g".as_ptr() as *const libc::c_void, 1);
+        let mut status = 0i32;
+        libc::waitpid(child, &mut status, 0);
+        status
+    };
+
+    // Cleanup before asserting so a failure doesn't leak the mount or the
+    // cgroup registration.
+    mgr.unregister("test-ovl-deny")
+        .await
+        .expect("unregister should succeed");
+    unsafe {
+        libc::umount2(merged_c.as_ptr(), libc::MNT_DETACH);
+    }
+    let _ = std::fs::remove_dir_all(&base);
+
+    assert!(
+        libc::WIFEXITED(status),
+        "child did not exit normally (status {status})"
+    );
+    let code = libc::WEXITSTATUS(status);
+    assert_eq!(
+        code, 0,
+        "child verdict {code}: 1 = denied open SUCCEEDED (inode key mismatch — \
+         registration-time stat disagrees with LSM d_inode on overlayfs), \
+         2 = wrong errno, 3 = allowed sibling blocked (deny not inode-exact), \
+         10 = chroot failed"
     );
 }
