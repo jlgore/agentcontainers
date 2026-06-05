@@ -211,3 +211,53 @@ func TestApplyBackendEnforcementRollsBackWithCancelledContext(t *testing.T) {
 		t.Errorf("unregistered = %v, want rollback despite cancelled caller context", ec.unregistered)
 	}
 }
+
+// completingEnforcer counts CompleteToolCall attempts, failing the first n.
+type completingEnforcer struct {
+	enforcerapi.EnforcerClient
+	failFirst int
+	calls     int
+}
+
+func (f *completingEnforcer) CompleteToolCall(ctx context.Context, req *enforcerapi.CompleteToolCallRequest, opts ...grpc.CallOption) (*enforcerapi.CompleteToolCallResponse, error) {
+	f.calls++
+	if f.calls <= f.failFirst {
+		return nil, fmt.Errorf("transient rpc failure")
+	}
+	return &enforcerapi.CompleteToolCallResponse{}, nil
+}
+
+// A transient CompleteToolCall failure must be retried: a lost Complete
+// leaves the correlation window open at the enforcer.
+func TestCompleteToolCallRetriesTransientFailure(t *testing.T) {
+	ec := &completingEnforcer{failFirst: 2}
+	p := &Proxy{deps: Deps{Enforcer: ec, Logger: zaptest.NewLogger(t)}}
+	b := &Backend{Name: "sift", ContainerID: "ctr-1"}
+
+	p.completeToolCall(context.Background(), b, "corr-1")
+	if ec.calls != 3 {
+		t.Errorf("CompleteToolCall attempts = %d, want 3 (two failures then success)", ec.calls)
+	}
+}
+
+func TestCompleteToolCallNoRetryOnSuccess(t *testing.T) {
+	ec := &completingEnforcer{}
+	p := &Proxy{deps: Deps{Enforcer: ec, Logger: zaptest.NewLogger(t)}}
+	b := &Backend{Name: "sift", ContainerID: "ctr-1"}
+
+	p.completeToolCall(context.Background(), b, "corr-1")
+	if ec.calls != 1 {
+		t.Errorf("CompleteToolCall attempts = %d, want 1", ec.calls)
+	}
+}
+
+func TestCompleteToolCallGivesUpAfterBoundedAttempts(t *testing.T) {
+	ec := &completingEnforcer{failFirst: 100}
+	p := &Proxy{deps: Deps{Enforcer: ec, Logger: zaptest.NewLogger(t)}}
+	b := &Backend{Name: "sift", ContainerID: "ctr-1"}
+
+	p.completeToolCall(context.Background(), b, "corr-1")
+	if ec.calls != completeToolCallAttempts {
+		t.Errorf("CompleteToolCall attempts = %d, want %d", ec.calls, completeToolCallAttempts)
+	}
+}

@@ -669,20 +669,34 @@ func (p *Proxy) prepareToolCall(ctx context.Context, b *Backend, corrID, toolNam
 	return nil
 }
 
+// completeToolCallAttempts bounds the retries on CompleteToolCall: a lost
+// Complete leaves the correlation window open until the enforcer's
+// open-window horizon expires it, misattributing background events to this
+// correlation ID in the meantime — worth a few hundred ms of retry.
+const completeToolCallAttempts = 3
+
 func (p *Proxy) completeToolCall(ctx context.Context, b *Backend, corrID string) {
 	if !shouldCorrelate(b) || p.deps.Enforcer == nil {
 		return
 	}
-	if _, err := p.deps.Enforcer.CompleteToolCall(ctx, &enforcerapi.CompleteToolCallRequest{
-		CorrelationId: corrID,
-		ContainerId:   b.ContainerID,
-	}); err != nil {
-		p.deps.Logger.Error("tool-call correlation completion failed",
-			zap.String("correlationId", corrID),
-			zap.String("backend", b.Name),
-			zap.Error(err),
-		)
+	var err error
+	for attempt := 0; attempt < completeToolCallAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
+		}
+		if _, err = p.deps.Enforcer.CompleteToolCall(ctx, &enforcerapi.CompleteToolCallRequest{
+			CorrelationId: corrID,
+			ContainerId:   b.ContainerID,
+		}); err == nil {
+			return
+		}
 	}
+	p.deps.Logger.Error("tool-call correlation completion failed — window stays open until the enforcer horizon expires it",
+		zap.String("correlationId", corrID),
+		zap.String("backend", b.Name),
+		zap.Int("attempts", completeToolCallAttempts),
+		zap.Error(err),
+	)
 }
 
 // logToolCall writes the audit entry, loudly surfacing failures (the call

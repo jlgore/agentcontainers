@@ -65,18 +65,86 @@ fn decode_dev(st_dev: u64) -> (u32, u32) {
     (libc::major(st_dev), libc::minor(st_dev))
 }
 
+/// How long a CLOSED window keeps matching after CompleteToolCall. Ring
+/// buffer events are drained asynchronously: an event generated during call
+/// N can be read after Complete(N), so closed windows must linger long
+/// enough to catch the drain lag — then they are pruned, or a long session
+/// accumulates one window per tool call forever.
+const CLOSED_WINDOW_RETENTION_NS: u64 = 30 * 1_000_000_000;
+
+/// How long an OPEN window (CompleteToolCall never arrived) keeps matching.
+/// This bounds the blast radius of a lost Complete: without a horizon, one
+/// failed RPC would attribute every subsequent kernel event for the cgroup
+/// to that correlation ID for the rest of the session — misattribution the
+/// spec calls worse than no attribution (§3.3). Generous enough for long
+/// forensic tool runs; events past the horizon carry no correlation ID.
+const OPEN_WINDOW_HORIZON_NS: u64 = 2 * 60 * 60 * 1_000_000_000;
+
 fn assign_correlation(event: &mut EnforcementEvent, windows: &CorrelationWindows) {
     let guard = windows.read().unwrap();
     let Some(items) = guard.get(&event.cgroup_id) else {
         return;
     };
     for w in items.iter().rev() {
-        if event.timestamp_ns >= w.start_ns && w.end_ns.is_none_or(|end| event.timestamp_ns <= end)
-        {
+        // An open window matches only up to its horizon — never the rest
+        // of the session.
+        let end = w
+            .end_ns
+            .unwrap_or_else(|| w.start_ns.saturating_add(OPEN_WINDOW_HORIZON_NS));
+        if event.timestamp_ns >= w.start_ns && event.timestamp_ns <= end {
             event.correlation_id = w.correlation_id.clone();
             return;
         }
     }
+}
+
+/// Record the start of a tool-call window, pruning dead windows first (the
+/// write lock is already held; prune amortizes to O(1) per call).
+fn open_tool_window(windows: &CorrelationWindows, cgroup_id: u64, correlation_id: &str, now: u64) {
+    let mut guard = windows.write().unwrap();
+    let items = guard.entry(cgroup_id).or_default();
+    prune_windows(items, now);
+    items.push(ToolWindow {
+        correlation_id: correlation_id.to_string(),
+        start_ns: now,
+        end_ns: None,
+    });
+}
+
+/// Close the open window with this correlation ID. Returns false when no
+/// such window exists (already completed, expired past the horizon, or
+/// never prepared) — callers surface that, since a mismatched Complete is
+/// an audit-relevant signal, not a no-op.
+fn close_tool_window(
+    windows: &CorrelationWindows,
+    cgroup_id: u64,
+    correlation_id: &str,
+    now: u64,
+) -> bool {
+    let mut guard = windows.write().unwrap();
+    let Some(items) = guard.get_mut(&cgroup_id) else {
+        return false;
+    };
+    let mut found = false;
+    for w in items.iter_mut().rev() {
+        if w.correlation_id == correlation_id && w.end_ns.is_none() {
+            w.end_ns = Some(now);
+            found = true;
+            break;
+        }
+    }
+    prune_windows(items, now);
+    found
+}
+
+/// Drop windows that can no longer match any event: closed ones past the
+/// retention horizon, and open ones past the open-window horizon (their
+/// CompleteToolCall is considered lost).
+fn prune_windows(items: &mut Vec<ToolWindow>, now: u64) {
+    items.retain(|w| match w.end_ns {
+        Some(end) => now.saturating_sub(end) < CLOSED_WINDOW_RETENTION_NS,
+        None => now.saturating_sub(w.start_ns) < OPEN_WINDOW_HORIZON_NS,
+    });
 }
 
 // ===========================================================================
@@ -1162,12 +1230,12 @@ mod linux {
             _tool_name: &str,
         ) -> anyhow::Result<()> {
             let cgroup_id = self.lookup_cgroup(container_id)?;
-            let mut windows = self.correlations.write().unwrap();
-            windows.entry(cgroup_id).or_default().push(ToolWindow {
-                correlation_id: correlation_id.to_string(),
-                start_ns: monotonic_ns(),
-                end_ns: None,
-            });
+            open_tool_window(
+                &self.correlations,
+                cgroup_id,
+                correlation_id,
+                monotonic_ns(),
+            );
             Ok(())
         }
 
@@ -1177,14 +1245,17 @@ mod linux {
             correlation_id: &str,
         ) -> anyhow::Result<()> {
             let cgroup_id = self.lookup_cgroup(container_id)?;
-            let mut windows = self.correlations.write().unwrap();
-            if let Some(items) = windows.get_mut(&cgroup_id) {
-                for w in items.iter_mut().rev() {
-                    if w.correlation_id == correlation_id && w.end_ns.is_none() {
-                        w.end_ns = Some(monotonic_ns());
-                        break;
-                    }
-                }
+            if !close_tool_window(
+                &self.correlations,
+                cgroup_id,
+                correlation_id,
+                monotonic_ns(),
+            ) {
+                warn!(
+                    container_id,
+                    correlation_id,
+                    "CompleteToolCall matched no open window (already completed, expired past the horizon, or never prepared)"
+                );
             }
             Ok(())
         }
@@ -1359,16 +1430,12 @@ mod stub {
             _tool_name: &str,
         ) -> anyhow::Result<()> {
             let cgroup_id = self.lookup_cgroup(container_id)?;
-            self.correlations
-                .write()
-                .unwrap()
-                .entry(cgroup_id)
-                .or_default()
-                .push(ToolWindow {
-                    correlation_id: correlation_id.to_string(),
-                    start_ns: monotonic_ns(),
-                    end_ns: None,
-                });
+            open_tool_window(
+                &self.correlations,
+                cgroup_id,
+                correlation_id,
+                monotonic_ns(),
+            );
             Ok(())
         }
 
@@ -1378,13 +1445,17 @@ mod stub {
             correlation_id: &str,
         ) -> anyhow::Result<()> {
             let cgroup_id = self.lookup_cgroup(container_id)?;
-            if let Some(items) = self.correlations.write().unwrap().get_mut(&cgroup_id) {
-                for w in items.iter_mut().rev() {
-                    if w.correlation_id == correlation_id && w.end_ns.is_none() {
-                        w.end_ns = Some(monotonic_ns());
-                        break;
-                    }
-                }
+            if !close_tool_window(
+                &self.correlations,
+                cgroup_id,
+                correlation_id,
+                monotonic_ns(),
+            ) {
+                warn!(
+                    container_id,
+                    correlation_id,
+                    "CompleteToolCall matched no open window (already completed, expired past the horizon, or never prepared)"
+                );
             }
             Ok(())
         }
@@ -1405,6 +1476,126 @@ pub use stub::BpfPolicyManager;
 mod tests {
     use super::*;
     use crate::policy::PolicyManager;
+
+    fn test_event(cgroup_id: u64, timestamp_ns: u64) -> EnforcementEvent {
+        EnforcementEvent {
+            timestamp_ns,
+            cgroup_id,
+            correlation_id: String::new(),
+            container_id: "ctr-1".into(),
+            domain: crate::policy::EventDomain::Process,
+            verdict: crate::policy::EventVerdict::Allow,
+            pid: 1,
+            comm: "find".into(),
+            details: HashMap::new(),
+        }
+    }
+
+    fn new_windows() -> CorrelationWindows {
+        std::sync::Arc::new(RwLock::new(HashMap::new()))
+    }
+
+    fn correlate(windows: &CorrelationWindows, cgroup_id: u64, ts: u64) -> String {
+        let mut ev = test_event(cgroup_id, ts);
+        assign_correlation(&mut ev, windows);
+        ev.correlation_id
+    }
+
+    #[test]
+    fn test_window_open_matches_during_call() {
+        let w = new_windows();
+        open_tool_window(&w, 7, "call-1", 1_000);
+        assert_eq!(correlate(&w, 7, 1_500), "call-1");
+        // Different cgroup never matches.
+        assert_eq!(correlate(&w, 8, 1_500), "");
+        // Before the window opened: no match.
+        assert_eq!(correlate(&w, 7, 500), "");
+    }
+
+    #[test]
+    fn test_window_closed_matches_late_drain_within_retention() {
+        let w = new_windows();
+        open_tool_window(&w, 7, "call-1", 1_000);
+        assert!(close_tool_window(&w, 7, "call-1", 2_000));
+        // Event generated during the call but drained after Complete still
+        // correlates by kernel timestamp (SPEC §3.3).
+        assert_eq!(correlate(&w, 7, 1_500), "call-1");
+        // Event after Complete: outside the window, no correlation.
+        assert_eq!(correlate(&w, 7, 2_500), "");
+    }
+
+    #[test]
+    fn test_window_gap_between_calls_is_uncorrelated() {
+        let w = new_windows();
+        open_tool_window(&w, 7, "call-1", 1_000);
+        assert!(close_tool_window(&w, 7, "call-1", 2_000));
+        open_tool_window(&w, 7, "call-2", 5_000);
+        // Background activity between Complete(1) and Prepare(2) belongs to
+        // neither call.
+        assert_eq!(correlate(&w, 7, 3_000), "");
+        assert_eq!(correlate(&w, 7, 5_500), "call-2");
+        assert_eq!(correlate(&w, 7, 1_500), "call-1");
+    }
+
+    #[test]
+    fn test_window_lost_complete_bounded_by_horizon() {
+        let w = new_windows();
+        open_tool_window(&w, 7, "call-1", 1_000);
+        // CompleteToolCall never arrives. Events within the horizon still
+        // correlate...
+        assert_eq!(correlate(&w, 7, 1_000 + OPEN_WINDOW_HORIZON_NS), "call-1");
+        // ...but the window must not claim the rest of the session.
+        assert_eq!(correlate(&w, 7, 1_001 + OPEN_WINDOW_HORIZON_NS), "");
+    }
+
+    #[test]
+    fn test_window_prune_drops_dead_windows() {
+        let w = new_windows();
+        for i in 0..100u64 {
+            open_tool_window(&w, 7, &format!("call-{i}"), 1_000 + i);
+            assert!(close_tool_window(&w, 7, &format!("call-{i}"), 2_000 + i));
+        }
+        // A prepare long after retention prunes all the closed windows.
+        let later = 2_099 + CLOSED_WINDOW_RETENTION_NS;
+        open_tool_window(&w, 7, "fresh", later);
+        assert_eq!(w.read().unwrap().get(&7).unwrap().len(), 1);
+
+        // An abandoned open window is pruned once past the horizon.
+        let much_later = later + OPEN_WINDOW_HORIZON_NS;
+        open_tool_window(&w, 7, "fresher", much_later);
+        let items: Vec<String> = w
+            .read()
+            .unwrap()
+            .get(&7)
+            .unwrap()
+            .iter()
+            .map(|x| x.correlation_id.clone())
+            .collect();
+        assert_eq!(items, vec!["fresher".to_string()]);
+    }
+
+    #[test]
+    fn test_window_close_unknown_correlation_reports_mismatch() {
+        let w = new_windows();
+        open_tool_window(&w, 7, "call-1", 1_000);
+        assert!(!close_tool_window(&w, 7, "ghost", 2_000));
+        assert!(!close_tool_window(&w, 99, "call-1", 2_000));
+        // Double-complete is a mismatch too.
+        assert!(close_tool_window(&w, 7, "call-1", 2_000));
+        assert!(!close_tool_window(&w, 7, "call-1", 2_100));
+    }
+
+    #[test]
+    fn test_window_overlapping_calls_newest_first() {
+        let w = new_windows();
+        open_tool_window(&w, 7, "call-1", 1_000);
+        open_tool_window(&w, 7, "call-2", 2_000);
+        // In the overlap, the most recent window wins (maxConcurrentTools>1
+        // ambiguity is resolved deterministically).
+        assert_eq!(correlate(&w, 7, 2_500), "call-2");
+        // Before call-2 opened, only call-1 can match.
+        assert_eq!(correlate(&w, 7, 1_500), "call-1");
+    }
 
     /// The userspace st_dev decode and the BPF-side s_dev decode
     /// (lsm/file_open.rs, lsm/bprm_check.rs: `(s_dev >> 20) & 0xfff`,
