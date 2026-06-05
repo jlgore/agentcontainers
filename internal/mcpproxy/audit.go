@@ -2,7 +2,9 @@ package mcpproxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
 
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/audit"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/enforcerapi"
@@ -85,18 +87,94 @@ func enforcerCommand(ev *enforcerapi.EnforcementEvent) string {
 	return ev.Domain
 }
 
-func StreamEnforcerAudit(ctx context.Context, client enforcerapi.EnforcerClient, sink *EnforcerAuditSink) error {
-	stream, err := client.StreamEvents(ctx, &enforcerapi.StreamEventsRequest{})
-	if err != nil {
-		return err
+// Stream reconnect backoff bounds. Vars (not consts) so tests can shrink
+// them.
+var (
+	streamReconnectBaseDelay = time.Second
+	streamReconnectMaxDelay  = 30 * time.Second
+)
+
+// LogStreamGap records a drop ("dropped") or recovery ("resumed") of the
+// kernel event stream. Kernel events emitted while the stream was down are
+// lost; without these markers the loss would be indistinguishable from a
+// quiet container, which a forensic audit cannot afford.
+func (s *EnforcerAuditSink) LogStreamGap(phase, detail string, downtime time.Duration) error {
+	opts := []audit.LogEntryOption{
+		audit.WithMetadataAny("phase", phase),
 	}
+	if detail != "" {
+		opts = append(opts, audit.WithDetail(detail))
+	}
+	if phase == "resumed" {
+		opts = append(opts, audit.WithMetadataAny("downtimeMs", downtime.Milliseconds()))
+	}
+	return s.logger.Log(audit.EventStreamGap, audit.Actor{Type: "system", Name: "enforcer-stream"}, opts...)
+}
+
+// StreamEnforcerAudit consumes the enforcer's event stream into the
+// enforcer audit chain, reconnecting with exponential backoff on stream
+// errors — a transient gRPC drop (enforcer restart, network blip) must not
+// silently end the kernel audit trail for the rest of the session. Each
+// drop and subsequent resume is recorded as a stream_gap entry. Returns on
+// ctx cancellation or when the audit sink itself fails (a broken chain
+// cannot be papered over).
+func StreamEnforcerAudit(ctx context.Context, client enforcerapi.EnforcerClient, sink *EnforcerAuditSink) error {
+	delay := streamReconnectBaseDelay
+	var droppedAt time.Time // zero while the stream is healthy
+
+	for {
+		stream, err := client.StreamEvents(ctx, &enforcerapi.StreamEventsRequest{})
+		if err == nil {
+			err = consumeEnforcerStream(stream, sink, &droppedAt, &delay)
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if errors.Is(err, errAuditSink) {
+			return err
+		}
+		if droppedAt.IsZero() {
+			droppedAt = time.Now()
+			detail := "stream error"
+			if err != nil {
+				detail = err.Error()
+			}
+			if gerr := sink.LogStreamGap("dropped", detail, 0); gerr != nil {
+				return fmt.Errorf("%w: %w", errAuditSink, gerr)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+		delay = min(delay*2, streamReconnectMaxDelay)
+	}
+}
+
+// errAuditSink marks failures writing the audit chain itself — terminal,
+// unlike stream errors.
+var errAuditSink = errors.New("mcpproxy: enforcer audit sink write failed")
+
+// consumeEnforcerStream drains one stream connection. The first successful
+// Recv proves the (re)connection is real: it closes any open gap and resets
+// the backoff. Always returns a non-nil error (the Recv that broke the
+// stream, or errAuditSink).
+func consumeEnforcerStream(stream enforcerapi.Enforcer_StreamEventsClient, sink *EnforcerAuditSink, droppedAt *time.Time, delay *time.Duration) error {
 	for {
 		ev, err := stream.Recv()
 		if err != nil {
 			return err
 		}
+		if !droppedAt.IsZero() {
+			if gerr := sink.LogStreamGap("resumed", "", time.Since(*droppedAt)); gerr != nil {
+				return fmt.Errorf("%w: %w", errAuditSink, gerr)
+			}
+			*droppedAt = time.Time{}
+		}
+		*delay = streamReconnectBaseDelay
 		if err := sink.LogEvent(ev); err != nil {
-			return err
+			return fmt.Errorf("%w: %w", errAuditSink, err)
 		}
 	}
 }

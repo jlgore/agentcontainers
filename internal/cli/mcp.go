@@ -147,7 +147,9 @@ func runMCPStart(cmd *cobra.Command, port int, sessionID, auditDir string, appro
 			return fmt.Errorf("mcp start: %w", err)
 		}
 		go func() {
-			if err := mcpproxy.StreamEnforcerAudit(streamCtx, deps.Enforcer, enforcerAudit); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
+			// StreamEnforcerAudit reconnects on stream errors itself; it
+			// only returns on shutdown or when the audit sink fails.
+			if err := mcpproxy.StreamEnforcerAudit(streamCtx, deps.Enforcer, enforcerAudit); err != nil && !errors.Is(err, context.Canceled) {
 				logger.Warn("enforcer audit stream stopped", zap.Error(err))
 			}
 		}()

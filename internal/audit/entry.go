@@ -16,6 +16,11 @@ const (
 	// EventApprovalDecision records a human approve/deny verdict on a
 	// proxied tools/call (the `<sessionId>-approval` chain, SPEC §7.3).
 	EventApprovalDecision EventType = "approval_decision"
+	// EventStreamGap records a drop or resume of the enforcer event stream
+	// in the `<sessionId>-enforcer` chain. Kernel events emitted during the
+	// gap are lost; the marker makes the gap itself evidence instead of
+	// indistinguishable silence.
+	EventStreamGap EventType = "stream_gap"
 )
 
 // Actor identifies who triggered an event.
