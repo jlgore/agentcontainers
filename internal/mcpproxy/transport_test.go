@@ -107,7 +107,10 @@ type fakeDockerClient struct {
 	createdConfig *container.Config
 	networkName   string
 	started       bool
+	paused        bool
+	unpaused      bool
 	removed       bool
+	pauseErr      error
 	containerConn net.Conn
 }
 
@@ -151,6 +154,19 @@ func (f *fakeDockerClient) ContainerStart(context.Context, string, client.Contai
 	return client.ContainerStartResult{}, nil
 }
 
+func (f *fakeDockerClient) ContainerPause(context.Context, string, client.ContainerPauseOptions) (client.ContainerPauseResult, error) {
+	if f.pauseErr != nil {
+		return client.ContainerPauseResult{}, f.pauseErr
+	}
+	f.paused = true
+	return client.ContainerPauseResult{}, nil
+}
+
+func (f *fakeDockerClient) ContainerUnpause(context.Context, string, client.ContainerUnpauseOptions) (client.ContainerUnpauseResult, error) {
+	f.unpaused = true
+	return client.ContainerUnpauseResult{}, nil
+}
+
 func (f *fakeDockerClient) ContainerStop(context.Context, string, client.ContainerStopOptions) (client.ContainerStopResult, error) {
 	return client.ContainerStopResult{}, nil
 }
@@ -162,7 +178,7 @@ func (f *fakeDockerClient) ContainerRemove(context.Context, string, client.Conta
 
 func TestDialStdioContainerUsesDockerAttachDemux(t *testing.T) {
 	docker := &fakeDockerClient{}
-	tr, containerID, cleanup, err := dialStdioContainer(t.Context(), Deps{Docker: docker, Logger: zaptest.NewLogger(t)}, "sift", config.MCPToolConfig{
+	sc, err := dialStdioContainer(t.Context(), Deps{Docker: docker, Logger: zaptest.NewLogger(t)}, "sift", config.MCPToolConfig{
 		Image:   "example/mcp:latest",
 		Command: []string{"mcp-server"},
 		Env:     map[string]string{"B": "2", "A": "1"},
@@ -170,14 +186,22 @@ func TestDialStdioContainerUsesDockerAttachDemux(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dialStdioContainer: %v", err)
 	}
-	if containerID != "container-1" {
-		t.Fatalf("containerID = %q, want container-1", containerID)
+	if sc.containerID != "container-1" {
+		t.Fatalf("containerID = %q, want container-1", sc.containerID)
 	}
 	if docker.networkName != "ac-mcp-sessiona" {
 		t.Fatalf("network = %q, want ac-mcp-sessiona", docker.networkName)
 	}
 	if !docker.started {
 		t.Fatal("container was not started")
+	}
+	// The container must come back frozen so enforcement lands before it
+	// runs; it must not be unpaused until the caller calls resume.
+	if !docker.paused {
+		t.Fatal("container was not frozen after start")
+	}
+	if docker.unpaused {
+		t.Fatal("container was unfrozen before resume")
 	}
 	if docker.createdConfig == nil || docker.createdConfig.Tty {
 		t.Fatalf("container config = %+v, want non-TTY config", docker.createdConfig)
@@ -186,9 +210,16 @@ func TestDialStdioContainerUsesDockerAttachDemux(t *testing.T) {
 		t.Fatalf("env = %v, want sorted [A=1 B=2]", got)
 	}
 
-	ioTr, ok := tr.(*mcp.IOTransport)
+	if err := sc.resume(t.Context()); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if !docker.unpaused {
+		t.Fatal("resume did not unfreeze the container")
+	}
+
+	ioTr, ok := sc.transport.(*mcp.IOTransport)
 	if !ok {
-		t.Fatalf("transport = %T, want *mcp.IOTransport", tr)
+		t.Fatalf("transport = %T, want *mcp.IOTransport", sc.transport)
 	}
 	line, err := bufio.NewReader(ioTr.Reader).ReadString('\n')
 	if err != nil {
@@ -198,10 +229,33 @@ func TestDialStdioContainerUsesDockerAttachDemux(t *testing.T) {
 		t.Fatalf("stdout = %q", line)
 	}
 
-	if err := cleanup(t.Context()); err != nil {
+	if err := sc.cleanup(t.Context()); err != nil {
 		t.Fatalf("cleanup: %v", err)
 	}
 	if !docker.removed {
 		t.Fatal("container was not removed during cleanup")
 	}
+}
+
+// When the freezer is unavailable, dialStdioContainer proceeds unfrozen
+// (degraded) rather than failing the backend, and resume is a no-op.
+func TestDialStdioContainerDegradesWhenFreezeUnavailable(t *testing.T) {
+	docker := &fakeDockerClient{pauseErr: errors.New("freezer cgroup controller not available")}
+	sc, err := dialStdioContainer(t.Context(), Deps{Docker: docker, Logger: zaptest.NewLogger(t)}, "sift", config.MCPToolConfig{
+		Image:   "example/mcp:latest",
+		Command: []string{"mcp-server"},
+	}, "sessionabcdef", "ac-mcp-sessiona")
+	if err != nil {
+		t.Fatalf("dialStdioContainer should degrade, not fail: %v", err)
+	}
+	if docker.paused {
+		t.Fatal("pause reported success despite the freezer error")
+	}
+	if err := sc.resume(t.Context()); err != nil {
+		t.Fatalf("resume on an unfrozen container must be a no-op: %v", err)
+	}
+	if docker.unpaused {
+		t.Fatal("resume unpaused a container that was never frozen")
+	}
+	_ = sc.cleanup(t.Context())
 }

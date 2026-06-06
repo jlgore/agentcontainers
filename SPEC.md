@@ -85,6 +85,13 @@ the enforcer). One proxy, N backends.
      stdin pipes on a Compose-managed container). Use
      `MCPServiceConfig` from `mcp_isolation.go` for the
      network/secrets/policy spec, but diverge on container lifecycle.
+     The container's cgroup does not exist until it starts, so the
+     proxy freezes it (`ContainerPause`) the instant after start,
+     registers + applies kernel policy while frozen, then unfreezes
+     before the MCP handshake — enforcement is in place before the
+     server handles anything. Docker has no atomic start-frozen, so
+     the brief Start→Pause interval runs unenforced (best-effort; if
+     the freezer is unavailable the pause is skipped with a warning).
    - `transport: "http"` with `image` — launch as a Compose service
      via the existing `GenerateMCPServices` path. Proxy connects via
      HTTP over the `ac-mcp-<session>` bridge network.
@@ -995,6 +1002,7 @@ allowlist (disk-forensics tools address `/dev` specifiers, governed by
 | ENFORCED_CGROUPS cap 256 | Scale | Fine for forensic; document limit |
 | Default serialize per-server | Throughput | maxConcurrentTools override; window exact at 1 |
 | Remote servers: proxy-only enforcement | Design | No cgroup; mark in audit as proxy-only |
+| Container's cgroup/PID exist only after start, so it cannot be registered before its process begins | Phase 3 | Freeze-on-start: pause immediately after start, apply policy while frozen, unfreeze before the handshake. Residual unenforced window is the Start→Pause interval only; skipped with a warning where the freezer is unavailable |
 | Approval socket is security boundary | Phase 4 | 0600 perms + SO_PEERCRED UID check |
 | DNS exfiltration when DNS allowed | Upstream | Filtering resolver as compensating control |
 | /proc/pid/mem bypasses file_open LSM | Upstream | Container boundary is primary isolation |

@@ -224,15 +224,17 @@ func newBackend(ctx context.Context, deps Deps, mcpClient *mcp.Client, name stri
 			return nil, fmt.Errorf("mcpproxy: backend %s: container type requires a Docker connection", name)
 		}
 		b.Kind = KindStdio
-		tr, containerID, cleanup, err := dialStdioContainer(ctx, deps, name, tool, sessionID, networkName)
+		sc, err := dialStdioContainer(ctx, deps, name, tool, sessionID, networkName)
 		if err != nil {
 			return nil, err
 		}
-		b.ContainerID = containerID
-		b.cleanup = append(b.cleanup, cleanup)
+		b.ContainerID = sc.containerID
+		b.cleanup = append(b.cleanup, sc.cleanup)
 
-		// Register with the eBPF enforcer BEFORE the MCP handshake so
-		// kernel policy is in place before the server handles anything.
+		// The container is frozen (best-effort) the instant its process
+		// started. Register and apply kernel policy while it cannot
+		// execute, THEN unfreeze — this closes the window where the
+		// container would otherwise run before its BPF maps are populated.
 		// Fail closed: with an enforcer connected, a backend that cannot
 		// be brought under enforcement does not start.
 		if deps.Enforcer != nil {
@@ -244,7 +246,14 @@ func newBackend(ctx context.Context, deps Deps, mcpClient *mcp.Client, name stri
 			b.cleanup = append(b.cleanup, unregister)
 		}
 
-		session, err := mcpClient.Connect(ctx, tr, nil)
+		// Unfreeze only after policy is in place. From here the container
+		// runs fully enforced through the MCP handshake and every tool call.
+		if err := sc.resume(ctx); err != nil {
+			_ = b.Close(ctx)
+			return nil, fmt.Errorf("mcpproxy: backend %s: resuming container after enforcement: %w", name, err)
+		}
+
+		session, err := mcpClient.Connect(ctx, sc.transport, nil)
 		if err != nil {
 			_ = b.Close(ctx)
 			return nil, fmt.Errorf("mcpproxy: backend %s: MCP initialize over stdio: %w", name, err)
@@ -257,19 +266,41 @@ func newBackend(ctx context.Context, deps Deps, mcpClient *mcp.Client, name stri
 	}
 }
 
+// stdioContainer is a launched, attached, and (best-effort) frozen backend
+// container. The caller applies enforcement while it is frozen, then calls
+// resume to unfreeze before driving the MCP handshake.
+type stdioContainer struct {
+	transport   mcp.Transport
+	containerID string
+	// resume unfreezes the container. No-op when the freeze could not be
+	// applied (resume must still be called — it keeps the lifecycle linear).
+	resume func(context.Context) error
+	// cleanup stops and removes the container; safe whether or not the
+	// container is still frozen.
+	cleanup func(context.Context) error
+}
+
 // dialStdioContainer launches the backend container directly via the Docker
 // API with attached stdin/stdout streams (NOT managed by Compose: Compose
 // services are detached, so stdin pipes cannot be held cleanly), joined to
 // the per-session MCP bridge network.
-func dialStdioContainer(ctx context.Context, deps Deps, name string, tool config.MCPToolConfig, sessionID, networkName string) (mcp.Transport, string, func(context.Context) error, error) {
+//
+// The container is paused immediately after start so the caller can apply
+// kernel enforcement before it executes anything meaningful. Docker has no
+// atomic "start frozen", so the process runs unenforced for the brief
+// Start→Pause interval — far smaller than the previous window (the entire
+// startup, MCP handshake, and first tool call all ran unenforced). If the
+// freezer is unavailable (e.g. some rootless setups) the pause is skipped
+// with a warning and behaviour degrades to that prior window.
+func dialStdioContainer(ctx context.Context, deps Deps, name string, tool config.MCPToolConfig, sessionID, networkName string) (*stdioContainer, error) {
 	dc := deps.Docker
 	log := deps.Logger
 
 	if err := ensureImage(ctx, dc, tool.Image); err != nil {
-		return nil, "", nil, fmt.Errorf("mcpproxy: backend %s: pulling image %s: %w", name, tool.Image, err)
+		return nil, fmt.Errorf("mcpproxy: backend %s: pulling image %s: %w", name, tool.Image, err)
 	}
 	if err := ensureNetwork(ctx, dc, networkName, sessionID); err != nil {
-		return nil, "", nil, fmt.Errorf("mcpproxy: backend %s: %w", name, err)
+		return nil, fmt.Errorf("mcpproxy: backend %s: %w", name, err)
 	}
 
 	cfg := &container.Config{
@@ -310,7 +341,7 @@ func dialStdioContainer(ctx context.Context, deps Deps, name string, tool config
 		Name:             fmt.Sprintf("ac-mcp-%s-%s", name, shortID(sessionID)),
 	})
 	if err != nil {
-		return nil, "", nil, fmt.Errorf("mcpproxy: backend %s: creating container: %w", name, err)
+		return nil, fmt.Errorf("mcpproxy: backend %s: creating container: %w", name, err)
 	}
 	containerID := created.ID
 
@@ -330,19 +361,41 @@ func dialStdioContainer(ctx context.Context, deps Deps, name string, tool config
 	})
 	if err != nil {
 		_ = cleanup(ctx)
-		return nil, "", nil, fmt.Errorf("mcpproxy: backend %s: attaching: %w", name, err)
+		return nil, fmt.Errorf("mcpproxy: backend %s: attaching: %w", name, err)
 	}
 
 	if _, err := dc.ContainerStart(ctx, containerID, client.ContainerStartOptions{}); err != nil {
 		attach.Close()
 		_ = cleanup(ctx)
-		return nil, "", nil, fmt.Errorf("mcpproxy: backend %s: starting container: %w", name, err)
+		return nil, fmt.Errorf("mcpproxy: backend %s: starting container: %w", name, err)
+	}
+
+	// Freeze immediately: the caller applies kernel enforcement before the
+	// container does anything meaningful. Best-effort — if the freezer is
+	// unavailable, proceed unfrozen (the policy still lands, just with the
+	// pre-fix startup race).
+	paused := true
+	if _, err := dc.ContainerPause(ctx, containerID, client.ContainerPauseOptions{}); err != nil {
+		paused = false
+		log.Warn("could not freeze backend container before enforcement; a brief startup window runs unenforced",
+			zap.String("backend", name),
+			zap.String("containerId", containerID),
+			zap.Error(err),
+		)
+	}
+	resume := func(rctx context.Context) error {
+		if !paused {
+			return nil
+		}
+		_, err := dc.ContainerUnpause(rctx, containerID, client.ContainerUnpauseOptions{})
+		return err
 	}
 
 	log.Info("mcp backend container started",
 		zap.String("backend", name),
 		zap.String("containerId", containerID),
 		zap.String("network", networkName),
+		zap.Bool("frozen", paused),
 	)
 
 	// Demux the multiplexed attach stream: MCP needs a clean stdout byte
@@ -359,7 +412,12 @@ func dialStdioContainer(ctx context.Context, deps Deps, name string, tool config
 		Reader: stdoutR,
 		Writer: &hijackWriter{attach: attach.HijackedResponse},
 	}
-	return tr, containerID, cleanup, nil
+	return &stdioContainer{
+		transport:   tr,
+		containerID: containerID,
+		resume:      resume,
+		cleanup:     cleanup,
+	}, nil
 }
 
 // hijackWriter adapts a hijacked attach connection into the WriteCloser
