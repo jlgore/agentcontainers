@@ -154,7 +154,9 @@ fn prune_windows(items: &mut Vec<ToolWindow>, now: u64) {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
-    use crate::events::{parse_cred_event, parse_exec_event, parse_fs_event, parse_network_event};
+    use crate::events::{
+        parse_cred_event, parse_dns_event, parse_exec_event, parse_fs_event, parse_network_event,
+    };
     use agentcontainer_common::events as bpf_events;
     use agentcontainer_common::maps::{
         CgroupStats, DomainKey, FsInodeKey, LpmDataV4, LpmDataV6, PortKeyV4, SecretAclKey,
@@ -226,7 +228,16 @@ mod linux {
         /// SIPHASH_KEY map at startup). Used to hash policy domains when
         /// populating TRACKED_DOMAINS.
         siphash_key: SipHashKey,
+
+        /// Reverse map of policy-domain SipHash digests to the hostnames
+        /// that produced them. The key is random per session, so a raw
+        /// digest in a DNS observation event is opaque to the auditor —
+        /// this map lets the event carry the human-readable domain.
+        domain_names: DomainNames,
     }
+
+    /// Digest → hostname reverse map shared with the DNS event reader.
+    type DomainNames = std::sync::Arc<RwLock<HashMap<[u8; 16], String>>>;
 
     impl BpfPolicyManager {
         /// Load BPF programs from the compiled ELF object.
@@ -274,6 +285,7 @@ mod linux {
                 container_pids: RwLock::new(HashMap::new()),
                 correlations: std::sync::Arc::new(RwLock::new(HashMap::new())),
                 siphash_key,
+                domain_names: std::sync::Arc::new(RwLock::new(HashMap::new())),
             };
 
             // Spawn background ring buffer readers for all event sources.
@@ -408,6 +420,7 @@ mod linux {
             let bus = self.event_bus.clone();
             let registry = self.registry.clone();
             let correlations = self.correlations.clone();
+            let domain_names = self.domain_names.clone();
 
             std::thread::Builder::new()
                 .name("event-readers".into())
@@ -431,13 +444,17 @@ mod linux {
                                         let b = bus.clone();
                                         let r = registry.clone();
                                         let c = correlations.clone();
+                                        // `move` so closure-typed parsers
+                                        // (e.g. the DNS name enricher) are
+                                        // owned by the task; plain fn-item
+                                        // parsers are Copy and unaffected.
                                         handles.push(tokio::task::spawn_local(async move {
                                             Self::run_ring_buf_reader(
                                                 ring_buf,
                                                 b,
                                                 r,
                                                 c,
-                                                |data, cid| {
+                                                move |data, cid| {
                                                     if data.len()
                                                         >= std::mem::size_of::<$event_type>()
                                                     {
@@ -464,6 +481,17 @@ mod linux {
                         spawn_reader!("FS_EVENTS", bpf_events::FsEvent, parse_fs_event);
                         spawn_reader!("PROC_EVENTS", bpf_events::ExecEvent, parse_exec_event);
                         spawn_reader!("CRED_EVENTS", bpf_events::CredEvent, parse_cred_event);
+                        // DNS observations: enrich with the readable domain
+                        // name — the SipHash key is random per session, so
+                        // the raw digest is opaque to the auditor.
+                        let parse_dns = move |raw: &bpf_events::DnsEvent, cid: &str| {
+                            let mut ev = parse_dns_event(raw, cid);
+                            if let Some(name) = domain_names.read().unwrap().get(&raw.domain_hash) {
+                                ev.details.insert("domain".into(), name.clone());
+                            }
+                            ev
+                        };
+                        spawn_reader!("DNS_EVENTS", bpf_events::DnsEvent, parse_dns);
 
                         for h in handles {
                             let _ = h.await;
@@ -695,10 +723,13 @@ mod linux {
         /// Insert a policy host into TRACKED_DOMAINS for DNS observation.
         /// IP literals are skipped (they never appear in DNS questions).
         /// The hash matches the BPF DNS parser: SipHash-2-4 over the
-        /// lowercased dotted name without a trailing dot.
+        /// lowercased dotted name without a trailing dot. The digest →
+        /// hostname mapping is recorded so observation events can carry
+        /// the readable name.
         fn track_domain(
             bpf: &mut Ebpf,
             sip_key: &SipHashKey,
+            names: &DomainNames,
             cgroup_id: u64,
             host: &str,
         ) -> anyhow::Result<()> {
@@ -706,15 +737,14 @@ mod linux {
                 return Ok(());
             }
             let canon = host.trim_end_matches('.').to_ascii_lowercase();
-            let key = DomainKey {
-                cgroup_id,
-                hash: siphash128_bytes(sip_key, canon.as_bytes()),
-            };
+            let hash = siphash128_bytes(sip_key, canon.as_bytes());
+            let key = DomainKey { cgroup_id, hash };
             let map_data = bpf
                 .map_mut("TRACKED_DOMAINS")
                 .ok_or_else(|| anyhow::anyhow!("BPF map TRACKED_DOMAINS not found"))?;
             let mut map: AyaHashMap<_, DomainKey, u8> = AyaHashMap::try_from(map_data)?;
             map.insert(key, 1, 0)?;
+            names.write().unwrap().insert(hash, canon.clone());
             info!(host = %canon, cgroup_id, "tracking domain for DNS observation");
             Ok(())
         }
@@ -935,7 +965,13 @@ mod linux {
                 .iter()
                 .chain(policy.egress_rules.iter().map(|r| &r.host));
             for host in hosts {
-                if let Err(e) = Self::track_domain(&mut bpf, &self.siphash_key, cgroup_id, host) {
+                if let Err(e) = Self::track_domain(
+                    &mut bpf,
+                    &self.siphash_key,
+                    &self.domain_names,
+                    cgroup_id,
+                    host,
+                ) {
                     warn!(host, error = %e, "failed to add domain to TRACKED_DOMAINS");
                 }
             }

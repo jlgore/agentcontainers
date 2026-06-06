@@ -75,6 +75,16 @@ func enforcerCommand(ev *enforcerapi.EnforcementEvent) string {
 		if dst := ev.Details["dst_ip"]; dst != "" {
 			return fmt.Sprintf("connect %s:%s/%s", dst, ev.Details["dst_port"], ev.Details["protocol"])
 		}
+		// DNS observation: a tracked policy domain resolved inside the
+		// container. The readable name is present when the enforcer could
+		// reverse the digest; the digest alone is session-opaque.
+		if ip := ev.Details["resolved_ip"]; ip != "" {
+			name := ev.Details["domain"]
+			if name == "" {
+				name = "domain#" + ev.Details["domain_hash"]
+			}
+			return fmt.Sprintf("dns %s %s -> %s", ev.Details["record_type"], name, ip)
+		}
 	case "filesystem":
 		return "open inode " + ev.Details["inode"]
 	case "process":

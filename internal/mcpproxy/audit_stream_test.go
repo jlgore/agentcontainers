@@ -181,3 +181,39 @@ func TestStreamEnforcerAuditReconnectsOnEOF(t *testing.T) {
 		t.Errorf("entry 2 = %s, want enforcement event after reconnect", entries[2].EventType)
 	}
 }
+
+func TestEnforcerCommandDNSObservation(t *testing.T) {
+	named := &enforcerapi.EnforcementEvent{
+		Domain:  "network",
+		Verdict: "allow",
+		Details: map[string]string{
+			"record_type": "A",
+			"domain":      "intel.example.com",
+			"domain_hash": "abcd1234",
+			"resolved_ip": "93.184.216.34",
+			"ttl":         "3600",
+		},
+	}
+	if got := enforcerCommand(named); got != "dns A intel.example.com -> 93.184.216.34" {
+		t.Errorf("named DNS command = %q", got)
+	}
+
+	// Without a reversed name the digest is still recorded — opaque but
+	// correlatable within the session.
+	unnamed := &enforcerapi.EnforcementEvent{
+		Domain:  "network",
+		Details: map[string]string{"record_type": "AAAA", "domain_hash": "abcd1234", "resolved_ip": "2001:db8::1"},
+	}
+	if got := enforcerCommand(unnamed); got != "dns AAAA domain#abcd1234 -> 2001:db8::1" {
+		t.Errorf("unnamed DNS command = %q", got)
+	}
+
+	// Plain connect events are unaffected.
+	connect := &enforcerapi.EnforcementEvent{
+		Domain:  "network",
+		Details: map[string]string{"dst_ip": "169.254.169.254", "dst_port": "80", "protocol": "tcp"},
+	}
+	if got := enforcerCommand(connect); got != "connect 169.254.169.254:80/tcp" {
+		t.Errorf("connect command = %q", got)
+	}
+}
