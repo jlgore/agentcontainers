@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"testing"
 
+	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
+	"go.uber.org/zap/zaptest/observer"
 	"google.golang.org/grpc"
 
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/config"
@@ -259,5 +261,36 @@ func TestCompleteToolCallGivesUpAfterBoundedAttempts(t *testing.T) {
 	p.completeToolCall(context.Background(), b, "corr-1")
 	if ec.calls != completeToolCallAttempts {
 		t.Errorf("CompleteToolCall attempts = %d, want %d", ec.calls, completeToolCallAttempts)
+	}
+}
+
+// Declared filesystem read/write allowlists must surface the kernel
+// posture gap (SPEC §14) at registration time — once, in the operator's
+// log — while deny-only policies stay quiet.
+func TestApplyBackendEnforcementWarnsOnProxyOnlyAllowlists(t *testing.T) {
+	tests := []struct {
+		name     string
+		fs       *config.FilesystemCaps
+		wantWarn bool
+	}{
+		{"read allowlist warns", &config.FilesystemCaps{Read: []string{"/evidence"}}, true},
+		{"write allowlist warns", &config.FilesystemCaps{Write: []string{"/cases"}}, true},
+		{"deny-only stays quiet", &config.FilesystemCaps{Deny: []string{"/etc/shadow"}}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			core, logs := observer.New(zap.WarnLevel)
+			ec := &recordingEnforcer{}
+			b := &Backend{Name: "sift", ContainerID: "ctr-1"}
+			tool := config.MCPToolConfig{Policy: &config.MCPServerPolicy{Filesystem: tt.fs}}
+
+			if _, err := applyBackendEnforcement(context.Background(), ec, zap.New(core), b, tool, "/sys/fs/cgroup/test", 123); err != nil {
+				t.Fatalf("applyBackendEnforcement: %v", err)
+			}
+			warned := logs.FilterMessageSnippet("proxy-enforced only").Len() > 0
+			if warned != tt.wantWarn {
+				t.Errorf("posture warning logged = %v, want %v (entries: %v)", warned, tt.wantWarn, logs.All())
+			}
+		})
 	}
 }

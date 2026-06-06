@@ -109,6 +109,17 @@ func applyBackendEnforcement(ctx context.Context, ec enforcerapi.EnforcerClient,
 	// the LSM runs in deny-list mode).
 	if tool.Policy != nil && tool.Policy.Filesystem != nil {
 		fs := tool.Policy.Filesystem
+		if len(fs.Read) > 0 || len(fs.Write) > 0 {
+			// Posture, not failure: the same lists confine argument paths at
+			// the proxy (filesystem.rego), and tool calls carry the
+			// "fs-allowlists:proxy-only" enforcement marker in the audit
+			// trail. Logged so the operator sees the kernel-confinement gap
+			// at registration, not only in SPEC §14.
+			log.Warn("filesystem read/write allowlists are proxy-enforced only — the kernel LSM runs in deny-list mode (deny paths and secret ACLs stay kernel-enforced; kernel allowlist confinement awaits inode-ancestry matching)",
+				zap.String("backend", b.Name),
+				zap.Int("readPaths", len(fs.Read)),
+				zap.Int("writePaths", len(fs.Write)))
+		}
 		if _, err := ec.ApplyFilesystemPolicy(ctx, &enforcerapi.FilesystemPolicyRequest{
 			ContainerId: b.ContainerID,
 			ReadPaths:   fs.Read,

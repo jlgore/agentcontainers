@@ -86,11 +86,18 @@ type Backend struct {
 }
 
 // Enforcement returns the audit-trail enforcement marker for this backend:
-// "proxy-only" for remote servers (no cgroup to attach eBPF to), empty
-// otherwise.
+// "proxy-only" for remote servers (no cgroup to attach eBPF to);
+// "fs-allowlists:proxy-only" for container backends whose policy declares
+// filesystem read/write allowlists — the kernel LSM runs in deny-list mode
+// (deny paths and secret ACLs are kernel-enforced), so allowlist confinement
+// happens only at the proxy's filesystem.rego layer; empty otherwise.
 func (b *Backend) Enforcement() string {
 	if b.Kind == KindRemote {
 		return "proxy-only"
+	}
+	if b.Kind == KindStdio && b.Policy != nil && b.Policy.Filesystem != nil &&
+		(len(b.Policy.Filesystem.Read) > 0 || len(b.Policy.Filesystem.Write) > 0) {
+		return "fs-allowlists:proxy-only"
 	}
 	return ""
 }

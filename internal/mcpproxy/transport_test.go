@@ -259,3 +259,49 @@ func TestDialStdioContainerDegradesWhenFreezeUnavailable(t *testing.T) {
 	}
 	_ = sc.cleanup(t.Context())
 }
+
+// The audit enforcement marker must surface the posture gap from SPEC §14:
+// container backends whose policy declares filesystem read/write allowlists
+// get those allowlists confined at the proxy only (the kernel LSM runs in
+// deny-list mode), and the audit trail must say so per tool call.
+func TestBackendEnforcementMarker(t *testing.T) {
+	tests := []struct {
+		name string
+		b    *Backend
+		want string
+	}{
+		{"remote is proxy-only", &Backend{Kind: KindRemote}, "proxy-only"},
+		{"container without policy is fully enforced", &Backend{Kind: KindStdio}, ""},
+		{"container with deny-only filesystem policy is fully enforced", &Backend{
+			Kind: KindStdio,
+			Policy: &config.MCPServerPolicy{
+				Filesystem: &config.FilesystemCaps{Deny: []string{"/etc/shadow"}},
+			},
+		}, ""},
+		{"container with read allowlist marks fs-allowlists proxy-only", &Backend{
+			Kind: KindStdio,
+			Policy: &config.MCPServerPolicy{
+				Filesystem: &config.FilesystemCaps{Read: []string{"/evidence"}},
+			},
+		}, "fs-allowlists:proxy-only"},
+		{"container with write allowlist marks fs-allowlists proxy-only", &Backend{
+			Kind: KindStdio,
+			Policy: &config.MCPServerPolicy{
+				Filesystem: &config.FilesystemCaps{Write: []string{"/cases"}},
+			},
+		}, "fs-allowlists:proxy-only"},
+		{"component is unmarked", &Backend{
+			Kind: KindComponent,
+			Policy: &config.MCPServerPolicy{
+				Filesystem: &config.FilesystemCaps{Read: []string{"/evidence"}},
+			},
+		}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.b.Enforcement(); got != tt.want {
+				t.Errorf("Enforcement() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
