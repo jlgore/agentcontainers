@@ -194,6 +194,25 @@ mod linux {
     /// Environment variable to override the BPF ELF path.
     const BPF_ELF_ENV: &str = "AC_BPF_ELF_PATH";
 
+    /// Cloud metadata endpoints blocked for every enforced cgroup on each
+    /// `apply_network`, ahead of any allow entry (BLOCKED_CIDRS is checked
+    /// first in the connect/sendmsg hooks). Mirrors the sandbox L7 proxy's
+    /// default BlockCIDRs (internal/sandbox/policy.go).
+    const METADATA_ENDPOINTS: &[&str] = &[
+        "169.254.169.254/32", // AWS/GCP/Azure IMDS (v4)
+        "fd00:ec2::254/128",  // AWS IMDS (v6)
+    ];
+
+    /// Convert an IPv6 address to the `[u32; 4]` layout the BPF hooks read
+    /// from `user_ip6`: four words whose in-memory bytes are the address in
+    /// network order (the LPM trie matches on raw key bytes).
+    fn ipv6_words(ip: std::net::Ipv6Addr) -> [u32; 4] {
+        let o = ip.octets();
+        core::array::from_fn(|i| {
+            u32::from_ne_bytes([o[4 * i], o[4 * i + 1], o[4 * i + 2], o[4 * i + 3]])
+        })
+    }
+
     /// Real BPF-backed policy manager for Linux.
     ///
     /// Holds the loaded BPF programs and typed map handles. Methods translate
@@ -905,17 +924,38 @@ mod linux {
             // swept (default-deny on previously-allowed destinations) while
             // lookups are in flight.
             let mut host_addrs: Vec<(&str, std::net::Ipv4Addr)> = Vec::new();
+            let mut host_addrs_v6: Vec<(&str, std::net::Ipv6Addr)> = Vec::new();
             for host in &policy.allowed_hosts {
                 match tokio::net::lookup_host(format!("{host}:0")).await {
                     Ok(addrs) => {
                         for addr in addrs {
-                            if let std::net::IpAddr::V4(ip) = addr.ip() {
-                                host_addrs.push((host, ip));
+                            match addr.ip() {
+                                std::net::IpAddr::V4(ip) => host_addrs.push((host, ip)),
+                                std::net::IpAddr::V6(ip) => host_addrs_v6.push((host, ip)),
                             }
                         }
                     }
                     Err(e) => {
                         warn!(host, error = %e, "DNS resolution failed for allowed host, skipping");
+                    }
+                }
+            }
+
+            // Blocked CIDRs: policy entries plus the cloud metadata
+            // endpoints, which are always denied for every enforced cgroup —
+            // an allowed hostname under attacker-influenced DNS must not be
+            // able to resolve its way to the instance credentials endpoint.
+            let mut blocked_v4: Vec<(std::net::Ipv4Addr, u8)> = Vec::new();
+            let mut blocked_v6: Vec<(std::net::Ipv6Addr, u8)> = Vec::new();
+            let builtin = METADATA_ENDPOINTS.iter().map(|s| (*s, true));
+            let declared = policy.blocked_cidrs.iter().map(|s| (s.as_str(), false));
+            for (cidr, is_builtin) in builtin.chain(declared) {
+                match crate::policy::parse_cidr(cidr) {
+                    Some((std::net::IpAddr::V4(ip), prefix)) => blocked_v4.push((ip, prefix)),
+                    Some((std::net::IpAddr::V6(ip), prefix)) => blocked_v6.push((ip, prefix)),
+                    None => {
+                        debug_assert!(!is_builtin, "builtin metadata CIDR must parse");
+                        warn!(cidr, "malformed blocked CIDR in network policy, skipping");
                     }
                 }
             }
@@ -933,8 +973,18 @@ mod linux {
                 match tokio::net::lookup_host(format!("{}:0", rule.host)).await {
                     Ok(addrs) => {
                         for addr in addrs {
-                            if let std::net::IpAddr::V4(ip) = addr.ip() {
-                                rule_addrs.push((rule, ip, proto));
+                            match addr.ip() {
+                                std::net::IpAddr::V4(ip) => rule_addrs.push((rule, ip, proto)),
+                                std::net::IpAddr::V6(ip) => {
+                                    // No per-port IPv6 map exists (ALLOWED_PORTS
+                                    // is v4-keyed); widening the rule to a
+                                    // host-wide v6 allow would exceed declared
+                                    // policy, so the v6 address stays denied.
+                                    warn!(
+                                        host = %rule.host, ip = %ip,
+                                        "egress rule resolved to IPv6 — port-scoped v6 enforcement unsupported, address remains denied"
+                                    );
+                                }
                             }
                         }
                     }
@@ -976,6 +1026,41 @@ mod linux {
                 }
             }
 
+            // Always-deny overrides go in first: BLOCKED_CIDRS_* is checked
+            // before the allow maps in the hooks, so an IP covered here is
+            // unreachable no matter what the allow inserts below contain.
+            for (ip, prefix) in blocked_v4 {
+                let key = LpmKey::new(
+                    LPM_CGROUP_PREFIX + prefix as u32,
+                    LpmDataV4 {
+                        cgroup_id,
+                        addr: u32::from(ip).to_be(),
+                        _pad: 0,
+                    },
+                );
+                let map_data = bpf
+                    .map_mut("BLOCKED_CIDRS_V4")
+                    .ok_or_else(|| anyhow::anyhow!("BPF map BLOCKED_CIDRS_V4 not found"))?;
+                let mut map: LpmTrie<_, LpmDataV4, u8> = LpmTrie::try_from(map_data)?;
+                map.insert(&key, 1, 0)?;
+                info!(cidr = %format!("{ip}/{prefix}"), cgroup_id, "added CIDR to BLOCKED_CIDRS_V4");
+            }
+            for (ip, prefix) in blocked_v6 {
+                let key = LpmKey::new(
+                    LPM_CGROUP_PREFIX + prefix as u32,
+                    LpmDataV6 {
+                        cgroup_id,
+                        addr: ipv6_words(ip),
+                    },
+                );
+                let map_data = bpf
+                    .map_mut("BLOCKED_CIDRS_V6")
+                    .ok_or_else(|| anyhow::anyhow!("BPF map BLOCKED_CIDRS_V6 not found"))?;
+                let mut map: LpmTrie<_, LpmDataV6, u8> = LpmTrie::try_from(map_data)?;
+                map.insert(&key, 1, 0)?;
+                info!(cidr = %format!("{ip}/{prefix}"), cgroup_id, "added CIDR to BLOCKED_CIDRS_V6");
+            }
+
             for (host, ip) in host_addrs {
                 // Per-cgroup LPM key: prefix covers all 64 cgroup bits plus
                 // the full /32 host address.
@@ -993,6 +1078,22 @@ mod linux {
                 let mut map: LpmTrie<_, LpmDataV4, u8> = LpmTrie::try_from(map_data)?;
                 map.insert(&key, 1, 0)?;
                 info!(host, ip = %ip, cgroup_id, "added IP to ALLOWED_V4");
+            }
+
+            for (host, ip) in host_addrs_v6 {
+                let key = LpmKey::new(
+                    LPM_CGROUP_PREFIX + 128,
+                    LpmDataV6 {
+                        cgroup_id,
+                        addr: ipv6_words(ip),
+                    },
+                );
+                let map_data = bpf
+                    .map_mut("ALLOWED_V6")
+                    .ok_or_else(|| anyhow::anyhow!("BPF map ALLOWED_V6 not found"))?;
+                let mut map: LpmTrie<_, LpmDataV6, u8> = LpmTrie::try_from(map_data)?;
+                map.insert(&key, 1, 0)?;
+                info!(host, ip = %ip, cgroup_id, "added IP to ALLOWED_V6");
             }
 
             for (rule, ip, proto) in rule_addrs {

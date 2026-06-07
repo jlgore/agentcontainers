@@ -274,6 +274,9 @@ impl Enforcer for EnforcerService {
                 })
                 .collect(),
             dns_servers: req.dns_servers,
+            // Not part of the bundle-baseline check above: blocked CIDRs
+            // only narrow what the baseline allows, never widen it.
+            blocked_cidrs: req.blocked_cidrs,
         };
 
         match self
@@ -1186,6 +1189,7 @@ mod tests {
                     protocol: "tcp".into(),
                 }],
                 dns_servers: vec!["8.8.8.8".into()],
+                blocked_cidrs: vec![],
             })
             .await
             .unwrap()
@@ -1210,6 +1214,7 @@ mod tests {
                     protocol: "tcp".into(),
                 }],
                 dns_servers: vec![],
+                blocked_cidrs: vec![],
             })
             .await
             .unwrap()
@@ -1851,6 +1856,7 @@ mod tests {
                 allowed_hosts: vec!["api.example.com".into()],
                 egress_rules: vec![],
                 dns_servers: vec!["8.8.8.8".into()],
+                blocked_cidrs: vec![],
             })
             .await
             .unwrap()
@@ -1874,6 +1880,7 @@ mod tests {
                 allowed_hosts: vec!["evil.example.com".into()], // not in bundle
                 egress_rules: vec![],
                 dns_servers: vec![],
+                blocked_cidrs: vec![],
             })
             .await;
 

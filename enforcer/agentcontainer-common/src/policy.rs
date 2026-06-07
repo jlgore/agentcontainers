@@ -24,6 +24,9 @@ pub struct NetworkPolicy {
     pub egress_rules: Vec<EgressRule>,
     /// DNS server IPs (restrict DNS queries to these).
     pub dns_servers: Vec<String>,
+    /// CIDRs (or bare IPs) denied even when an allow entry covers them.
+    /// Checked before the allow maps in the BPF connect/sendmsg hooks.
+    pub blocked_cidrs: Vec<String>,
 }
 
 /// A specific egress rule with host, port, and protocol.

@@ -21,10 +21,20 @@ func TestTranslateNetworkCaps(t *testing.T) {
 		wantHosts   []string
 		wantEgress  int
 		wantDefProt string
+		wantBlocked []string
 	}{
 		{
 			name:   "nil policy is default-deny (empty request)",
 			policy: nil,
+		},
+		{
+			name: "deny list forwards as blocked CIDRs",
+			policy: &config.MCPServerPolicy{Network: &config.NetworkCaps{
+				Egress: []config.EgressRule{{Host: "ghcr.io"}},
+				Deny:   []string{"10.0.0.0/8", "192.0.2.7"},
+			}},
+			wantHosts:   []string{"ghcr.io"},
+			wantBlocked: []string{"10.0.0.0/8", "192.0.2.7"},
 		},
 		{
 			name:   "nil network is default-deny",
@@ -68,6 +78,14 @@ func TestTranslateNetworkCaps(t *testing.T) {
 			}
 			if tt.wantDefProt != "" && req.EgressRules[0].Protocol != tt.wantDefProt {
 				t.Errorf("default protocol = %q, want %q", req.EgressRules[0].Protocol, tt.wantDefProt)
+			}
+			if len(req.BlockedCidrs) != len(tt.wantBlocked) {
+				t.Fatalf("BlockedCidrs = %v, want %v", req.BlockedCidrs, tt.wantBlocked)
+			}
+			for i, c := range tt.wantBlocked {
+				if req.BlockedCidrs[i] != c {
+					t.Errorf("BlockedCidrs[%d] = %q, want %q", i, req.BlockedCidrs[i], c)
+				}
 			}
 		})
 	}

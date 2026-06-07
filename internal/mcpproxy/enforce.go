@@ -135,14 +135,16 @@ func applyBackendEnforcement(ctx context.Context, ec enforcerapi.EnforcerClient,
 
 // translateNetworkCaps converts config.NetworkCaps to the enforcer request.
 // Egress rules with a port become precise (host, port, protocol) tuples;
-// port-less rules become host-wide allows. The deny list is not forwarded:
-// the kernel layer is default-deny, so an explicit deny adds nothing today
-// (BLOCKED_CIDRS population is reserved for always-deny overrides).
+// port-less rules become host-wide allows. The deny list is forwarded as
+// blocked CIDRs — always-deny overrides checked BEFORE the allow maps, so
+// a denied CIDR is unreachable even when an allowed hostname resolves into
+// it (the enforcer also always blocks the cloud metadata endpoints).
 func translateNetworkCaps(containerID string, p *config.MCPServerPolicy) *enforcerapi.NetworkPolicyRequest {
 	req := &enforcerapi.NetworkPolicyRequest{ContainerId: containerID}
 	if p == nil || p.Network == nil {
 		return req
 	}
+	req.BlockedCidrs = append(req.BlockedCidrs, p.Network.Deny...)
 	for _, rule := range p.Network.Egress {
 		if rule.Port > 0 {
 			proto := rule.Protocol

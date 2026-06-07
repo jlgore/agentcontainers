@@ -80,6 +80,12 @@ message NetworkPolicyRequest {
   repeated string allowed_hosts = 2;
   repeated EgressRule egress_rules = 3;
   repeated string dns_servers = 4;
+  // CIDRs (or bare IPs) denied even when an allow entry covers them —
+  // checked before the allow maps in the BPF connect/sendmsg hooks.
+  // The enforcer additionally always blocks the cloud metadata endpoints
+  // for every enforced cgroup; these entries narrow policy, never widen
+  // it, so they are not part of the signed-bundle baseline check.
+  repeated string blocked_cidrs = 5;
 }
 
 message EgressRule {

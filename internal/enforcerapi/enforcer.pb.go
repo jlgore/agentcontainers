@@ -390,11 +390,17 @@ func (*CompleteToolCallResponse) Descriptor() ([]byte, []int) {
 }
 
 type NetworkPolicyRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ContainerId   string                 `protobuf:"bytes,1,opt,name=container_id,json=containerId,proto3" json:"container_id,omitempty"`
-	AllowedHosts  []string               `protobuf:"bytes,2,rep,name=allowed_hosts,json=allowedHosts,proto3" json:"allowed_hosts,omitempty"`
-	EgressRules   []*EgressRule          `protobuf:"bytes,3,rep,name=egress_rules,json=egressRules,proto3" json:"egress_rules,omitempty"`
-	DnsServers    []string               `protobuf:"bytes,4,rep,name=dns_servers,json=dnsServers,proto3" json:"dns_servers,omitempty"`
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	ContainerId  string                 `protobuf:"bytes,1,opt,name=container_id,json=containerId,proto3" json:"container_id,omitempty"`
+	AllowedHosts []string               `protobuf:"bytes,2,rep,name=allowed_hosts,json=allowedHosts,proto3" json:"allowed_hosts,omitempty"`
+	EgressRules  []*EgressRule          `protobuf:"bytes,3,rep,name=egress_rules,json=egressRules,proto3" json:"egress_rules,omitempty"`
+	DnsServers   []string               `protobuf:"bytes,4,rep,name=dns_servers,json=dnsServers,proto3" json:"dns_servers,omitempty"`
+	// CIDRs (or bare IPs) denied even when an allow entry covers them —
+	// checked before the allow maps in the BPF connect/sendmsg hooks.
+	// The enforcer additionally always blocks the cloud metadata endpoints
+	// for every enforced cgroup; these entries narrow policy, never widen
+	// it, so they are not part of the signed-bundle baseline check.
+	BlockedCidrs  []string `protobuf:"bytes,5,rep,name=blocked_cidrs,json=blockedCidrs,proto3" json:"blocked_cidrs,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -453,6 +459,13 @@ func (x *NetworkPolicyRequest) GetEgressRules() []*EgressRule {
 func (x *NetworkPolicyRequest) GetDnsServers() []string {
 	if x != nil {
 		return x.DnsServers
+	}
+	return nil
+}
+
+func (x *NetworkPolicyRequest) GetBlockedCidrs() []string {
+	if x != nil {
+		return x.BlockedCidrs
 	}
 	return nil
 }
@@ -2273,13 +2286,14 @@ const file_enforcer_proto_rawDesc = "" +
 	"\x17CompleteToolCallRequest\x12%\n" +
 	"\x0ecorrelation_id\x18\x01 \x01(\tR\rcorrelationId\x12!\n" +
 	"\fcontainer_id\x18\x02 \x01(\tR\vcontainerId\"\x1a\n" +
-	"\x18CompleteToolCallResponse\"\xcb\x01\n" +
+	"\x18CompleteToolCallResponse\"\xf0\x01\n" +
 	"\x14NetworkPolicyRequest\x12!\n" +
 	"\fcontainer_id\x18\x01 \x01(\tR\vcontainerId\x12#\n" +
 	"\rallowed_hosts\x18\x02 \x03(\tR\fallowedHosts\x12J\n" +
 	"\fegress_rules\x18\x03 \x03(\v2'.agentcontainers.enforcer.v1.EgressRuleR\vegressRules\x12\x1f\n" +
 	"\vdns_servers\x18\x04 \x03(\tR\n" +
-	"dnsServers\"P\n" +
+	"dnsServers\x12#\n" +
+	"\rblocked_cidrs\x18\x05 \x03(\tR\fblockedCidrs\"P\n" +
 	"\n" +
 	"EgressRule\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x12\n" +

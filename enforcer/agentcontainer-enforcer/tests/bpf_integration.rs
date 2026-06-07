@@ -96,6 +96,7 @@ async fn test_network_apply_allowed_host() {
         allowed_hosts: vec!["127.0.0.1".into()],
         egress_rules: vec![],
         dns_servers: vec![],
+        blocked_cidrs: vec![],
     };
 
     mgr.apply_network("test-net-host", &policy).await.unwrap();
@@ -121,6 +122,7 @@ async fn test_network_apply_egress_rule() {
             protocol: "tcp".into(),
         }],
         dns_servers: vec![],
+        blocked_cidrs: vec![],
     };
 
     mgr.apply_network("test-net-egress", &policy).await.unwrap();
@@ -140,6 +142,7 @@ async fn test_network_apply_empty_policy() {
         allowed_hosts: vec![],
         egress_rules: vec![],
         dns_servers: vec![],
+        blocked_cidrs: vec![],
     };
 
     mgr.apply_network("test-net-empty", &policy).await.unwrap();
@@ -159,6 +162,7 @@ async fn test_network_apply_multiple_hosts() {
         allowed_hosts: vec!["127.0.0.1".into(), "10.0.0.1".into()],
         egress_rules: vec![],
         dns_servers: vec![],
+        blocked_cidrs: vec![],
     };
 
     mgr.apply_network("test-net-multi", &policy).await.unwrap();
@@ -178,6 +182,7 @@ async fn test_network_apply_unresolvable_host() {
         allowed_hosts: vec!["this.host.definitely.does.not.exist.invalid".into()],
         egress_rules: vec![],
         dns_servers: vec![],
+        blocked_cidrs: vec![],
     };
 
     // Should succeed — unresolvable hosts are skipped with a warning.
@@ -574,6 +579,7 @@ async fn test_apply_to_unregistered_container_errors() {
                 allowed_hosts: vec![],
                 egress_rules: vec![],
                 dns_servers: vec![],
+                blocked_cidrs: vec![],
             },
         )
         .await;
@@ -851,6 +857,7 @@ async fn test_dns_observation_gated_by_enforced_cgroups() {
         allowed_hosts: vec!["dns-gate-test.invalid".into()],
         egress_rules: vec![],
         dns_servers: vec![],
+        blocked_cidrs: vec![],
     };
     mgr.apply_network("test-dns-gate", &policy).await.unwrap();
 
@@ -897,5 +904,62 @@ async fn test_dns_observation_gated_by_enforced_cgroups() {
         quiet.is_err(),
         "unregistered cgroup still produced a DNS event: {:?}",
         quiet
+    );
+}
+
+// ===========================================================================
+// Tier 9: BLOCKED_CIDRS always-deny overrides
+// ===========================================================================
+
+/// Blocked CIDRs must beat allow entries: BLOCKED_CIDRS_V4 is checked before
+/// ALLOWED_V4/ALLOWED_PORTS in the connect hooks, the policy deny list and
+/// the built-in metadata-endpoint block both land there, and an explicitly
+/// allowed IP inside a blocked CIDR must stay unreachable. UDP connect()
+/// exercises the connect4 hook without emitting packets.
+#[tokio::test]
+#[serial]
+async fn test_blocked_cidrs_override_allowed_hosts() {
+    let mgr = BpfPolicyManager::new().unwrap();
+    let cgroup = own_cgroup_path();
+    mgr.register("test-blocked-cidrs", &cgroup, 0)
+        .await
+        .unwrap();
+
+    // Every destination below is explicitly allowed; two of them are also
+    // covered by deny entries (one declared, one built-in).
+    let policy = NetworkPolicy {
+        allowed_hosts: vec![
+            "192.0.2.9".into(),       // inside declared blocked 192.0.2.0/24
+            "169.254.169.254".into(), // built-in metadata endpoint block
+            "198.51.100.5".into(),    // control: allowed, not blocked
+        ],
+        egress_rules: vec![],
+        dns_servers: vec![],
+        blocked_cidrs: vec!["192.0.2.0/24".into()],
+    };
+    mgr.apply_network("test-blocked-cidrs", &policy)
+        .await
+        .unwrap();
+
+    let udp_connect =
+        |dst: &str| -> std::io::Result<()> { std::net::UdpSocket::bind("0.0.0.0:0")?.connect(dst) };
+
+    let declared = udp_connect("192.0.2.9:443");
+    let metadata = udp_connect("169.254.169.254:80");
+    let control = udp_connect("198.51.100.5:443");
+
+    mgr.unregister("test-blocked-cidrs").await.unwrap();
+
+    assert!(
+        matches!(&declared, Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+        "declared blocked CIDR did not override the allow entry: {declared:?}"
+    );
+    assert!(
+        matches!(&metadata, Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+        "built-in metadata endpoint block did not override the allow entry: {metadata:?}"
+    );
+    assert!(
+        control.is_ok(),
+        "allowed (unblocked) destination was denied — deny list is over-broad: {control:?}"
     );
 }

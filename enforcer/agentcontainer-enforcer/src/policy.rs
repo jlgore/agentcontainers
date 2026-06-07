@@ -23,6 +23,27 @@ pub struct ContainerHandle {
     pub cgroup_id: u64,
 }
 
+/// Parse a CIDR string (`"10.0.0.0/8"`, `"fd00:ec2::254/128"`) or a bare IP
+/// (treated as a host route: /32 or /128) into address + prefix length.
+/// Returns `None` for anything malformed — callers warn-and-skip so one bad
+/// entry cannot abort policy application.
+pub fn parse_cidr(s: &str) -> Option<(std::net::IpAddr, u8)> {
+    let (addr_str, prefix_str) = match s.split_once('/') {
+        Some((a, p)) => (a, Some(p)),
+        None => (s, None),
+    };
+    let addr: std::net::IpAddr = addr_str.trim().parse().ok()?;
+    let max = if addr.is_ipv4() { 32 } else { 128 };
+    let prefix = match prefix_str {
+        Some(p) => p.trim().parse::<u8>().ok()?,
+        None => max,
+    };
+    if prefix > max {
+        return None;
+    }
+    Some((addr, prefix))
+}
+
 /// Enforcement statistics for a container.
 #[derive(Debug, Clone, Default)]
 pub struct EnforcementStats {
@@ -246,5 +267,49 @@ impl PolicyManager for StubPolicyManager {
         _correlation_id: &str,
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_cidr;
+    use std::net::IpAddr;
+
+    #[test]
+    fn parse_cidr_v4_with_prefix() {
+        let (addr, prefix) = parse_cidr("10.0.0.0/8").unwrap();
+        assert_eq!(addr, "10.0.0.0".parse::<IpAddr>().unwrap());
+        assert_eq!(prefix, 8);
+    }
+
+    #[test]
+    fn parse_cidr_bare_v4_is_host_route() {
+        let (addr, prefix) = parse_cidr("169.254.169.254").unwrap();
+        assert_eq!(addr, "169.254.169.254".parse::<IpAddr>().unwrap());
+        assert_eq!(prefix, 32);
+    }
+
+    #[test]
+    fn parse_cidr_v6_with_prefix() {
+        let (addr, prefix) = parse_cidr("fd00:ec2::254/128").unwrap();
+        assert_eq!(addr, "fd00:ec2::254".parse::<IpAddr>().unwrap());
+        assert_eq!(prefix, 128);
+    }
+
+    #[test]
+    fn parse_cidr_bare_v6_is_host_route() {
+        let (_, prefix) = parse_cidr("2001:db8::1").unwrap();
+        assert_eq!(prefix, 128);
+    }
+
+    #[test]
+    fn parse_cidr_rejects_malformed() {
+        // Prefix beyond the family maximum, garbage, empty, hostname.
+        assert!(parse_cidr("10.0.0.0/33").is_none());
+        assert!(parse_cidr("2001:db8::/129").is_none());
+        assert!(parse_cidr("not-an-ip/8").is_none());
+        assert!(parse_cidr("").is_none());
+        assert!(parse_cidr("example.com").is_none());
+        assert!(parse_cidr("10.0.0.0/abc").is_none());
     }
 }

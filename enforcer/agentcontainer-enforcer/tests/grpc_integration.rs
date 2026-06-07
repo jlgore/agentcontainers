@@ -216,6 +216,7 @@ async fn test_apply_network_policy() {
                 protocol: "tcp".into(),
             }],
             dns_servers: vec!["8.8.8.8".into()],
+            blocked_cidrs: vec![],
         })
         .await
         .expect("apply_network_policy failed")
@@ -413,6 +414,7 @@ async fn test_apply_unregistered_fails() {
             allowed_hosts: vec!["example.com".into()],
             egress_rules: vec![],
             dns_servers: vec![],
+            blocked_cidrs: vec![],
         })
         .await
         .expect("RPC should return a response, not a transport error")
@@ -461,6 +463,7 @@ async fn test_port_out_of_range() {
                 protocol: "tcp".into(),
             }],
             dns_servers: vec![],
+            blocked_cidrs: vec![],
         })
         .await
         .expect("RPC should return a response")
@@ -505,6 +508,7 @@ async fn test_full_lifecycle() {
                 protocol: "tcp".into(),
             }],
             dns_servers: vec!["8.8.8.8".into()],
+            blocked_cidrs: vec![],
         })
         .await
         .expect("network policy failed")
@@ -583,6 +587,7 @@ async fn test_full_lifecycle() {
             allowed_hosts: vec!["should.fail".into()],
             egress_rules: vec![],
             dns_servers: vec![],
+            blocked_cidrs: vec![],
         })
         .await
         .expect("RPC should return a response")
