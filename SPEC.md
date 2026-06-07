@@ -235,6 +235,16 @@ assigns the correlation ID by comparing the event's kernel timestamp
 (`bpf_ktime_get_ns` captured at emit time) against the window, not by
 when the userspace reader happens to drain the buffer.
 
+The Prepare side has the mirror-image race: an event can be drained in
+the instant between `PrepareToolCall` capturing its window-start
+timestamp and inserting the window, where immediate assignment would
+find no window. Drained events are therefore parked ~100 ms before
+assignment — longer than any plausible insert latency — so the
+in-flight Prepare lands first. Late assignment is safe for exactly the
+reason above: matching is by the event's kernel timestamp, not by when
+assignment runs. Parked events are flushed (assigned and published) on
+reader shutdown, never dropped.
+
 **Extend `EnforcementEvent`:** Add `correlationId` (string) to the
 existing message (`proto:163-171`). The enforcer sets this on events
 emitted while a `PrepareToolCall` window is active for the container.

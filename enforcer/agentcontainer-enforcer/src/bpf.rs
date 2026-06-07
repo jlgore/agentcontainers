@@ -80,6 +80,54 @@ const CLOSED_WINDOW_RETENTION_NS: u64 = 30 * 1_000_000_000;
 /// forensic tool runs; events past the horizon carry no correlation ID.
 const OPEN_WINDOW_HORIZON_NS: u64 = 2 * 60 * 60 * 1_000_000_000;
 
+/// How long a drained event is parked before correlation assignment.
+///
+/// Prepare-side race: `PrepareToolCall` captures the window's start
+/// timestamp, then takes the write lock and inserts the window. An event
+/// generated inside the window can be drained from the ring buffer during
+/// that capture→insert gap — assigned immediately, it would find no window
+/// and stay uncorrelated even though its kernel timestamp matches one.
+/// Parking events for longer than any plausible lock-acquisition latency
+/// lets the in-flight Prepare land first. Late assignment is safe precisely
+/// because matching is by the event's kernel timestamp, not by when
+/// assignment runs (the same property §3.3 uses on the Complete side).
+const CORRELATION_ASSIGN_DELAY_NS: u64 = 100 * 1_000_000;
+
+/// FIFO park bench for drained events awaiting correlation assignment.
+/// Events become due `CORRELATION_ASSIGN_DELAY_NS` after their drain time;
+/// drain order is preserved.
+#[derive(Default)]
+struct PendingEvents {
+    queue: std::collections::VecDeque<(u64, EnforcementEvent)>,
+}
+
+impl PendingEvents {
+    /// Park an event drained at `now`.
+    fn park(&mut self, event: EnforcementEvent, now: u64) {
+        self.queue
+            .push_back((now.saturating_add(CORRELATION_ASSIGN_DELAY_NS), event));
+    }
+
+    /// Monotonic instant the oldest parked event becomes due, if any.
+    fn next_due_ns(&self) -> Option<u64> {
+        self.queue.front().map(|(due, _)| *due)
+    }
+
+    /// Remove and return every event due at `now` (drain order preserved).
+    fn take_due(&mut self, now: u64) -> Vec<EnforcementEvent> {
+        let mut due = Vec::new();
+        while matches!(self.queue.front(), Some((d, _)) if *d <= now) {
+            due.push(self.queue.pop_front().expect("front checked").1);
+        }
+        due
+    }
+
+    /// Remove and return everything regardless of due time (shutdown flush).
+    fn take_all(&mut self) -> Vec<EnforcementEvent> {
+        self.queue.drain(..).map(|(_, ev)| ev).collect()
+    }
+}
+
 fn assign_correlation(event: &mut EnforcementEvent, windows: &CorrelationWindows) {
     let guard = windows.read().unwrap();
     let Some(items) = guard.get(&event.cgroup_id) else {
@@ -558,31 +606,71 @@ mod linux {
                 }
             };
 
-            loop {
-                // Wait until the ring buffer has data.
-                let mut guard = match async_fd.readable().await {
-                    Ok(g) => g,
-                    Err(e) => {
-                        warn!(error = %e, "ring buffer readable() error, stopping reader");
-                        break;
+            // Drained events are parked briefly before correlation
+            // assignment (see CORRELATION_ASSIGN_DELAY_NS): an event drained
+            // in the gap between PrepareToolCall capturing its window-start
+            // timestamp and inserting the window would otherwise be assigned
+            // against a window set that does not yet contain its window.
+            let mut pending = PendingEvents::default();
+
+            'reader: loop {
+                // Wait for ring buffer data — or for the oldest parked event
+                // to come due, whichever is first.
+                let readable = async_fd.readable();
+                tokio::pin!(readable);
+                let due_sleep = async {
+                    match pending.next_due_ns() {
+                        Some(due) => {
+                            let now = monotonic_ns();
+                            tokio::time::sleep(std::time::Duration::from_nanos(
+                                due.saturating_sub(now),
+                            ))
+                            .await
+                        }
+                        // Nothing parked — only readability can wake us.
+                        None => std::future::pending().await,
                     }
                 };
 
-                // Drain all available records.
-                while let Some(item) = ring_buf.next() {
-                    let data: &[u8] = &item;
+                tokio::select! {
+                    guard = &mut readable => {
+                        let mut guard = match guard {
+                            Ok(g) => g,
+                            Err(e) => {
+                                warn!(error = %e, "ring buffer readable() error, stopping reader");
+                                break 'reader;
+                            }
+                        };
 
-                    if let Some(mut event) = parse(data, "") {
-                        if let Some(container_id) = registry.lookup(event.cgroup_id).await {
-                            event.container_id = container_id;
+                        // Drain all available records into the park bench.
+                        let now = monotonic_ns();
+                        while let Some(item) = ring_buf.next() {
+                            let data: &[u8] = &item;
+                            if let Some(mut event) = parse(data, "") {
+                                if let Some(container_id) = registry.lookup(event.cgroup_id).await {
+                                    event.container_id = container_id;
+                                }
+                                pending.park(event, now);
+                            }
                         }
-                        assign_correlation(&mut event, &correlations);
-                        bus.publish(event);
+                        guard.clear_ready();
                     }
+                    _ = due_sleep => {}
                 }
 
-                guard.clear_ready();
+                // Publish whatever has aged past the assignment delay.
+                for mut event in pending.take_due(monotonic_ns()) {
+                    assign_correlation(&mut event, &correlations);
+                    bus.publish(event);
+                }
                 let _ = online_cpus(); // suppress unused import warning
+            }
+
+            // Shutdown: flush parked events rather than dropping them — a
+            // short assignment delay must never cost audit records.
+            for mut event in pending.take_all() {
+                assign_correlation(&mut event, &correlations);
+                bus.publish(event);
             }
         }
 
@@ -1860,5 +1948,57 @@ mod tests {
         let mgr = BpfPolicyManager::new().unwrap();
         let _rx = mgr.subscribe_events("ctr-1").await.unwrap();
         // Receiver is valid; no events will come from stub.
+    }
+
+    // --- PendingEvents: deferred correlation assignment (#prepare-race) ---
+
+    #[test]
+    fn test_pending_events_due_only_after_delay() {
+        let mut p = PendingEvents::default();
+        p.park(test_event(7, 1_000), 1_000);
+        // Not due before the delay elapses.
+        assert!(p
+            .take_due(1_000 + CORRELATION_ASSIGN_DELAY_NS - 1)
+            .is_empty());
+        // Due exactly at the boundary; drain order preserved.
+        p.park(test_event(7, 2_000), 2_000);
+        let due = p.take_due(1_000 + CORRELATION_ASSIGN_DELAY_NS);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].timestamp_ns, 1_000);
+        assert_eq!(p.next_due_ns(), Some(2_000 + CORRELATION_ASSIGN_DELAY_NS));
+    }
+
+    #[test]
+    fn test_pending_events_take_all_flushes_regardless_of_due() {
+        let mut p = PendingEvents::default();
+        p.park(test_event(7, 1_000), 1_000);
+        p.park(test_event(7, 2_000), 2_000);
+        let all = p.take_all();
+        assert_eq!(all.len(), 2, "shutdown flush must not drop parked events");
+        assert!(p.next_due_ns().is_none());
+    }
+
+    /// The prepare-side race end-to-end at the logic level: an event drained
+    /// BEFORE its PrepareToolCall window is recorded must still correlate,
+    /// because assignment happens only after the park delay — by which time
+    /// the window exists and the kernel timestamp matches it.
+    #[test]
+    fn test_parked_event_correlates_with_window_recorded_after_drain() {
+        let w = new_windows();
+        let mut p = PendingEvents::default();
+
+        // t=1_000: kernel event generated and immediately drained — its
+        // window is not recorded yet (Prepare is mid-flight).
+        p.park(test_event(7, 1_000), 1_000);
+
+        // t=1_050: PrepareToolCall lands, window start backdates to 990
+        // (its timestamp was captured before the insert).
+        open_tool_window(&w, 7, "call-1", 990);
+
+        // Assignment at due time finds the window.
+        let mut due = p.take_due(1_000 + CORRELATION_ASSIGN_DELAY_NS);
+        assert_eq!(due.len(), 1);
+        assign_correlation(&mut due[0], &w);
+        assert_eq!(due[0].correlation_id, "call-1");
     }
 }
