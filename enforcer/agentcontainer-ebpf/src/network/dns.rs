@@ -4,6 +4,11 @@
 //! parses answer records, and emits events containing a SipHash-2-4 128-bit
 //! digest of the domain name plus the resolved IP addresses.
 //!
+//! Gated by ENFORCED_CGROUPS like every other hook: the program is attached
+//! at the cgroup root, so without the gate it would parse and SipHash every
+//! DNS reply on the host. Packets whose socket cgroup is not enforced are
+//! ignored before any parsing.
+//!
 //! Only emits events for domains present in the TRACKED_DOMAINS map — all
 //! other DNS traffic is silently ignored, minimizing ring buffer bandwidth.
 //!
@@ -25,7 +30,7 @@ use agentcontainer_common::events::{
 };
 use agentcontainer_common::maps::DomainKey;
 
-use crate::maps::{DNS_EVENTS, SIPHASH_KEY, TRACKED_DOMAINS};
+use crate::maps::{DNS_EVENTS, ENFORCED_CGROUPS, SIPHASH_KEY, TRACKED_DOMAINS};
 
 // ---------------------------------------------------------------------------
 // IP protocol constants.
@@ -214,6 +219,18 @@ pub fn ac_dns_ingress(ctx: SkBuffContext) -> i32 {
 
 #[inline(always)]
 fn try_parse_dns(ctx: &SkBuffContext) -> Result<(), ()> {
+    // 0. Cgroup scoping: the hook is attached at the cgroup root, so it
+    //    sees every socket on the host. Bail before any parsing unless the
+    //    packet belongs to an enforced container — parsing + SipHashing
+    //    every DNS reply host-wide is both wasted cycles and observation
+    //    of traffic the enforcer has no business looking at.
+    //    cgroup_skb runs in softirq context, so the *current task* cgroup
+    //    is unrelated — use the skb's socket cgroup instead.
+    let cgroup_id = unsafe { aya_ebpf::helpers::bpf_skb_cgroup_id(ctx.skb.skb) };
+    if unsafe { ENFORCED_CGROUPS.get(&cgroup_id) }.is_none() {
+        return Ok(());
+    }
+
     let pkt_len = ctx.len() as usize;
 
     // Load SipHash key from BPF map. If not set, skip DNS processing.
@@ -288,10 +305,8 @@ fn try_parse_dns(ctx: &SkBuffContext) -> Result<(), ()> {
         pos = name_end + 4;
     }
 
-    // Check if this domain is tracked for the cgroup that owns this socket.
-    // cgroup_skb runs in softirq context, so the *current task* cgroup is
-    // unrelated — use the skb's socket cgroup instead.
-    let cgroup_id = unsafe { aya_ebpf::helpers::bpf_skb_cgroup_id(ctx.skb.skb) };
+    // Check if this domain is tracked for the cgroup that owns this socket
+    // (resolved at the top of the function).
     let tracked_key = DomainKey {
         cgroup_id,
         hash: domain_hash,

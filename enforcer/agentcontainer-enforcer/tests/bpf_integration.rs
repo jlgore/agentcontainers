@@ -783,3 +783,119 @@ async fn test_overlayfs_deny_resolves_via_proc_root() {
          10 = chroot failed"
     );
 }
+
+// ===========================================================================
+// Tier 8: DNS observation through the ENFORCED_CGROUPS gate
+// ===========================================================================
+
+/// Build a minimal DNS response: one question for `name` (dot-separated),
+/// one A-record answer (compression pointer to the question name) carrying
+/// `addr` with TTL 60.
+fn build_dns_reply(name: &str, addr: [u8; 4]) -> Vec<u8> {
+    let mut pkt = Vec::new();
+    // Header: id, flags (QR=1), qdcount=1, ancount=1, nscount=0, arcount=0.
+    pkt.extend_from_slice(&0x1234u16.to_be_bytes());
+    pkt.extend_from_slice(&0x8180u16.to_be_bytes());
+    pkt.extend_from_slice(&1u16.to_be_bytes());
+    pkt.extend_from_slice(&1u16.to_be_bytes());
+    pkt.extend_from_slice(&0u16.to_be_bytes());
+    pkt.extend_from_slice(&0u16.to_be_bytes());
+    // Question: labels, QTYPE=A, QCLASS=IN.
+    for label in name.split('.') {
+        pkt.push(label.len() as u8);
+        pkt.extend_from_slice(label.as_bytes());
+    }
+    pkt.push(0);
+    pkt.extend_from_slice(&1u16.to_be_bytes());
+    pkt.extend_from_slice(&1u16.to_be_bytes());
+    // Answer: pointer to offset 12 (question name), A, IN, TTL, RDLENGTH=4.
+    pkt.extend_from_slice(&0xC00Cu16.to_be_bytes());
+    pkt.extend_from_slice(&1u16.to_be_bytes());
+    pkt.extend_from_slice(&1u16.to_be_bytes());
+    pkt.extend_from_slice(&60u32.to_be_bytes());
+    pkt.extend_from_slice(&4u16.to_be_bytes());
+    pkt.extend_from_slice(&addr);
+    pkt
+}
+
+/// End-to-end DNS observation across the ENFORCED_CGROUPS gate. The
+/// cgroup_skb ingress hook is attached at the cgroup root and bails before
+/// parsing unless the packet's *socket* cgroup is enforced, so this pins the
+/// gate's riskiest assumption: `bpf_skb_cgroup_id` on a delivered skb must
+/// equal the cgroup id RegisterContainer recorded — otherwise the gate
+/// silently kills DNS observation for enforced containers.
+///
+/// Phase 1 (enforced + tracked): a crafted reply from 127.0.0.1:53 for a
+/// tracked policy hostname must surface as a DnsEvent.
+/// Phase 2 (after unregister): the same reply must produce nothing.
+///
+/// Requires root: binds UDP port 53 on loopback.
+#[tokio::test]
+#[serial]
+async fn test_dns_observation_gated_by_enforced_cgroups() {
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!(
+            "skipping test_dns_observation_gated_by_enforced_cgroups: requires root to bind UDP :53"
+        );
+        return;
+    }
+
+    let mgr = BpfPolicyManager::new().unwrap();
+    let cgroup = own_cgroup_path();
+    mgr.register("test-dns-gate", &cgroup, 0).await.unwrap();
+
+    // Hostname policy entries are tracked for DNS observation even when
+    // resolution fails (.invalid never resolves) — exactly what we want:
+    // TRACKED_DOMAINS gains the (cgroup, siphash) pair and nothing else.
+    let policy = NetworkPolicy {
+        allowed_hosts: vec!["dns-gate-test.invalid".into()],
+        egress_rules: vec![],
+        dns_servers: vec![],
+    };
+    mgr.apply_network("test-dns-gate", &policy).await.unwrap();
+
+    // Subscribe unfiltered so phase 2's negative assertion cannot pass
+    // merely because a container filter ate the event.
+    let mut rx = mgr.subscribe_events("").await.unwrap();
+
+    let reply = build_dns_reply("dns-gate-test.invalid", [203, 0, 113, 7]);
+    let sender = std::net::UdpSocket::bind("127.0.0.1:53").expect("bind UDP :53 (requires root)");
+    let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    receiver
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    let dst = receiver.local_addr().unwrap();
+
+    // Phase 1: enforced cgroup, tracked domain — event must arrive.
+    sender.send_to(&reply, dst).unwrap();
+    let mut buf = [0u8; 512];
+    receiver
+        .recv_from(&mut buf)
+        .expect("loopback DNS reply not delivered");
+
+    let ev = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("enforced cgroup: tracked DNS reply produced no event — gate is over-blocking")
+        .expect("event channel closed");
+    assert_eq!(
+        ev.details.get("resolved_ip").map(String::as_str),
+        Some("203.0.113.7"),
+        "unexpected event details: {:?}",
+        ev.details
+    );
+
+    // Phase 2: unregister sweeps ENFORCED_CGROUPS — the same reply must now
+    // be dropped at the gate before any parsing.
+    mgr.unregister("test-dns-gate").await.unwrap();
+    sender.send_to(&reply, dst).unwrap();
+    receiver
+        .recv_from(&mut buf)
+        .expect("loopback DNS reply not delivered");
+
+    let quiet = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
+    assert!(
+        quiet.is_err(),
+        "unregistered cgroup still produced a DNS event: {:?}",
+        quiet
+    );
+}
