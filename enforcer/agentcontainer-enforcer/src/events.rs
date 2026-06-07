@@ -63,6 +63,12 @@ impl EventBus {
     /// If `container_id` is empty, the subscriber receives all events.
     /// Returns an mpsc receiver; the filtering task runs in the background
     /// and stops when the receiver is dropped.
+    ///
+    /// When the subscriber falls behind the broadcast buffer, the dropped
+    /// events are gone — but the loss itself is delivered in-band as a
+    /// synthetic [`EventDomain::Stream`] gap-marker event (mirroring the
+    /// proxy's stream_gap audit entries), so a forensic reader can
+    /// distinguish "quiet container" from "events lost to backpressure".
     pub fn subscribe(&self, container_id: &str) -> mpsc::Receiver<EnforcementEvent> {
         let mut rx = self.tx.subscribe();
         let (tx, out) = mpsc::channel::<EnforcementEvent>(256);
@@ -81,6 +87,12 @@ impl EventBus {
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!(lagged = n, "event subscriber lagged, {} events dropped", n);
+                        // The drop count is bus-wide (pre-filter): with a
+                        // container filter some lost events may not have
+                        // matched, so it is an upper bound for the subscriber.
+                        if tx.send(gap_marker_event(&filter, n)).await.is_err() {
+                            break;
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         break;
@@ -90,6 +102,32 @@ impl EventBus {
         });
 
         out
+    }
+}
+
+/// Build the synthetic event recording that `dropped` events were lost to
+/// broadcast backpressure before reaching this subscriber. It rides the
+/// normal event path into the consumer's audit chain (enforcer.jsonl), so
+/// the gap is tamper-evident rather than a process-local warn line.
+///
+/// `timestamp_ns` is zero: kernel event timestamps are bpf_ktime ns, and no
+/// kernel clock reading exists for a userspace drop. The audit logger stamps
+/// its own wall-clock time on the entry.
+fn gap_marker_event(filter: &str, dropped: u64) -> EnforcementEvent {
+    let mut details = HashMap::new();
+    details.insert("event".into(), "stream_gap".into());
+    details.insert("scope".into(), "enforcer-event-bus".into());
+    details.insert("dropped".into(), dropped.to_string());
+    EnforcementEvent {
+        timestamp_ns: 0,
+        cgroup_id: 0,
+        correlation_id: String::new(),
+        container_id: filter.to_string(),
+        domain: EventDomain::Stream,
+        verdict: EventVerdict::Allow,
+        pid: 0,
+        comm: String::new(),
+        details,
     }
 }
 
@@ -621,6 +659,52 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(ec.timestamp_ns, 3);
+    }
+
+    #[tokio::test]
+    async fn test_event_bus_lag_delivers_gap_marker() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe("");
+
+        // On the current-thread test runtime the spawned filter task cannot
+        // run until this task awaits, so every publish lands in the broadcast
+        // buffer first — overflowing it forces a real Lagged(n) on the
+        // subscriber's first recv.
+        let overflow = 10u64;
+        for ts in 0..(BROADCAST_CAPACITY as u64 + overflow) {
+            bus.publish(EnforcementEvent {
+                timestamp_ns: ts + 1,
+                cgroup_id: 1,
+                correlation_id: String::new(),
+                container_id: "ctr-lag".into(),
+                domain: EventDomain::Network,
+                verdict: EventVerdict::Allow,
+                pid: 1,
+                comm: "x".into(),
+                details: HashMap::new(),
+            });
+        }
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out")
+            .expect("channel closed");
+
+        // The loss must be reported in-band, before any post-gap event.
+        assert_eq!(first.domain, EventDomain::Stream);
+        assert_eq!(first.details.get("event").unwrap(), "stream_gap");
+        assert_eq!(first.details.get("scope").unwrap(), "enforcer-event-bus");
+        let dropped: u64 = first.details.get("dropped").unwrap().parse().unwrap();
+        assert!(dropped >= 1, "gap marker must carry a positive drop count");
+
+        // The stream resumes with the oldest retained event — nothing else
+        // is silently skipped after the marker.
+        let next = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out")
+            .expect("channel closed");
+        assert_eq!(next.domain, EventDomain::Network);
+        assert_eq!(next.timestamp_ns, dropped + 1);
     }
 
     #[tokio::test]

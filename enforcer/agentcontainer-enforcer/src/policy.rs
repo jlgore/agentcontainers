@@ -56,6 +56,9 @@ pub enum EventDomain {
     Filesystem,
     Process,
     Credential,
+    /// Synthetic marker about the event stream itself (e.g. a backpressure
+    /// gap on the event bus) — not a kernel enforcement event.
+    Stream,
 }
 
 impl EventDomain {
@@ -65,6 +68,7 @@ impl EventDomain {
             Self::Filesystem => "filesystem",
             Self::Process => "process",
             Self::Credential => "credential",
+            Self::Stream => "stream",
         }
     }
 }
