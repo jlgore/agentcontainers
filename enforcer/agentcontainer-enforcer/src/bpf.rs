@@ -377,6 +377,14 @@ mod linux {
             let cgroup = std::fs::File::open("/sys/fs/cgroup")
                 .map_err(|e| anyhow::anyhow!("opening cgroup2 root /sys/fs/cgroup: {e}"))?;
 
+            // CgroupAttachMode::Single, NOT AllowMultiple: on kernels >= 5.7
+            // aya attaches via bpf_link_create, and the kernel rejects any
+            // nonzero link_create flags for cgroup links with EINVAL —
+            // BPF_F_ALLOW_MULTI is a legacy BPF_PROG_ATTACH flag, while
+            // links are inherently multi-attach (Single maps to flags=0).
+            // AllowMultiple here made every attach fail on every modern
+            // kernel. The legacy (<5.7) fallback where Single would mean
+            // exclusive attach is unreachable: the enforcer requires 5.15+.
             for name in ["ac_connect4", "ac_connect6", "ac_sendmsg4", "ac_sendmsg6"] {
                 let prog: &mut CgroupSockAddr = bpf
                     .program_mut(name)
@@ -385,7 +393,7 @@ mod linux {
                     .map_err(|e| anyhow::anyhow!("program {name} type mismatch: {e}"))?;
                 prog.load()
                     .map_err(|e| anyhow::anyhow!("loading {name}: {e}"))?;
-                prog.attach(&cgroup, CgroupAttachMode::AllowMultiple)
+                prog.attach(&cgroup, CgroupAttachMode::Single)
                     .map_err(|e| anyhow::anyhow!("attaching {name} to cgroup root: {e}"))?;
                 info!(program = name, "attached network enforcement hook");
             }
@@ -400,7 +408,7 @@ mod linux {
             dns.attach(
                 &cgroup,
                 CgroupSkbAttachType::Ingress,
-                CgroupAttachMode::AllowMultiple,
+                CgroupAttachMode::Single,
             )
             .map_err(|e| anyhow::anyhow!("attaching ac_dns_ingress: {e}"))?;
             info!("attached DNS observation hook");
