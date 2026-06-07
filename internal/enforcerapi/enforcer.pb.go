@@ -1092,11 +1092,15 @@ func (x *LoadPolicyBundleResponse) GetPolicyDigest() string {
 }
 
 type PolicyResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
-	Error         string                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Success bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	Error   string                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	// Network policy only: hosts whose DNS resolution failed, so no allow
+	// entries were installed for them (the policy applied PARTIALLY —
+	// narrower than declared, never wider). Empty on full application.
+	UnresolvedHosts []string `protobuf:"bytes,3,rep,name=unresolved_hosts,json=unresolvedHosts,proto3" json:"unresolved_hosts,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *PolicyResponse) Reset() {
@@ -1141,6 +1145,13 @@ func (x *PolicyResponse) GetError() string {
 		return x.Error
 	}
 	return ""
+}
+
+func (x *PolicyResponse) GetUnresolvedHosts() []string {
+	if x != nil {
+		return x.UnresolvedHosts
+	}
+	return nil
 }
 
 type StreamEventsRequest struct {
@@ -2341,10 +2352,11 @@ const file_enforcer_proto_rawDesc = "" +
 	"\x18LoadPolicyBundleResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\x12#\n" +
-	"\rpolicy_digest\x18\x03 \x01(\tR\fpolicyDigest\"@\n" +
+	"\rpolicy_digest\x18\x03 \x01(\tR\fpolicyDigest\"k\n" +
 	"\x0ePolicyResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\tR\x05error\"8\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error\x12)\n" +
+	"\x10unresolved_hosts\x18\x03 \x03(\tR\x0funresolvedHosts\"8\n" +
 	"\x13StreamEventsRequest\x12!\n" +
 	"\fcontainer_id\x18\x01 \x01(\tR\vcontainerId\"\x86\x03\n" +
 	"\x10EnforcementEvent\x12!\n" +

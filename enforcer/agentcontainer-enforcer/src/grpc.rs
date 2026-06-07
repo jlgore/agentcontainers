@@ -236,6 +236,7 @@ impl Enforcer for EnforcerService {
                 return Ok(Response::new(PolicyResponse {
                     success: false,
                     error: format!("port out of range: {}", r.port),
+                    unresolved_hosts: vec![],
                 }));
             }
         }
@@ -284,12 +285,13 @@ impl Enforcer for EnforcerService {
             .apply_network(&req.container_id, &net_policy)
             .await
         {
-            Ok(()) => {
+            Ok(report) => {
                 #[cfg(feature = "otel")]
                 _span.set_attribute(ac::enforcement::VERDICT, "allow");
                 Ok(Response::new(PolicyResponse {
                     success: true,
                     error: String::new(),
+                    unresolved_hosts: report.unresolved_hosts,
                 }))
             }
             Err(e) => {
@@ -298,6 +300,7 @@ impl Enforcer for EnforcerService {
                 Ok(Response::new(PolicyResponse {
                     success: false,
                     error: e.to_string(),
+                    unresolved_hosts: vec![],
                 }))
             }
         }
@@ -352,6 +355,7 @@ impl Enforcer for EnforcerService {
                 Ok(Response::new(PolicyResponse {
                     success: true,
                     error: String::new(),
+                    unresolved_hosts: vec![],
                 }))
             }
             Err(e) => {
@@ -360,6 +364,7 @@ impl Enforcer for EnforcerService {
                 Ok(Response::new(PolicyResponse {
                     success: false,
                     error: e.to_string(),
+                    unresolved_hosts: vec![],
                 }))
             }
         }
@@ -414,6 +419,7 @@ impl Enforcer for EnforcerService {
                 Ok(Response::new(PolicyResponse {
                     success: true,
                     error: String::new(),
+                    unresolved_hosts: vec![],
                 }))
             }
             Err(e) => {
@@ -422,6 +428,7 @@ impl Enforcer for EnforcerService {
                 Ok(Response::new(PolicyResponse {
                     success: false,
                     error: e.to_string(),
+                    unresolved_hosts: vec![],
                 }))
             }
         }
@@ -534,6 +541,7 @@ impl Enforcer for EnforcerService {
                 Ok(Response::new(PolicyResponse {
                     success: true,
                     error: String::new(),
+                    unresolved_hosts: vec![],
                 }))
             }
             Err(e) => {
@@ -542,6 +550,7 @@ impl Enforcer for EnforcerService {
                 Ok(Response::new(PolicyResponse {
                     success: false,
                     error: e.to_string(),
+                    unresolved_hosts: vec![],
                 }))
             }
         }

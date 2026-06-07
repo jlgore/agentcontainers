@@ -126,6 +126,9 @@ type recordingEnforcer struct {
 
 	netPolicyErr error
 	fsPolicyErr  error
+	// unresolvedHosts is returned on ApplyNetworkPolicy responses to
+	// simulate a partial application (DNS-skipped policy hosts).
+	unresolvedHosts []string
 
 	registered   []string
 	unregistered []string
@@ -145,7 +148,7 @@ func (f *recordingEnforcer) ApplyNetworkPolicy(ctx context.Context, req *enforce
 	if f.netPolicyErr != nil {
 		return nil, f.netPolicyErr
 	}
-	return &enforcerapi.PolicyResponse{Success: true}, nil
+	return &enforcerapi.PolicyResponse{Success: true, UnresolvedHosts: f.unresolvedHosts}, nil
 }
 
 func (f *recordingEnforcer) ApplyFilesystemPolicy(ctx context.Context, req *enforcerapi.FilesystemPolicyRequest, opts ...grpc.CallOption) (*enforcerapi.PolicyResponse, error) {
@@ -308,6 +311,34 @@ func TestApplyBackendEnforcementWarnsOnProxyOnlyAllowlists(t *testing.T) {
 			warned := logs.FilterMessageSnippet("proxy-enforced only").Len() > 0
 			if warned != tt.wantWarn {
 				t.Errorf("posture warning logged = %v, want %v (entries: %v)", warned, tt.wantWarn, logs.All())
+			}
+		})
+	}
+}
+
+// A partial network policy application (DNS-skipped hosts) must be surfaced
+// at registration; a fully-applied policy stays quiet.
+func TestApplyBackendEnforcementWarnsOnPartialNetworkPolicy(t *testing.T) {
+	tests := []struct {
+		name       string
+		unresolved []string
+		wantWarn   bool
+	}{
+		{"unresolved hosts warn", []string{"intel.example.com"}, true},
+		{"full application stays quiet", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			core, logs := observer.New(zap.WarnLevel)
+			ec := &recordingEnforcer{unresolvedHosts: tt.unresolved}
+			b := &Backend{Name: "sift", ContainerID: "ctr-1"}
+
+			if _, err := applyBackendEnforcement(context.Background(), ec, zap.New(core), b, enforcementTestTool(), "/sys/fs/cgroup/test", 123); err != nil {
+				t.Fatalf("applyBackendEnforcement: %v", err)
+			}
+			warned := logs.FilterMessageSnippet("applied partially").Len() > 0
+			if warned != tt.wantWarn {
+				t.Errorf("partial-apply warning logged = %v, want %v (entries: %v)", warned, tt.wantWarn, logs.All())
 			}
 		})
 	}

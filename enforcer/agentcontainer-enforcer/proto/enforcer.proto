@@ -175,6 +175,10 @@ message LoadPolicyBundleResponse {
 message PolicyResponse {
   bool success = 1;
   string error = 2;
+  // Network policy only: hosts whose DNS resolution failed, so no allow
+  // entries were installed for them (the policy applied PARTIALLY —
+  // narrower than declared, never wider). Empty on full application.
+  repeated string unresolved_hosts = 3;
 }
 
 // --- Events ---

@@ -185,8 +185,14 @@ async fn test_network_apply_unresolvable_host() {
         blocked_cidrs: vec![],
     };
 
-    // Should succeed — unresolvable hosts are skipped with a warning.
-    mgr.apply_network("test-net-unres", &policy).await.unwrap();
+    // Should succeed — unresolvable hosts are skipped, but the partial
+    // application must be visible in the report, not swallowed.
+    let report = mgr.apply_network("test-net-unres", &policy).await.unwrap();
+    assert_eq!(
+        report.unresolved_hosts,
+        vec!["this.host.definitely.does.not.exist.invalid".to_string()],
+        "DNS-skipped host missing from the apply report"
+    );
 
     mgr.unregister("test-net-unres").await.unwrap();
 }

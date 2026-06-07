@@ -915,9 +915,13 @@ mod linux {
             &self,
             container_id: &str,
             policy: &NetworkPolicy,
-        ) -> anyhow::Result<()> {
+        ) -> anyhow::Result<crate::policy::NetworkApplyReport> {
             let cgroup_id = self.lookup_cgroup(container_id)?;
             info!(container_id, cgroup_id, hosts = ?policy.allowed_hosts, "applying network policy to BPF maps");
+
+            // Hosts skipped because DNS failed — reported to the caller so a
+            // partial application is distinguishable from a full one.
+            let mut unresolved_hosts: Vec<String> = Vec::new();
 
             // Phase 1 — resolve every hostname BEFORE touching any map. DNS
             // can take seconds; the swap below must not leave the cgroup
@@ -937,6 +941,7 @@ mod linux {
                     }
                     Err(e) => {
                         warn!(host, error = %e, "DNS resolution failed for allowed host, skipping");
+                        unresolved_hosts.push(host.clone());
                     }
                 }
             }
@@ -994,6 +999,7 @@ mod linux {
                             error = %e,
                             "DNS resolution failed for egress rule host, skipping"
                         );
+                        unresolved_hosts.push(rule.host.clone());
                     }
                 }
             }
@@ -1118,7 +1124,7 @@ mod linux {
                 );
             }
 
-            Ok(())
+            Ok(crate::policy::NetworkApplyReport { unresolved_hosts })
         }
 
         async fn apply_filesystem(
@@ -1498,14 +1504,14 @@ mod stub {
             &self,
             container_id: &str,
             policy: &NetworkPolicy,
-        ) -> anyhow::Result<()> {
+        ) -> anyhow::Result<crate::policy::NetworkApplyReport> {
             warn!(
                 container_id,
                 hosts = ?policy.allowed_hosts,
                 rules = policy.egress_rules.len(),
                 "stub: apply_network is a no-op"
             );
-            Ok(())
+            Ok(crate::policy::NetworkApplyReport::default())
         }
 
         async fn apply_filesystem(

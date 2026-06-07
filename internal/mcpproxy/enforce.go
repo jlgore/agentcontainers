@@ -99,9 +99,11 @@ func applyBackendEnforcement(ctx context.Context, ec enforcerapi.EnforcerClient,
 	// spec's intent for forensic MCP servers.
 	netReq := translateNetworkCaps(b.ContainerID, tool.Policy)
 	b.netPolicy = netReq
-	if _, err := ec.ApplyNetworkPolicy(ctx, netReq); err != nil {
+	netResp, err := ec.ApplyNetworkPolicy(ctx, netReq)
+	if err != nil {
 		return fail(fmt.Errorf("mcpproxy: backend %s: applying network policy: %w", b.Name, err))
 	}
+	warnUnresolvedHosts(log, b.Name, "registration", netResp)
 
 	// Filesystem policy: deny_paths are kernel-enforced (DENIED_INODES);
 	// read/write paths populate ALLOWED_INODES (write-protection applies to
@@ -184,14 +186,30 @@ func (p *Proxy) refreshNetworkPolicies(ctx context.Context) {
 		}
 		p.mu.Unlock()
 		for _, b := range backends {
-			if _, err := p.deps.Enforcer.ApplyNetworkPolicy(ctx, b.netPolicy); err != nil {
+			resp, err := p.deps.Enforcer.ApplyNetworkPolicy(ctx, b.netPolicy)
+			if err != nil {
 				p.deps.Logger.Warn("network policy refresh failed",
 					zap.String("backend", b.Name), zap.Error(err))
-			} else {
-				p.deps.Logger.Debug("re-resolved network policy hostnames",
-					zap.String("backend", b.Name))
+				continue
 			}
+			warnUnresolvedHosts(p.deps.Logger, b.Name, "refresh", resp)
+			p.deps.Logger.Debug("re-resolved network policy hostnames",
+				zap.String("backend", b.Name))
 		}
+	}
+}
+
+// warnUnresolvedHosts surfaces a PARTIAL network policy application: the
+// enforcer skips (and reports) policy hosts whose DNS resolution failed, so
+// the kernel allowlist is narrower than declared — those hosts stay denied
+// until a later refresh resolves them. Without the warning the gap is
+// invisible until a tool call times out.
+func warnUnresolvedHosts(log *zap.Logger, backend, phase string, resp *enforcerapi.PolicyResponse) {
+	if hosts := resp.GetUnresolvedHosts(); len(hosts) > 0 {
+		log.Warn("network policy applied partially — unresolved policy hosts remain denied until the next refresh",
+			zap.String("backend", backend),
+			zap.String("phase", phase),
+			zap.Strings("unresolvedHosts", hosts))
 	}
 }
 

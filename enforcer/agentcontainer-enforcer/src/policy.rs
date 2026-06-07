@@ -44,6 +44,16 @@ pub fn parse_cidr(s: &str) -> Option<(std::net::IpAddr, u8)> {
     Some((addr, prefix))
 }
 
+/// Outcome of a network policy application. `unresolved_hosts` lists policy
+/// hosts whose DNS resolution failed: no allow entries were installed for
+/// them, so the policy applied PARTIALLY — narrower than declared, never
+/// wider. Callers (the proxy) decide whether to warn, retry, or abort;
+/// swallowing the partiality here left them unable to tell.
+#[derive(Debug, Clone, Default)]
+pub struct NetworkApplyReport {
+    pub unresolved_hosts: Vec<String>,
+}
+
 /// Enforcement statistics for a container.
 #[derive(Debug, Clone, Default)]
 pub struct EnforcementStats {
@@ -135,9 +145,13 @@ pub trait PolicyManager: Send + Sync + 'static {
     /// Unregister a container. Removes all map entries for this cgroup.
     async fn unregister(&self, container_id: &str) -> anyhow::Result<()>;
 
-    /// Apply network enforcement policy for a container.
-    async fn apply_network(&self, container_id: &str, policy: &NetworkPolicy)
-        -> anyhow::Result<()>;
+    /// Apply network enforcement policy for a container. The report carries
+    /// hosts that failed DNS resolution (partial application).
+    async fn apply_network(
+        &self,
+        container_id: &str,
+        policy: &NetworkPolicy,
+    ) -> anyhow::Result<NetworkApplyReport>;
 
     /// Apply filesystem enforcement policy for a container.
     async fn apply_filesystem(
@@ -209,8 +223,8 @@ impl PolicyManager for StubPolicyManager {
         &self,
         _container_id: &str,
         _policy: &NetworkPolicy,
-    ) -> anyhow::Result<()> {
-        Ok(())
+    ) -> anyhow::Result<NetworkApplyReport> {
+        Ok(NetworkApplyReport::default())
     }
 
     async fn apply_filesystem(
