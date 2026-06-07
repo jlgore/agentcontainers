@@ -25,6 +25,7 @@ import (
 
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/approval"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/config"
+	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/enforcement"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/enforcerapi"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/mcpproxy"
 )
@@ -244,6 +245,15 @@ func buildMCPDeps(cfg *config.AgentContainer, log *zap.Logger) (mcpproxy.Deps, f
 		if addr == "" {
 			addr = "127.0.0.1:50051"
 		}
+		// grpc.NewClient is lazy — it never dials. Without an eager probe,
+		// an unreachable enforcer surfaces only at the first backend
+		// launch, after audit sinks and approval channels are already up.
+		// Reaching this branch means enforcement is required (component
+		// servers need the enforcer runtime; container servers only skip
+		// it via enforcer.required: false), so fail `mcp start` here.
+		if !enforcerHealthProbe(addr) {
+			return deps, cleanup, fmt.Errorf("enforcer at %s failed its gRPC health check; the configured MCP servers require it (kernel enforcement, or the component runtime) — start the enforcer sidecar, point AC_ENFORCER_ADDR at it, or set agent.enforcer.required: false to run container servers without kernel enforcement", addr)
+		}
 		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			return deps, cleanup, fmt.Errorf("connecting to enforcer at %s: %w", addr, err)
@@ -254,6 +264,11 @@ func buildMCPDeps(cfg *config.AgentContainer, log *zap.Logger) (mcpproxy.Deps, f
 
 	return deps, cleanup, nil
 }
+
+// enforcerHealthProbe is swappable for tests; the default asks the standard
+// gRPC health service (grpc.health.v1, served by the enforcer sidecar) with
+// a 2-second timeout.
+var enforcerHealthProbe = enforcement.ProbeEnforcerHealth
 
 // buildApprovalChannels stands up the HITL broker and its channels when any
 // configured server declares requireApproval tools. Returns a nil broker
