@@ -60,6 +60,23 @@ pub static NET_STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(16, 0);
 
 // --- DNS maps ---
 
+/// Scratch buffer size for DNS payload parsing — a power of two so buffer
+/// indices can be mask-bounded for the verifier. 512 bytes covers classic
+/// UDP DNS responses; longer (EDNS) replies are parsed up to truncation.
+pub const DNS_SCRATCH_SIZE: usize = 512;
+
+/// Per-CPU scratch the DNS parser copies each reply into (one
+/// bpf_skb_load_bytes call) before parsing from memory — per-byte skb
+/// helper loads exploded the verifier budget. Safe per-CPU: cgroup_skb
+/// programs run to completion in softirq context.
+#[repr(C)]
+pub struct DnsScratch {
+    pub data: [u8; DNS_SCRATCH_SIZE],
+}
+
+#[map]
+pub static DNS_SCRATCH: PerCpuArray<DnsScratch> = PerCpuArray::with_max_entries(1, 0);
+
 /// SipHash-2-4 key shared between BPF and userspace.
 /// Single entry (index 0). Userspace writes the key at enforcer startup;
 /// BPF programs read it to hash domain names identically.

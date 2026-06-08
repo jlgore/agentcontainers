@@ -398,20 +398,34 @@ mod linux {
                 info!(program = name, "attached network enforcement hook");
             }
 
-            let dns: &mut CgroupSkb = bpf
-                .program_mut("ac_dns_ingress")
-                .ok_or_else(|| anyhow::anyhow!("BPF program ac_dns_ingress not found"))?
-                .try_into()
-                .map_err(|e| anyhow::anyhow!("program ac_dns_ingress type mismatch: {e}"))?;
-            dns.load()
-                .map_err(|e| anyhow::anyhow!("loading ac_dns_ingress: {e}"))?;
-            dns.attach(
-                &cgroup,
-                CgroupSkbAttachType::Ingress,
-                CgroupAttachMode::Single,
-            )
-            .map_err(|e| anyhow::anyhow!("attaching ac_dns_ingress: {e}"))?;
-            info!("attached DNS observation hook");
+            // DNS observation failing to load/attach must not take the
+            // enforcement hooks down with it — observation is additive,
+            // the connect/sendmsg deny boundary is the point. Mirror the
+            // LSM-hook tolerance below: warn loudly, continue.
+            let dns_attach = (|| -> anyhow::Result<()> {
+                let dns: &mut CgroupSkb = bpf
+                    .program_mut("ac_dns_ingress")
+                    .ok_or_else(|| anyhow::anyhow!("BPF program ac_dns_ingress not found"))?
+                    .try_into()
+                    .map_err(|e| anyhow::anyhow!("program ac_dns_ingress type mismatch: {e}"))?;
+                dns.load()
+                    .map_err(|e| anyhow::anyhow!("loading ac_dns_ingress: {e}"))?;
+                dns.attach(
+                    &cgroup,
+                    CgroupSkbAttachType::Ingress,
+                    CgroupAttachMode::Single,
+                )
+                .map_err(|e| anyhow::anyhow!("attaching ac_dns_ingress: {e}"))?;
+                Ok(())
+            })();
+            match dns_attach {
+                Ok(()) => info!("attached DNS observation hook"),
+                Err(e) => warn!(
+                    error = %e,
+                    "DNS observation hook NOT attached — tracked-domain DNS \
+                     observation disabled; network enforcement is unaffected"
+                ),
+            }
 
             match Btf::from_sys_fs() {
                 Ok(btf) => {
@@ -852,7 +866,29 @@ mod linux {
                 return Ok(());
             }
             let canon = host.trim_end_matches('.').to_ascii_lowercase();
-            let hash = siphash128_bytes(sip_key, canon.as_bytes());
+            // Hash a FIXED-width zero-padded DNS wire-format buffer
+            // (length-prefixed labels, no terminator), byte-identical to
+            // what the BPF parser hashes — a constant hash length is what
+            // keeps SipHash inside the BPF verifier's limits, so userspace
+            // must match the same padded width. The digest is opaque; only
+            // both sides agreeing matters.
+            const HASH_NAME_LEN: usize = 128;
+            const MAX_NAME_BYTES: usize = 120;
+            let mut wire = [0u8; HASH_NAME_LEN];
+            let mut w = 0usize;
+            for label in canon.split('.') {
+                if label.is_empty() || label.len() > 63 {
+                    anyhow::bail!("invalid hostname label in policy host {canon:?}");
+                }
+                if w + 1 + label.len() > MAX_NAME_BYTES {
+                    anyhow::bail!("policy host {canon:?} too long to track for DNS observation");
+                }
+                wire[w] = label.len() as u8;
+                w += 1;
+                wire[w..w + label.len()].copy_from_slice(label.as_bytes());
+                w += label.len();
+            }
+            let hash = siphash128_bytes(sip_key, &wire);
             let key = DomainKey { cgroup_id, hash };
             let map_data = bpf
                 .map_mut("TRACKED_DOMAINS")

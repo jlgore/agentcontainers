@@ -12,10 +12,21 @@
 //! Only emits events for domains present in the TRACKED_DOMAINS map — all
 //! other DNS traffic is silently ignored, minimizing ring buffer bandwidth.
 //!
+//! Verifier design — the parser copies the DNS message into a per-CPU
+//! scratch buffer with ONE bpf_skb_load_bytes call and parses from memory
+//! with mask-bounded indices. Per-byte parsing through helper calls
+//! (bpf_skb_load_bytes per byte, each a call plus error branch) multiplied
+//! verifier states past the 1M processed-instruction budget — the program
+//! never loaded on a real kernel. Replies longer than the scratch buffer
+//! (512 bytes — classic UDP DNS; ample for A/AAAA answers) are parsed up
+//! to the truncation point.
+//!
 //! Security properties:
 //! - Keyed SipHash-128: negligible collision risk (birthday bound ~2^64).
 //!   Replaces the old FNV-1a 32-bit approach (M2 fix).
-//! - Compression pointer depth limit of 8 jumps (H1 fix).
+//! - Compression pointers in the question name are rejected outright (the
+//!   question is the first name in a message and cannot legally point
+//!   anywhere); answer names are hopped, never followed (H1 fix).
 //! - Observation-only: always returns 1 (allow). Never blocks DNS traffic.
 
 use core::hash::Hasher;
@@ -26,11 +37,13 @@ use aya_ebpf::programs::SkBuffContext;
 
 use agentcontainer_common::events::{
     DnsEvent, EventType, DNS_CLASS_IN, DNS_FLAG_QR, DNS_HEADER_SIZE, DNS_PORT, DNS_TYPE_A,
-    DNS_TYPE_AAAA, MAX_COMPRESSION_JUMPS,
+    DNS_TYPE_AAAA,
 };
 use agentcontainer_common::maps::DomainKey;
 
-use crate::maps::{DNS_EVENTS, ENFORCED_CGROUPS, SIPHASH_KEY, TRACKED_DOMAINS};
+use crate::maps::{
+    DNS_EVENTS, DNS_SCRATCH, DNS_SCRATCH_SIZE, ENFORCED_CGROUPS, SIPHASH_KEY, TRACKED_DOMAINS,
+};
 
 // ---------------------------------------------------------------------------
 // IP protocol constants.
@@ -40,16 +53,88 @@ const IP_HEADER_MIN_SIZE: usize = 20;
 const IP6_HEADER_SIZE: usize = 40;
 const UDP_HEADER_SIZE: usize = 8;
 
-// Bounded loop limits for BPF verifier compliance.
-const MAX_NAME_BYTES: usize = 255;
+// Bounded loop limits for BPF verifier compliance. Parsing runs against the
+// in-memory scratch buffer (cheap per iteration), but the unrolled totals
+// still count — keep these proportionate.
+/// Question-name walk budget (bytes traversed). The RFC ceiling is 255,
+/// but every traversed byte multiplies verifier exploration — at 255 the
+/// program exceeds the 1M processed-instruction budget and cannot load.
+/// 120 covers all realistic policy hostnames (Kubernetes FQDNs and cloud
+/// LB names run ~60-70 octets); longer names abort parsing (no event).
+const MAX_NAME_BYTES: usize = 120;
+/// Fixed width of the buffer the question name is hashed over. The name is
+/// copied in and the remainder stays zero, and SipHash always runs over
+/// exactly this many bytes — a COMPILE-TIME-CONSTANT length, which is what
+/// makes the digest viable in BPF: a runtime-length `hasher.write` emits
+/// SipHash's data-dependent 0..7-byte tail handling, whose branch product
+/// blew the verifier's 8192-jump limit. A constant length unrolls to a
+/// fixed sequence of 8-byte reads with no tail branch. Userspace
+/// (track_domain) hashes the identical zero-padded fixed-width buffer.
+const HASH_NAME_LEN: usize = 128;
 const MAX_LABEL_BYTES: usize = 63;
-const MAX_QUESTIONS: usize = 4;
-const MAX_ANSWERS: usize = 16;
+/// Labels per name in the answer-section skip walk (one iteration per
+/// label). Real hostnames have well under 16 labels; names exceeding this
+/// abort parsing (no event).
+const MAX_SKIP_LABELS: usize = 16;
+/// Answer records examined per response — the first 8 resolved addresses
+/// are ample for egress observation of a tracked domain.
+const MAX_ANSWERS: usize = 8;
 
 // ---------------------------------------------------------------------------
-// Safe packet access helpers.
+// Scratch buffer access. `n` is the number of valid bytes copied from the
+// packet; every read is double-bounded — a constant compare for the
+// verifier, the `n` compare for parsing correctness.
 // ---------------------------------------------------------------------------
 
+// The asm masks below hard-code the buffer sizes; keep them in lockstep.
+const _: () = assert!(DNS_SCRATCH_SIZE == 512);
+const _: () = assert!(HASH_NAME_LEN == 128);
+
+/// Branch-free scratch read. The buffer is zero-filled before the packet
+/// copy, so reads past the message see zeros (which self-terminate name
+/// walks and fail record checks) — no per-byte length compare needed. A
+/// length compare per read forked verifier state at every access and blew
+/// the 1M processed-instruction budget; a plain Rust mask gets deleted by
+/// LLVM as provably redundant. The inline-asm mask is opaque to LLVM but
+/// hands the verifier a hard constant bound on the exact load register.
+#[inline(always)]
+fn bget(buf: &[u8; DNS_SCRATCH_SIZE], i: usize) -> u8 {
+    let mut idx = i;
+    unsafe {
+        core::arch::asm!("{idx} &= 511", idx = inout(reg) idx);
+        *buf.as_ptr().add(idx)
+    }
+}
+
+#[inline(always)]
+fn bget_u16(buf: &[u8; DNS_SCRATCH_SIZE], i: usize) -> u16 {
+    ((bget(buf, i) as u16) << 8) | bget(buf, i + 1) as u16
+}
+
+#[inline(always)]
+fn bget_u32(buf: &[u8; DNS_SCRATCH_SIZE], i: usize) -> u32 {
+    ((bget(buf, i) as u32) << 24)
+        | ((bget(buf, i + 1) as u32) << 16)
+        | ((bget(buf, i + 2) as u32) << 8)
+        | bget(buf, i + 3) as u32
+}
+
+/// Masked write into the fixed-width hash buffer — the write mirror of
+/// `bget`. The loop counter is provably < MAX_NAME_BYTES (120) < 128, but
+/// the verifier loses that bound across LLVM's index arithmetic and rejects
+/// the store; the opaque asm mask restores a hard constant bound (128 is a
+/// power of two so the mask is a logical no-op for in-range indices).
+#[inline(always)]
+fn bset_name(buf: &mut [u8; HASH_NAME_LEN], i: usize, v: u8) {
+    let mut idx = i;
+    unsafe {
+        core::arch::asm!("{idx} &= 127", idx = inout(reg) idx);
+        *buf.as_mut_ptr().add(idx) = v;
+    }
+}
+
+/// Load one byte straight from the skb. Used only for the fixed-offset
+/// IP/UDP header fields ahead of the scratch copy.
 #[inline(always)]
 fn load_byte(ctx: &SkBuffContext, offset: usize) -> Option<u8> {
     ctx.load::<u8>(offset).ok()
@@ -62,22 +147,10 @@ fn load_u16_be(ctx: &SkBuffContext, offset: usize) -> Option<u16> {
     Some((hi << 8) | lo)
 }
 
-#[inline(always)]
-fn load_u32_be(ctx: &SkBuffContext, offset: usize) -> Option<u32> {
-    let b0 = ctx.load::<u8>(offset).ok()? as u32;
-    let b1 = ctx.load::<u8>(offset + 1).ok()? as u32;
-    let b2 = ctx.load::<u8>(offset + 2).ok()? as u32;
-    let b3 = ctx.load::<u8>(offset + 3).ok()? as u32;
-    Some((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)
-}
-
 // ---------------------------------------------------------------------------
-// DNS name hashing: walk a DNS name in the packet and incrementally feed
-// lowercased bytes into a SipHash-2-4 hasher. No copy to a buffer needed.
-//
-// Returns (end_offset, hash) where:
-//   - end_offset is past the name in the original packet
-//   - hash is the 128-bit SipHash digest of the normalized domain
+// DNS name handling against the scratch buffer. Offsets are DNS-message
+// relative, which is exactly what compression pointers encode — no
+// translation needed.
 // ---------------------------------------------------------------------------
 
 struct DnsHashResult {
@@ -85,97 +158,99 @@ struct DnsHashResult {
     hash: [u8; 16],
 }
 
+/// Hash the QUESTION name. Two phases, both with single-counter loops —
+/// the verifier-friendly shape. Phase 1 hops label-to-label to find the
+/// name's end (16 hops max, tiny state). Phase 2 copies the raw wire-format
+/// bytes (length-prefixed labels), lowercased, into a stack buffer and
+/// SipHashes it once.
+///
+/// The digest is over the RAW WIRE FORMAT, not a dotted string — userspace
+/// track_domain encodes policy hostnames the same way. Hashing wire bytes
+/// is what makes a single copy loop possible: a dotted-string walk needs
+/// per-byte label bookkeeping whose (offset, label_remaining, name_len)
+/// state product blew the verifier's 1M-instruction budget at every size
+/// we tried.
+///
+/// Compression pointers are rejected, not followed: the question is the
+/// FIRST name in a DNS message, so there is nothing earlier for it to
+/// point at — a pointer here is malformed (or adversarial) traffic.
 #[inline(always)]
 fn hash_dns_name(
-    ctx: &SkBuffContext,
+    buf: &[u8; DNS_SCRATCH_SIZE],
     start_offset: usize,
-    pkt_len: usize,
-    hasher: &mut SipHasher24,
+    k0: u64,
+    k1: u64,
 ) -> Option<DnsHashResult> {
+    // Phase 1: hop labels to find the terminator.
     let mut offset = start_offset;
-    let mut end_offset: usize = 0;
-    let mut first_label = true;
-    let mut jumps: u32 = 0;
-
-    for _i in 0..MAX_NAME_BYTES {
-        if offset >= pkt_len {
+    let mut end: usize = 0;
+    for _i in 0..MAX_SKIP_LABELS {
+        if offset >= DNS_SCRATCH_SIZE {
             return None;
         }
-
-        let label_len = load_byte(ctx, offset)?;
-
+        let label_len = bget(buf, offset);
         if label_len == 0 {
-            if end_offset == 0 {
-                end_offset = offset + 1;
-            }
+            end = offset; // terminator (root byte) excluded from the hash
             break;
         }
-
-        // Compression pointer (top 2 bits = 0b11).
         if (label_len & 0xC0) == 0xC0 {
-            let low = load_byte(ctx, offset + 1)?;
-            if end_offset == 0 {
-                end_offset = offset + 2;
-            }
-            offset = ((label_len as usize & 0x3F) << 8) | (low as usize);
-            jumps += 1;
-            if jumps > MAX_COMPRESSION_JUMPS {
-                return None; // H1 fix
-            }
-            continue;
+            return None; // pointer in a question name: malformed
         }
-
-        let len = label_len as usize;
-        if len > MAX_LABEL_BYTES {
+        if label_len as usize > MAX_LABEL_BYTES {
             return None;
         }
-
-        // Insert '.' between labels.
-        if !first_label {
-            hasher.write_u8(b'.');
-        }
-        first_label = false;
-
-        offset += 1;
-
-        // Feed label bytes into hasher, lowercasing ASCII.
-        for j in 0..MAX_LABEL_BYTES {
-            if j >= len {
-                break;
-            }
-            let ch = load_byte(ctx, offset + j)?;
-            let lower = if ch >= b'A' && ch <= b'Z' {
-                ch + 32
-            } else {
-                ch
-            };
-            hasher.write_u8(lower);
-        }
-        offset += len;
+        offset += 1 + label_len as usize;
     }
-
-    if end_offset == 0 {
+    if end == 0 || end <= start_offset {
         return None;
     }
 
+    let total = end - start_offset;
+    if total > MAX_NAME_BYTES {
+        return None;
+    }
+
+    // Phase 2: copy + lowercase into a FIXED-width zero-padded buffer, then
+    // hash the whole buffer at a compile-time-constant length (see
+    // HASH_NAME_LEN). Label-length prefix bytes are <= 63 and ASCII letters
+    // start at 65, so blanket lowercasing can never corrupt a length byte.
+    let mut name_buf = [0u8; HASH_NAME_LEN];
+    for k in 0..MAX_NAME_BYTES {
+        if k >= total {
+            break;
+        }
+        let ch = bget(buf, start_offset + k);
+        bset_name(
+            &mut name_buf,
+            k,
+            if ch.is_ascii_uppercase() { ch + 32 } else { ch },
+        );
+    }
+
+    let mut hasher = SipHasher24::new_with_keys(k0, k1);
+    hasher.write(&name_buf);
     let hash = hasher.finish128().as_u128().to_ne_bytes();
-    Some(DnsHashResult { end_offset, hash })
+    Some(DnsHashResult {
+        end_offset: end + 1,
+        hash,
+    })
 }
 
-/// Skip a DNS name without hashing. Used for subsequent questions and
-/// answer name fields where we already have the domain hash from the
-/// first question.
+/// Skip a DNS name without hashing. Used for answer-record name fields —
+/// the domain hash already comes from the question.
 #[inline(always)]
-fn skip_dns_name(ctx: &SkBuffContext, start_offset: usize, pkt_len: usize) -> Option<usize> {
+fn skip_dns_name(buf: &[u8; DNS_SCRATCH_SIZE], start_offset: usize) -> Option<usize> {
     let mut offset = start_offset;
     let mut end_offset: usize = 0;
 
-    for _i in 0..MAX_NAME_BYTES {
-        if offset >= pkt_len {
+    // One iteration per LABEL (the loop advances by 1 + len), so the bound
+    // is a label count, not a byte count — this loop runs once per answer
+    // record and its unrolled size multiplies accordingly.
+    for _i in 0..MAX_SKIP_LABELS {
+        if offset >= DNS_SCRATCH_SIZE {
             return None;
         }
-
-        let label_len = load_byte(ctx, offset)?;
+        let label_len = bget(buf, offset);
 
         if label_len == 0 {
             if end_offset == 0 {
@@ -275,35 +350,68 @@ fn try_parse_dns(ctx: &SkBuffContext) -> Result<(), ()> {
     }
 
     let dns_offset = udp_offset + UDP_HEADER_SIZE;
+    if pkt_len < dns_offset + DNS_HEADER_SIZE {
+        return Err(());
+    }
 
-    // DNS header: flags, qdcount, ancount.
-    let flags = load_u16_be(ctx, dns_offset + 2).ok_or(())?;
+    // Copy the DNS message into the per-CPU scratch buffer in ONE helper
+    // call; everything below parses from memory. Zero-fill first: bytes
+    // past the message read as zeros (self-terminating for name walks,
+    // failing for record checks), which is what lets the accessors skip a
+    // per-read length compare — stale bytes from a previous packet must
+    // never influence parsing.
+    let avail = pkt_len - dns_offset;
+    let n = if avail > DNS_SCRATCH_SIZE {
+        DNS_SCRATCH_SIZE
+    } else {
+        avail
+    };
+    let scratch = unsafe { DNS_SCRATCH.get_ptr_mut(0).ok_or(())? };
+    let buf = unsafe { &mut (*scratch).data };
+    // Zero in u64 strides — the byte-wise memset lowering costs the
+    // verifier 8x the iterations for the same effect.
+    let words = buf.as_mut_ptr() as *mut u64;
+    for w in 0..(DNS_SCRATCH_SIZE / 8) {
+        unsafe { words.add(w).write(0) };
+    }
+    let rc = unsafe {
+        aya_ebpf::helpers::gen::bpf_skb_load_bytes(
+            ctx.skb.skb as *const core::ffi::c_void,
+            dns_offset as u32,
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            n as u32,
+        )
+    };
+    if rc != 0 {
+        return Err(());
+    }
+    let buf: &[u8; DNS_SCRATCH_SIZE] = buf;
+
+    // DNS header: flags, qdcount, ancount (message-relative offsets).
+    let flags = bget_u16(buf, 2);
     if (flags & DNS_FLAG_QR) == 0 {
         return Err(()); // Not a response
     }
 
-    let qdcount = load_u16_be(ctx, dns_offset + 4).ok_or(())?;
-    let ancount = load_u16_be(ctx, dns_offset + 6).ok_or(())?;
+    let qdcount = bget_u16(buf, 4);
+    let ancount = bget_u16(buf, 6);
 
-    let mut pos = dns_offset + DNS_HEADER_SIZE;
+    // Single-question responses only — which is every response a real
+    // resolver produces (multi-question queries are unsupported by
+    // mainstream servers). Skipping extra questions cost a per-question
+    // name walk whose unrolled size pushed the program over the
+    // verifier's branch budget.
+    if qdcount != 1 {
+        return Err(());
+    }
 
-    // Hash the first question's domain name with SipHash-2-4 128-bit.
-    let question_name_offset = pos;
-    let mut hasher = SipHasher24::new_with_keys(key.k0, key.k1);
-    let hash_result = hash_dns_name(ctx, question_name_offset, pkt_len, &mut hasher).ok_or(())?;
+    // Hash the question's domain name with SipHash-2-4 128-bit.
+    let hash_result = hash_dns_name(buf, DNS_HEADER_SIZE, key.k0, key.k1).ok_or(())?;
     let domain_hash: [u8; 16] = hash_result.hash;
 
-    // Skip past QTYPE + QCLASS for the first question.
-    pos = hash_result.end_offset + 4;
-
-    // Skip remaining questions (if any).
-    for q in 1..MAX_QUESTIONS {
-        if q >= qdcount as usize {
-            break;
-        }
-        let name_end = skip_dns_name(ctx, pos, pkt_len).ok_or(())?;
-        pos = name_end + 4;
-    }
+    // Skip past QTYPE + QCLASS (end_offset is already past the name's
+    // terminator).
+    let mut pos = hash_result.end_offset + 4;
 
     // Check if this domain is tracked for the cgroup that owns this socket
     // (resolved at the top of the function).
@@ -321,18 +429,18 @@ fn try_parse_dns(ctx: &SkBuffContext) -> Result<(), ()> {
         if a >= ancount as usize {
             break;
         }
-        if pos >= pkt_len {
+        if pos >= DNS_SCRATCH_SIZE {
             break;
         }
 
-        let name_end = skip_dns_name(ctx, pos, pkt_len).ok_or(())?;
+        let name_end = skip_dns_name(buf, pos).ok_or(())?;
         pos = name_end;
 
         // TYPE (2) + CLASS (2) + TTL (4) + RDLENGTH (2) = 10 bytes.
-        let rtype = load_u16_be(ctx, pos).ok_or(())?;
-        let rclass = load_u16_be(ctx, pos + 2).ok_or(())?;
-        let ttl = load_u32_be(ctx, pos + 4).ok_or(())?;
-        let rdlength = load_u16_be(ctx, pos + 8).ok_or(())?;
+        let rtype = bget_u16(buf, pos);
+        let rclass = bget_u16(buf, pos + 2);
+        let ttl = bget_u32(buf, pos + 4);
+        let rdlength = bget_u16(buf, pos + 8);
         pos += 10;
 
         if rclass != DNS_CLASS_IN {
@@ -351,21 +459,10 @@ fn try_parse_dns(ctx: &SkBuffContext) -> Result<(), ()> {
                     (*ev).record_type = DNS_TYPE_A as u8;
                     (*ev).domain_hash = domain_hash;
 
-                    let mut ok = true;
                     for k in 0..4 {
-                        if let Some(b) = load_byte(ctx, pos + k) {
-                            (*ev).addr_v4[k] = b;
-                        } else {
-                            ok = false;
-                            break;
-                        }
+                        (*ev).addr_v4[k] = bget(buf, pos + k);
                     }
-
-                    if !ok {
-                        entry.discard(0);
-                    } else {
-                        entry.submit(0);
-                    }
+                    entry.submit(0);
                 }
             }
         } else if rtype == DNS_TYPE_AAAA && rdlength == 16 {
@@ -379,21 +476,10 @@ fn try_parse_dns(ctx: &SkBuffContext) -> Result<(), ()> {
                     (*ev).record_type = DNS_TYPE_AAAA as u8;
                     (*ev).domain_hash = domain_hash;
 
-                    let mut ok = true;
                     for k in 0..16 {
-                        if let Some(b) = load_byte(ctx, pos + k) {
-                            (*ev).addr_v6[k] = b;
-                        } else {
-                            ok = false;
-                            break;
-                        }
+                        (*ev).addr_v6[k] = bget(buf, pos + k);
                     }
-
-                    if !ok {
-                        entry.discard(0);
-                    } else {
-                        entry.submit(0);
-                    }
+                    entry.submit(0);
                 }
             }
         }
