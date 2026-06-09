@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"runtime"
 	"strings"
 )
 
@@ -45,6 +46,99 @@ type ociManifest struct {
 	MediaType string          `json:"mediaType,omitempty"`
 	Config    ociDescriptor   `json:"config"`
 	Layers    []ociDescriptor `json:"layers"`
+}
+
+// rawManifest is the union of an image manifest and an image index (manifest
+// list). A single GET on a tag may return either, depending on whether the
+// image is single- or multi-arch, so we decode into one struct and branch on
+// the shape (see isIndex).
+type rawManifest struct {
+	MediaType string          `json:"mediaType,omitempty"`
+	Config    ociDescriptor   `json:"config"`
+	Layers    []ociDescriptor `json:"layers"`
+	Manifests []ociIndexEntry `json:"manifests"`
+}
+
+// ociIndexEntry is one platform entry in an image index, pointing at a concrete
+// per-architecture image manifest.
+type ociIndexEntry struct {
+	MediaType string       `json:"mediaType"`
+	Digest    string       `json:"digest"`
+	Size      int64        `json:"size"`
+	Platform  *ociPlatform `json:"platform,omitempty"`
+}
+
+// ociPlatform is the OCI platform descriptor for an index entry.
+type ociPlatform struct {
+	OS           string `json:"os"`
+	Architecture string `json:"architecture"`
+	Variant      string `json:"variant,omitempty"`
+}
+
+// indexMediaTypes are the manifest-list / image-index media types. A registry
+// only returns one of these if the client advertises it in Accept; omitting
+// them makes multi-arch tags 404 (the registry won't down-convert an index to
+// a single image manifest).
+var indexMediaTypes = []string{
+	"application/vnd.oci.image.index.v1+json",
+	"application/vnd.docker.distribution.manifest.list.v2+json",
+}
+
+// imageMediaTypes are the single-arch image manifest media types.
+var imageMediaTypes = []string{
+	"application/vnd.oci.image.manifest.v1+json",
+	"application/vnd.docker.distribution.manifest.v2+json",
+}
+
+// isIndex reports whether the decoded document is an image index (manifest
+// list) rather than a concrete image manifest. An image manifest never carries
+// a "manifests" array, so its presence is the structural signal; the media type
+// is checked first for registries that set it.
+func (m *rawManifest) isIndex() bool {
+	for _, mt := range indexMediaTypes {
+		if m.MediaType == mt {
+			return true
+		}
+	}
+	return len(m.Manifests) > 0
+}
+
+// maxManifestIndexDepth bounds index → image-manifest resolution to guard
+// against a pathological (or malicious) chain of nested indexes.
+const maxManifestIndexDepth = 4
+
+// selectPlatformManifest picks the image-manifest digest for the running host
+// platform from an image index. It prefers an exact linux/<GOARCH> match, then
+// linux/amd64, then any linux image entry. Entries with no platform or the
+// "unknown" platform (attestation/SBOM manifests attached by BuildKit) are
+// skipped.
+func selectPlatformManifest(entries []ociIndexEntry, ref Reference) (string, error) {
+	var amd64Fallback, anyLinux string
+	for _, e := range entries {
+		if e.Digest == "" || e.Platform == nil {
+			continue
+		}
+		os, arch := e.Platform.OS, e.Platform.Architecture
+		if os == "unknown" || arch == "unknown" {
+			continue
+		}
+		if os == "linux" && arch == runtime.GOARCH {
+			return e.Digest, nil
+		}
+		if os == "linux" && arch == "amd64" && amd64Fallback == "" {
+			amd64Fallback = e.Digest
+		}
+		if os == "linux" && anyLinux == "" {
+			anyLinux = e.Digest
+		}
+	}
+	if amd64Fallback != "" {
+		return amd64Fallback, nil
+	}
+	if anyLinux != "" {
+		return anyLinux, nil
+	}
+	return "", fmt.Errorf("no linux/%s image manifest in index for %s", runtime.GOARCH, ref.String())
 }
 
 // ociDescriptor describes a content-addressable blob.
@@ -93,44 +187,71 @@ func (r *Resolver) FetchPolicy(ctx context.Context, imageRef string) ([]byte, er
 	return data, nil
 }
 
-// fetchManifest fetches and parses the OCI manifest for a given reference.
+// fetchManifest fetches and parses the OCI image manifest for a given
+// reference. When the reference resolves to a multi-arch image index (manifest
+// list), it selects the entry for the running host platform and fetches that
+// concrete image manifest, repeating until it lands on an image manifest (up to
+// maxManifestIndexDepth levels of nesting).
 func (r *Resolver) fetchManifest(ctx context.Context, ref Reference) (*ociManifest, error) {
+	cur := ref
+	for depth := 0; depth <= maxManifestIndexDepth; depth++ {
+		raw, err := r.fetchRawManifest(ctx, cur, ref)
+		if err != nil {
+			return nil, err
+		}
+		if !raw.isIndex() {
+			return &ociManifest{MediaType: raw.MediaType, Config: raw.Config, Layers: raw.Layers}, nil
+		}
+		childDigest, err := selectPlatformManifest(raw.Manifests, ref)
+		if err != nil {
+			return nil, err
+		}
+		// Resolve the selected platform manifest by digest under the same repo.
+		cur = Reference{Registry: ref.Registry, Name: ref.Name, Digest: childDigest}
+	}
+	return nil, fmt.Errorf("manifest index nesting exceeded %d levels for %s", maxManifestIndexDepth, ref.String())
+}
+
+// fetchRawManifest performs a single manifest GET (by tag or digest) and
+// decodes it as either an image manifest or an image index. fetchRef is the
+// reference actually requested (a child digest during index resolution);
+// origRef is used for stable, user-facing error messages.
+func (r *Resolver) fetchRawManifest(ctx context.Context, fetchRef, origRef Reference) (*rawManifest, error) {
 	scheme := "https"
-	tagOrDigest := ref.Tag
-	if ref.Digest != "" {
-		tagOrDigest = ref.Digest
+	tagOrDigest := fetchRef.Tag
+	if fetchRef.Digest != "" {
+		tagOrDigest = fetchRef.Digest
 	}
 
-	url := fmt.Sprintf("%s://%s/v2/%s/manifests/%s", scheme, ref.Registry, ref.Name, tagOrDigest)
+	url := fmt.Sprintf("%s://%s/v2/%s/manifests/%s", scheme, fetchRef.Registry, fetchRef.Name, tagOrDigest)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("creating manifest request: %w", err)
 	}
 
-	req.Header.Set("Accept", strings.Join([]string{
-		"application/vnd.oci.image.manifest.v1+json",
-		"application/vnd.docker.distribution.manifest.v2+json",
-	}, ", "))
+	// Advertise both index and image-manifest media types so the registry will
+	// serve a multi-arch index instead of 404ing the tag.
+	req.Header.Set("Accept", strings.Join(append(append([]string{}, indexMediaTypes...), imageMediaTypes...), ", "))
 
-	resp, err := r.doWithAuth(ctx, req, ref)
+	resp, err := r.doWithAuth(ctx, req, fetchRef)
 	if err != nil {
-		return nil, fmt.Errorf("fetching manifest for %s: %w", ref.String(), err)
+		return nil, fmt.Errorf("fetching manifest for %s: %w", origRef.String(), err)
 	}
 	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("manifest not found for %s", ref.String())
+		return nil, fmt.Errorf("manifest not found for %s", origRef.String())
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		return nil, fmt.Errorf("unexpected status %d fetching manifest for %s: %s",
-			resp.StatusCode, ref.String(), string(body))
+			resp.StatusCode, origRef.String(), string(body))
 	}
 
-	var m ociManifest
+	var m rawManifest
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxPolicySize)).Decode(&m); err != nil {
-		return nil, fmt.Errorf("decoding manifest for %s: %w", ref.String(), err)
+		return nil, fmt.Errorf("decoding manifest for %s: %w", origRef.String(), err)
 	}
 
 	return &m, nil
