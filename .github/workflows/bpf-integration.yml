@@ -1,0 +1,63 @@
+name: BPF integration
+
+# Privileged BPF integration suite (enforcer/agentcontainer-enforcer/tests/
+# bpf_integration.rs). These tests load and attach real eBPF programs, so they
+# need root + CAP_BPF/CAP_NET_ADMIN and a cgroup-v2 host — they are NOT covered
+# by the unit-test job in rust.yml (which runs `--lib` only). That gap is how
+# the cgroup_skb DNS parser shipped for several commits without ever loading
+# under the verifier; this job closes it.
+#
+# LSM-dependent tests (file_open / bprm_check / credential) self-skip when the
+# kernel lacks CONFIG_BPF_LSM (most GitHub-hosted runners), so they do not fail
+# here; the network / DNS / cgroup_skb tests do run and are the regression net.
+#
+# NOTE: GitHub-hosted runners are not guaranteed to permit cgroup-BPF load/
+# attach. If this job fails at program load with EPERM, point `runs-on` at a
+# self-hosted runner with privileged BPF (the rest of the job is unchanged).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'enforcer/**'
+      - '.github/workflows/bpf-integration.yml'
+      - '.github/actions/setup-rust-bpf/**'
+  pull_request:
+    paths:
+      - 'enforcer/**'
+      - '.github/workflows/bpf-integration.yml'
+      - '.github/actions/setup-rust-bpf/**'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  bpf-integration:
+    name: BPF integration (privileged)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-rust-bpf
+
+      # build.rs runs aya-build, compiling the BPF ELF alongside the test
+      # binary. Link it now (unprivileged) so the privileged step only runs.
+      - name: Build BPF integration test binary
+        run: cargo test --manifest-path enforcer/Cargo.toml -p agentcontainer-enforcer --test bpf_integration --no-run
+
+      - name: Run BPF integration suite (root)
+        run: |
+          set -euo pipefail
+          # Newest aya-build ELF and the freshly linked test binary.
+          ELF=$(ls -t enforcer/target/debug/build/agentcontainer-enforcer-*/out/agentcontainer-ebpf-progs | head -1)
+          TESTBIN=$(ls -t enforcer/target/debug/deps/bpf_integration-* | grep -v '\.d$' | head -1)
+          echo "ELF=$ELF"
+          echo "TESTBIN=$TESTBIN"
+          # serial_test already serializes these, but the suite binds fixed
+          # ports (UDP :53) and shares the cgroup root, so force single-threaded.
+          sudo AC_BPF_ELF_PATH="$PWD/$ELF" "$PWD/$TESTBIN" --test-threads=1 --nocapture

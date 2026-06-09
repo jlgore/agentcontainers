@@ -177,7 +177,7 @@ tool-call correlation with bounded windows.
 | `ALLOWED_INODES` | `FsInodeKey` (no cgroup_id) | Add cgroup_id to `FsInodeKey` |
 | `DENIED_INODES` | `FsInodeKey` (no cgroup_id) | Same |
 | `ALLOWED_EXECS` | `FsInodeKey` (no cgroup_id) | Same |
-| `TRACKED_DOMAINS` | SipHash-based (global) | Add cgroup_id to key |
+| `TRACKED_DOMAINS` | SipHash-based (global) | **Retired** — in-kernel hashing over a variable-length name never cleared the verifier; the kernel now copies the raw question name and userspace owns per-cgroup identification (Phase 3, step 7) |
 
 **Already per-cgroup (no change):** `SECRET_ACLS` (`SecretAclKey`
 includes `cgroup_id`).
@@ -867,9 +867,18 @@ v6 — replaces the hand-rolled transport). `google/uuid` already present.
 6. **Hostname resolution:** at registration, proxy resolves hostnames
    to IPs and populates IP-based maps, with re-resolution every 5
    minutes for long sessions (CDN/cloud IPs rotate).
-7. **Rekey `TRACKED_DOMAINS`** for per-cgroup DNS-observed hostname
-   scoping. Sequenced after steps 1–6 (the IP-refresh path in step 6
-   is the interim behavior if this step slips to a later milestone).
+7. **DNS observation (userspace identification).** The `cgroup_skb/ingress`
+   parser (`ac_dns_ingress`), gated per-cgroup via `bpf_skb_cgroup_id`, copies
+   each enforced cgroup's DNS-response question name (raw wire bytes,
+   lowercased, length-prefixed) into a `DnsEvent` and emits one event per
+   A/AAAA answer record. Userspace matches the name against a per-cgroup
+   tracked-domain set (wire bytes → hostname, populated at `apply_network`) and
+   drops the rest — so no hostname identification or hashing runs in the
+   kernel. The original plan (rekey an in-kernel SipHash `TRACKED_DOMAINS` map)
+   was abandoned: a SipHash over a variable-length name never cleared the BPF
+   verifier. Answer records are capped at `MAX_ANSWERS` (4) to stay inside the
+   verifier's 1M-insn complexity budget; the filtering resolver (§14) is the
+   compensating control for answer sections beyond the cap.
 8. **(Stretch) argv capture:** new BPF tracepoint at execve. Truncation
    at 256 bytes/arg, 16 args max. Only if verifier budget allows.
 
