@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
 # Bring up the SIFT platform demo under agentcontainers enforcement.
 #
-# Idempotent. Builds the gateway image if missing, resolves the agent base
-# image's amd64 manifest digest (so org-policy extraction doesn't 404 on the
-# multi-arch tag), starts the hardened gateway, runs the agent under
-# enforcement, and starts the MCP proxy fronting the 49 SIFT tools.
+# Idempotent. Builds the gateway image if missing, starts the hardened gateway,
+# runs the agent under enforcement, and starts the MCP proxy fronting the 49
+# SIFT tools.
 #
 # Assumes scripts/bootstrap.sh has already prepared the host (Docker, the
 # agentcontainer CLI, the enforcer image, BPF LSM).
 #
 # Env: IMAGE=sift-gateway:demo  GATEWAY_PORT=4508  PROXY_PORT=4510
-#      BASE_IMAGE=mcr.microsoft.com/devcontainers/base:ubuntu
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,7 +17,6 @@ cd "$HERE"
 IMAGE="${IMAGE:-sift-gateway:demo}"
 GATEWAY_PORT="${GATEWAY_PORT:-4508}"
 PROXY_PORT="${PROXY_PORT:-4510}"
-BASE_IMAGE="${BASE_IMAGE:-mcr.microsoft.com/devcontainers/base:ubuntu}"
 RUN_DIR="$HERE/.run"
 
 if [ -t 1 ]; then B='\033[1;34m'; G='\033[1;32m'; Y='\033[1;33m'; R='\033[1;31m'; Z='\033[0m'
@@ -43,26 +40,7 @@ else
   "$HERE/build.sh"
 fi
 
-# 2. Resolve the agent base image's amd64 manifest digest. Fall back to the
-#    committed pin if crane is unavailable or the lookup fails.
-RUN_CONFIG="$RUN_DIR/agentcontainer.json"
-if command -v crane >/dev/null 2>&1; then
-  log "Resolving $BASE_IMAGE linux/amd64 digest"
-  DIGEST="$(crane digest --platform linux/amd64 "$BASE_IMAGE" 2>/dev/null || true)"
-  if [ -n "$DIGEST" ]; then
-    ok "$DIGEST"
-    sed -E "s#\"image\": \"[^\"]*\"#\"image\": \"${BASE_IMAGE}@${DIGEST}\"#" \
-      "$HERE/agentcontainer.json" > "$RUN_CONFIG"
-  else
-    warn "crane could not resolve digest; using committed config pin"
-    cp "$HERE/agentcontainer.json" "$RUN_CONFIG"
-  fi
-else
-  warn "crane not found; using committed config pin"
-  cp "$HERE/agentcontainer.json" "$RUN_CONFIG"
-fi
-
-# 3. Gateway container (hardened, mirrors the MCP-sidecar profile).
+# 2. Gateway container (hardened, mirrors the MCP-sidecar profile).
 log "Starting gateway on :$GATEWAY_PORT"
 docker rm -f sift-gateway >/dev/null 2>&1 || true
 docker run -d --name sift-gateway \
@@ -75,13 +53,11 @@ done
 [ "$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:${GATEWAY_PORT}/health" 2>/dev/null)" = "200" ] \
   && ok "gateway healthy" || die "gateway did not become healthy (docker logs sift-gateway)"
 
-# 4. Agent under enforcement (enforcer auto-starts). Workspace stays this dir;
-#    -c just points at the digest-pinned config.
+# 3. Agent under enforcement (enforcer auto-starts).
 log "Starting agent under enforcement"
-agentcontainer run -c "$RUN_CONFIG" -d 2>&1 | grep -avE 'lockfile not found' || true
+agentcontainer run -d 2>&1 | grep -avE 'lockfile not found' || true
 
-# 5. MCP proxy fronting the SIFT platform (committed config from cwd; the remote
-#    backend's URL is what matters here, not the agent image digest).
+# 4. MCP proxy fronting the SIFT platform.
 log "Starting MCP proxy on :$PROXY_PORT"
 if [ -f "$RUN_DIR/proxy.pid" ] && kill -0 "$(cat "$RUN_DIR/proxy.pid")" 2>/dev/null; then
   ok "proxy already running (pid $(cat "$RUN_DIR/proxy.pid"))"

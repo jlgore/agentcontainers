@@ -65,9 +65,8 @@ funneled to `/run/secrets` and `.pyc` writes are disabled.
 ## Run
 
 The whole lifecycle is scripted (idempotent). `up.sh` builds the image if
-needed, resolves the agent base image's amd64 digest (avoids the org-policy
-multi-arch 404), starts the hardened gateway, runs the agent under enforcement,
-and starts the MCP proxy:
+needed, starts the hardened gateway, runs the agent under enforcement, and
+starts the MCP proxy:
 
 ```bash
 ./up.sh       # build (if needed) + gateway + agent + proxy

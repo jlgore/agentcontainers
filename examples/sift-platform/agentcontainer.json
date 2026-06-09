@@ -9,13 +9,7 @@
   //
   // Build the image first:  ./build.sh   (produces sift-gateway:demo)
   "name": "sift-agent",
-  // Pinned to the linux/amd64 image-manifest digest, not the multi-arch tag:
-  // org-policy extraction fetches the manifest with image-manifest Accept
-  // headers only, so a multi-arch index tag 404s. A concrete manifest digest
-  // resolves cleanly (no policy layer -> DefaultPolicy) and is the digest
-  // pinning the tool recommends for TOCTOU safety anyway.
-  // Digest via: crane digest --platform linux/amd64 mcr.microsoft.com/devcontainers/base:ubuntu
-  "image": "mcr.microsoft.com/devcontainers/base:ubuntu@sha256:3397b3751886e669eb873b4dfbebecc9c9e4bc413451d1f2540c62d5b615d6da",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
 
   "agent": {
     "capabilities": {
