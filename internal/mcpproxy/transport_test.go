@@ -8,10 +8,12 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"testing"
 
 	"github.com/moby/moby/api/pkg/stdcopy"
 	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.uber.org/zap/zaptest"
@@ -144,14 +146,29 @@ func (f *fakeDockerClient) ContainerAttach(context.Context, string, client.Conta
 
 func (f *fakeDockerClient) ContainerStart(context.Context, string, client.ContainerStartOptions) (client.ContainerStartResult, error) {
 	f.started = true
-	go func() {
-		var muxed bytes.Buffer
-		muxFrame(&muxed, stdcopy.Stderr, "log noise\n")
-		muxFrame(&muxed, stdcopy.Stdout, `{"jsonrpc":"2.0","id":1,"result":{}}`+"\n")
-		_, _ = f.containerConn.Write(muxed.Bytes())
-		_ = f.containerConn.Close()
-	}()
+	// Only the stdio path attaches; the http path has no containerConn.
+	if f.containerConn != nil {
+		go func() {
+			var muxed bytes.Buffer
+			muxFrame(&muxed, stdcopy.Stderr, "log noise\n")
+			muxFrame(&muxed, stdcopy.Stdout, `{"jsonrpc":"2.0","id":1,"result":{}}`+"\n")
+			_, _ = f.containerConn.Write(muxed.Bytes())
+			_ = f.containerConn.Close()
+		}()
+	}
 	return client.ContainerStartResult{}, nil
+}
+
+func (f *fakeDockerClient) ContainerInspect(context.Context, string, client.ContainerInspectOptions) (client.ContainerInspectResult, error) {
+	return client.ContainerInspectResult{
+		Container: container.InspectResponse{
+			NetworkSettings: &container.NetworkSettings{
+				Networks: map[string]*network.EndpointSettings{
+					f.networkName: {IPAddress: netip.MustParseAddr("172.20.0.42")},
+				},
+			},
+		},
+	}, nil
 }
 
 func (f *fakeDockerClient) ContainerPause(context.Context, string, client.ContainerPauseOptions) (client.ContainerPauseResult, error) {
@@ -258,6 +275,64 @@ func TestDialStdioContainerDegradesWhenFreezeUnavailable(t *testing.T) {
 		t.Fatal("resume unpaused a container that was never frozen")
 	}
 	_ = sc.cleanup(t.Context())
+}
+
+// dialHTTPContainer launches the backend on the bridge network (no stdin
+// attach), freezes it for enforcement, and returns the bridge address/endpoint
+// to connect to over Streamable HTTP.
+func TestDialHTTPContainer(t *testing.T) {
+	docker := &fakeDockerClient{}
+	hc, err := dialHTTPContainer(t.Context(), Deps{Docker: docker, Logger: zaptest.NewLogger(t)}, "sift", config.MCPToolConfig{
+		Type:      "container",
+		Image:     "sift-gateway:demo",
+		Transport: "http",
+		Port:      4508,
+		Path:      "/mcp",
+	}, "sessionabcdef", "ac-mcp-sessiona")
+	if err != nil {
+		t.Fatalf("dialHTTPContainer: %v", err)
+	}
+
+	// HTTP backends connect over the network, not an attached stream.
+	if docker.createdConfig.AttachStdin || docker.createdConfig.OpenStdin {
+		t.Error("http backend must not attach stdin")
+	}
+	if !docker.started {
+		t.Error("container was not started")
+	}
+	if !docker.paused {
+		t.Error("container was not frozen before enforcement")
+	}
+
+	if want := "172.20.0.42:4508"; hc.address != want {
+		t.Errorf("address = %q, want %q", hc.address, want)
+	}
+	if want := "http://172.20.0.42:4508/mcp"; hc.endpoint != want {
+		t.Errorf("endpoint = %q, want %q", hc.endpoint, want)
+	}
+
+	if err := hc.resume(t.Context()); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if !docker.unpaused {
+		t.Error("resume did not unpause the container")
+	}
+	_ = hc.cleanup(t.Context())
+}
+
+// An unset path defaults to "/".
+func TestDialHTTPContainerDefaultPath(t *testing.T) {
+	docker := &fakeDockerClient{}
+	hc, err := dialHTTPContainer(t.Context(), Deps{Docker: docker, Logger: zaptest.NewLogger(t)}, "svc", config.MCPToolConfig{
+		Type: "container", Image: "x:1", Transport: "http", Port: 8080,
+	}, "sessionabcdef", "ac-mcp-sessiona")
+	if err != nil {
+		t.Fatalf("dialHTTPContainer: %v", err)
+	}
+	if want := "http://172.20.0.42:8080/"; hc.endpoint != want {
+		t.Errorf("endpoint = %q, want %q", hc.endpoint, want)
+	}
+	_ = hc.cleanup(t.Context())
 }
 
 // The audit enforcement marker must surface the posture gap from SPEC §14:

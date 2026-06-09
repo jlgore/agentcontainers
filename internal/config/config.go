@@ -198,6 +198,11 @@ type MCPToolConfig struct {
 	// transport is "http". Container type only.
 	Port int `json:"port,omitempty"`
 
+	// Path is the HTTP path of the MCP Streamable HTTP endpoint for
+	// container-type tools with transport "http" (e.g. "/mcp"). Defaults to
+	// "/". Only valid for container + http.
+	Path string `json:"path,omitempty"`
+
 	// URL is the endpoint of a "remote" server. Remote type only.
 	URL string `json:"url,omitempty"`
 
@@ -522,12 +527,18 @@ func validateMCPTool(name string, tool MCPToolConfig) []error {
 		if tool.Transport != "http" && tool.Port != 0 {
 			errs = append(errs, fmt.Errorf("%s: port is only valid when transport is \"http\"", field("port")))
 		}
+		if tool.Transport != "http" && tool.Path != "" {
+			errs = append(errs, fmt.Errorf("%s: path is only valid when transport is \"http\"", field("path")))
+		}
 	} else {
 		if tool.Transport != "" {
 			errs = append(errs, fmt.Errorf("%s: transport is only valid for container-type tools", field("transport")))
 		}
 		if tool.Port != 0 {
 			errs = append(errs, fmt.Errorf("%s: port is only valid for container-type tools", field("port")))
+		}
+		if tool.Path != "" {
+			errs = append(errs, fmt.Errorf("%s: path is only valid for container-type tools", field("path")))
 		}
 	}
 

@@ -26,21 +26,35 @@ attaches it to the agent:
 
 ## Hosting model: why `remote`, not `container`
 
-The gateway is wired as a **`type: remote`** MCP backend, not `container`. Two
-constraints on a plain Docker **Engine** host (no Docker Desktop) force this:
+This example wires the gateway as a **`type: remote`** MCP backend for
+simplicity, but `container` + `http` is also supported by the MCP proxy and
+gives the gateway kernel enforcement — see the alternative below.
 
-1. The in-`run` container-MCP path is only wired by the **sandbox** runtime,
-   which needs Docker Desktop's `sandboxd` (a microVM backend). On Docker Engine
-   `--runtime sandbox` fails with `dial unix .../sandboxd.sock: no such file`.
-2. The MCP proxy can host container backends only over **stdio** — it explicitly
-   rejects `container` + `http` (*"transport http is not yet implemented (use
-   type remote for HTTP endpoints)"*, `internal/mcpproxy/transport.go`). The
-   gateway is HTTP.
+One thing to know about a plain Docker **Engine** host (no Docker Desktop): the
+in-`run` container-MCP path is only wired by the **sandbox** runtime, which
+needs Docker Desktop's `sandboxd` (a microVM backend); on Docker Engine
+`--runtime sandbox` fails with `dial unix .../sandboxd.sock: no such file`. The
+MCP proxy (`agentcontainer mcp start`) does not need the sandbox runtime — it
+launches container backends directly via the Docker API.
 
-So the gateway runs as a standalone container and the proxy connects to its HTTP
-endpoint as a remote backend. (For a kernel-enforced *container* MCP tool on
-Engine, host an individual **stdio** server as `type: container` instead — the
-proxy `docker run`s it and registers its cgroup with the enforcer.)
+**Remote (this example):** the gateway runs as a standalone container and the
+proxy connects to its HTTP endpoint as a remote backend. Simple, but the gateway
+itself is not registered with the enforcer.
+
+**Container + http (kernel-enforced):** point the tool at the image instead of a
+URL and the proxy launches the gateway container, registers its cgroup with the
+eBPF enforcer (network/file/process policy on BPF maps), and connects over HTTP
+on the per-session bridge network:
+
+```jsonc
+"sift": {
+  "type": "container",
+  "image": "sift-gateway:demo",
+  "transport": "http",
+  "port": 4508,
+  "path": "/mcp"
+}
+```
 
 ## Files
 

@@ -1286,6 +1286,20 @@ func TestValidate_MCPToolTypeMatrix(t *testing.T) {
 			tool: MCPToolConfig{Image: "x:1", Transport: "http", Port: 8080},
 		},
 		{
+			name: "container http transport with port and path is valid",
+			tool: MCPToolConfig{Image: "x:1", Transport: "http", Port: 8080, Path: "/mcp"},
+		},
+		{
+			name:     "container stdio transport with path is rejected",
+			tool:     MCPToolConfig{Image: "x:1", Path: "/mcp"},
+			wantErrs: []string{`agent.tools.mcp["t"].path: path is only valid when transport is "http"`},
+		},
+		{
+			name:     "remote transport with path is rejected",
+			tool:     MCPToolConfig{Type: "remote", URL: "http://h:1/mcp", Path: "/mcp"},
+			wantErrs: []string{`agent.tools.mcp["t"].path: path is only valid for container-type tools`},
+		},
+		{
 			name:     "container http transport without port is rejected",
 			tool:     MCPToolConfig{Image: "x:1", Transport: "http"},
 			wantErrs: []string{`agent.tools.mcp["t"].port: port must be > 0 when transport is "http"`},

@@ -13,8 +13,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/moby/moby/api/pkg/stdcopy"
 	"github.com/moby/moby/api/types/container"
@@ -95,7 +97,7 @@ func (b *Backend) Enforcement() string {
 	if b.Kind == KindRemote {
 		return "proxy-only"
 	}
-	if b.Kind == KindStdio && b.Policy != nil && b.Policy.Filesystem != nil &&
+	if (b.Kind == KindStdio || b.Kind == KindHTTP) && b.Policy != nil && b.Policy.Filesystem != nil &&
 		(len(b.Policy.Filesystem.Read) > 0 || len(b.Policy.Filesystem.Write) > 0) {
 		return "fs-allowlists:proxy-only"
 	}
@@ -188,6 +190,28 @@ func (b *Backend) Close(ctx context.Context) error {
 	return nil
 }
 
+// freezeEnforceResume registers a freshly started, frozen backend container
+// with the enforcer (when one is connected) and then unpauses it. It preserves
+// the fail-closed invariant shared by the stdio and http container paths:
+// kernel policy is applied while the container cannot execute, and a backend
+// that cannot be brought under enforcement does not start. The unregister
+// cleanup is appended to the backend so Close sweeps its BPF map entries.
+func (b *Backend) freezeEnforceResume(ctx context.Context, deps Deps, tool config.MCPToolConfig, resume func(context.Context) error) error {
+	if deps.Enforcer != nil {
+		unregister, err := registerBackendEnforcement(ctx, deps, b, tool)
+		if err != nil {
+			return err
+		}
+		b.cleanup = append(b.cleanup, unregister)
+	}
+	// Unfreeze only after policy is in place. From here the container runs
+	// fully enforced through the MCP handshake and every tool call.
+	if err := resume(ctx); err != nil {
+		return fmt.Errorf("resuming container after enforcement: %w", err)
+	}
+	return nil
+}
+
 // newBackend connects a single backend per its declared type and transport.
 // The mcp.Client is supplied by the proxy with relay handlers already wired.
 func newBackend(ctx context.Context, deps Deps, mcpClient *mcp.Client, name string, tool config.MCPToolConfig, sessionID, networkName string, concurrency int) (*Backend, error) {
@@ -221,15 +245,41 @@ func newBackend(ctx context.Context, deps Deps, mcpClient *mcp.Client, name stri
 		return b, nil
 
 	case "", "container":
-		if tool.Transport == "http" {
-			// Container HTTP transport rides the Compose lifecycle and is
-			// deferred to Phase 3; type:"remote" exercises the same
-			// StreamableClientTransport code path in the meantime.
-			return nil, fmt.Errorf("mcpproxy: backend %s: transport %q is not yet implemented (use type \"remote\" for HTTP endpoints)", name, tool.Transport)
-		}
 		if deps.Docker == nil {
 			return nil, fmt.Errorf("mcpproxy: backend %s: container type requires a Docker connection", name)
 		}
+		if tool.Transport == "http" {
+			b.Kind = KindHTTP
+			hc, err := dialHTTPContainer(ctx, deps, name, tool, sessionID, networkName)
+			if err != nil {
+				return nil, err
+			}
+			b.ContainerID = hc.containerID
+			b.cleanup = append(b.cleanup, hc.cleanup)
+
+			// Enforce while frozen, then resume — same fail-closed invariant
+			// as the stdio path: kernel policy lands before the container runs.
+			if err := b.freezeEnforceResume(ctx, deps, tool, hc.resume); err != nil {
+				_ = b.Close(ctx)
+				return nil, fmt.Errorf("mcpproxy: backend %s: %w", name, err)
+			}
+
+			// The HTTP server is not listening until it unfreezes and boots;
+			// wait for the socket, then drive the MCP handshake over HTTP.
+			if err := waitForListening(ctx, hc.address, httpBackendReadyTimeout); err != nil {
+				_ = b.Close(ctx)
+				return nil, fmt.Errorf("mcpproxy: backend %s: waiting for http server: %w", name, err)
+			}
+			tr := &mcp.StreamableClientTransport{Endpoint: hc.endpoint}
+			session, err := mcpClient.Connect(ctx, tr, nil)
+			if err != nil {
+				_ = b.Close(ctx)
+				return nil, fmt.Errorf("mcpproxy: backend %s: MCP initialize over http: %w", name, err)
+			}
+			b.session = session
+			return b, nil
+		}
+
 		b.Kind = KindStdio
 		sc, err := dialStdioContainer(ctx, deps, name, tool, sessionID, networkName)
 		if err != nil {
@@ -238,26 +288,11 @@ func newBackend(ctx context.Context, deps Deps, mcpClient *mcp.Client, name stri
 		b.ContainerID = sc.containerID
 		b.cleanup = append(b.cleanup, sc.cleanup)
 
-		// The container is frozen (best-effort) the instant its process
-		// started. Register and apply kernel policy while it cannot
-		// execute, THEN unfreeze — this closes the window where the
+		// Enforce while frozen, then resume — closes the window where the
 		// container would otherwise run before its BPF maps are populated.
-		// Fail closed: with an enforcer connected, a backend that cannot
-		// be brought under enforcement does not start.
-		if deps.Enforcer != nil {
-			unregister, err := registerBackendEnforcement(ctx, deps, b, tool)
-			if err != nil {
-				_ = b.Close(ctx)
-				return nil, err
-			}
-			b.cleanup = append(b.cleanup, unregister)
-		}
-
-		// Unfreeze only after policy is in place. From here the container
-		// runs fully enforced through the MCP handshake and every tool call.
-		if err := sc.resume(ctx); err != nil {
+		if err := b.freezeEnforceResume(ctx, deps, tool, sc.resume); err != nil {
 			_ = b.Close(ctx)
-			return nil, fmt.Errorf("mcpproxy: backend %s: resuming container after enforcement: %w", name, err)
+			return nil, fmt.Errorf("mcpproxy: backend %s: %w", name, err)
 		}
 
 		session, err := mcpClient.Connect(ctx, sc.transport, nil)
@@ -425,6 +460,184 @@ func dialStdioContainer(ctx context.Context, deps Deps, name string, tool config
 		resume:      resume,
 		cleanup:     cleanup,
 	}, nil
+}
+
+// httpContainer is a launched, (best-effort) frozen backend container that
+// serves MCP over Streamable HTTP on the per-session bridge network. Mirrors
+// stdioContainer, but the proxy reaches it over the network (endpoint/address)
+// rather than the Docker attach API.
+type httpContainer struct {
+	endpoint    string // full MCP URL, e.g. http://172.20.0.2:4508/mcp
+	address     string // host:port for the readiness probe, e.g. 172.20.0.2:4508
+	containerID string
+	resume      func(context.Context) error
+	cleanup     func(context.Context) error
+}
+
+const (
+	// httpBackendReadyTimeout bounds the wait for the backend's HTTP server to
+	// accept connections after the container unfreezes.
+	httpBackendReadyTimeout = 30 * time.Second
+	// httpBackendReadyInterval is the poll cadence for that wait.
+	httpBackendReadyInterval = 250 * time.Millisecond
+)
+
+// dialHTTPContainer launches an HTTP MCP backend container on the per-session
+// bridge network and returns the address to connect to. Like dialStdioContainer
+// it freezes the container immediately after start so the caller can apply
+// kernel enforcement before it serves anything; unlike stdio, there is no
+// attached stream — the proxy connects to the container's bridge IP over the
+// network once it resumes.
+//
+// The proxy reaches the container by its address on the bridge (host-routable
+// for a standard Linux bridge network); no host port is published.
+func dialHTTPContainer(ctx context.Context, deps Deps, name string, tool config.MCPToolConfig, sessionID, networkName string) (*httpContainer, error) {
+	dc := deps.Docker
+	log := deps.Logger
+
+	if tool.Port <= 0 {
+		return nil, fmt.Errorf("mcpproxy: backend %s: container http transport requires port > 0", name)
+	}
+	if err := ensureImage(ctx, dc, tool.Image); err != nil {
+		return nil, fmt.Errorf("mcpproxy: backend %s: pulling image %s: %w", name, tool.Image, err)
+	}
+	if err := ensureNetwork(ctx, dc, networkName, sessionID); err != nil {
+		return nil, fmt.Errorf("mcpproxy: backend %s: %w", name, err)
+	}
+
+	cfg := &container.Config{
+		Image: tool.Image,
+		Cmd:   tool.Command,
+		Env:   envList(tool.Env),
+		Tty:   false,
+		Labels: map[string]string{
+			LabelRole:    RoleMCPBackend,
+			LabelSession: sessionID,
+			LabelMCPName: name,
+		},
+	}
+	hostCfg := &container.HostConfig{
+		Mounts: parseColonMounts(tool.Mounts),
+		// Hardening mirrors the stdio and Compose MCP isolation paths.
+		CapDrop:     []string{"ALL"},
+		SecurityOpt: []string{"no-new-privileges:true"},
+	}
+	netCfg := &network.NetworkingConfig{
+		EndpointsConfig: map[string]*network.EndpointSettings{
+			networkName: {},
+		},
+	}
+
+	created, err := dc.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config:           cfg,
+		HostConfig:       hostCfg,
+		NetworkingConfig: netCfg,
+		Name:             fmt.Sprintf("ac-mcp-%s-%s", name, shortID(sessionID)),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("mcpproxy: backend %s: creating container: %w", name, err)
+	}
+	containerID := created.ID
+
+	cleanup := func(cctx context.Context) error {
+		timeout := 10
+		_, _ = dc.ContainerStop(cctx, containerID, client.ContainerStopOptions{Timeout: &timeout})
+		_, err := dc.ContainerRemove(cctx, containerID, client.ContainerRemoveOptions{Force: true})
+		return err
+	}
+
+	if _, err := dc.ContainerStart(ctx, containerID, client.ContainerStartOptions{}); err != nil {
+		_ = cleanup(ctx)
+		return nil, fmt.Errorf("mcpproxy: backend %s: starting container: %w", name, err)
+	}
+
+	// Freeze immediately (best-effort) so enforcement lands before the server
+	// boots — same model and caveats as dialStdioContainer.
+	paused := true
+	if _, err := dc.ContainerPause(ctx, containerID, client.ContainerPauseOptions{}); err != nil {
+		paused = false
+		log.Warn("could not freeze backend container before enforcement; a brief startup window runs unenforced",
+			zap.String("backend", name),
+			zap.String("containerId", containerID),
+			zap.Error(err),
+		)
+	}
+	resume := func(rctx context.Context) error {
+		if !paused {
+			return nil
+		}
+		_, err := dc.ContainerUnpause(rctx, containerID, client.ContainerUnpauseOptions{})
+		return err
+	}
+
+	// Resolve the container's address on the session bridge network. Inspect
+	// works while frozen (the freezer stops processes, not the metadata).
+	ip, err := containerBridgeIP(ctx, dc, containerID, networkName)
+	if err != nil {
+		_ = cleanup(ctx)
+		return nil, fmt.Errorf("mcpproxy: backend %s: %w", name, err)
+	}
+
+	path := tool.Path
+	if path == "" {
+		path = "/"
+	}
+	address := net.JoinHostPort(ip, fmt.Sprintf("%d", tool.Port))
+
+	log.Info("mcp backend container started (http)",
+		zap.String("backend", name),
+		zap.String("containerId", containerID),
+		zap.String("network", networkName),
+		zap.String("address", address),
+		zap.Bool("frozen", paused),
+	)
+
+	return &httpContainer{
+		endpoint:    fmt.Sprintf("http://%s%s", address, path),
+		address:     address,
+		containerID: containerID,
+		resume:      resume,
+		cleanup:     cleanup,
+	}, nil
+}
+
+// containerBridgeIP returns the container's IPv4/IPv6 address on the named
+// network, looked up via the Docker inspect API.
+func containerBridgeIP(ctx context.Context, dc client.APIClient, containerID, networkName string) (string, error) {
+	insp, err := dc.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{})
+	if err != nil {
+		return "", fmt.Errorf("inspecting container for network address: %w", err)
+	}
+	ns := insp.Container.NetworkSettings
+	if ns == nil {
+		return "", fmt.Errorf("container %s has no network settings", containerID)
+	}
+	ep := ns.Networks[networkName]
+	if ep == nil || !ep.IPAddress.IsValid() {
+		return "", fmt.Errorf("container %s has no address on network %s", containerID, networkName)
+	}
+	return ep.IPAddress.String(), nil
+}
+
+// waitForListening blocks until a TCP connection to addr succeeds or the
+// timeout elapses. Used to wait out the gap between a container unfreezing and
+// its HTTP MCP server binding its port.
+func waitForListening(ctx context.Context, addr string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	var d net.Dialer
+	for {
+		conn, err := d.DialContext(ctx, "tcp", addr)
+		if err == nil {
+			_ = conn.Close()
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("not listening at %s within %s: %w", addr, timeout, err)
+		case <-time.After(httpBackendReadyInterval):
+		}
+	}
 }
 
 // hijackWriter adapts a hijacked attach connection into the WriteCloser
