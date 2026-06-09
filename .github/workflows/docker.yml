@@ -20,7 +20,9 @@ jobs:
     timeout-minutes: 90
     outputs:
       digest: ${{ steps.build.outputs.digest }}
-      image: ghcr.io/kubedoll-heavy-industries/agentcontainer-enforcer
+      # Publish under whichever org/user owns this fork. GHCR requires a
+      # lowercase owner; github.repository_owner is already lowercased.
+      image: ghcr.io/${{ github.repository_owner }}/agentcontainer-enforcer
     steps:
       - uses: actions/checkout@v6
 
@@ -37,7 +39,7 @@ jobs:
       - uses: docker/metadata-action@v6
         id: meta
         with:
-          images: ghcr.io/kubedoll-heavy-industries/agentcontainer-enforcer
+          images: ghcr.io/${{ github.repository_owner }}/agentcontainer-enforcer
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,format=short
