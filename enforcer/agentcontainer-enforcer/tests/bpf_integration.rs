@@ -841,18 +841,11 @@ fn build_dns_reply(name: &str, addr: [u8; 4]) -> Vec<u8> {
 /// tracked policy hostname must surface as a DnsEvent.
 /// Phase 2 (after unregister): the same reply must produce nothing.
 ///
-/// Requires root: binds UDP port 53 on loopback.
-///
-/// `#[ignore]`d: `ac_dns_ingress` is rejected by the BPF verifier on real
-/// kernels (it has likely never loaded — CI runs `--lib` only). DNS
-/// observation is therefore degraded-off via a non-fatal attach; the
-/// userspace match + reader path this test exercises is correct and will
-/// pass once the in-kernel parser lands under the verifier. The rest of the
-/// enforcer (network/fs/exec/credential) is unaffected. Run with `--ignored`
-/// once the parser loads.
+/// Requires root: binds UDP port 53 on loopback. Like the other tests in this
+/// file it is excluded from CI (which runs `--lib` only) by needing privileged
+/// BPF; run it in the privileged container documented at the top of the file.
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn test_dns_observation_gated_by_enforced_cgroups() {
     if unsafe { libc::geteuid() } != 0 {
         eprintln!(

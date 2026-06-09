@@ -41,11 +41,20 @@ const UDP_HEADER_SIZE: usize = 8;
 // Bounded loop limits. Parsing runs against the in-memory scratch buffer
 // (cheap per iteration), but unrolled totals still count.
 const MAX_LABEL_BYTES: usize = 63;
-/// Labels per name walk (one iteration per label). Real hostnames have well
-/// under 16 labels; longer names abort parsing (no event).
-const MAX_SKIP_LABELS: usize = 16;
-/// Answer records examined per response.
-const MAX_ANSWERS: usize = 8;
+/// Labels in the question name (copy_qname). Walked once per reply, so a
+/// generous budget is cheap; covers deep subdomains without dropping the event.
+const MAX_QNAME_LABELS: usize = 16;
+/// Labels per answer-record name walk (skip_dns_name). Kept small: real answer
+/// names are 2-byte compression pointers, the walk runs once per answer record,
+/// and each label iteration forks verifier states (cost scales with MAX_ANSWERS).
+const MAX_SKIP_LABELS: usize = 8;
+/// Answer records examined per response. Even with clamp_off normalizing the
+/// parse offset each iteration, each answer's name walk + record parse is a
+/// sizable chunk of the verifier's 1M-insn budget: 4 loads with margin, 6 blows
+/// the budget. Bounded here at 4 (covers a CNAME plus a few A/AAAA records);
+/// longer answer sections are parsed up to this many records, and the userspace
+/// filtering resolver (SPEC §14) is the compensating control for the remainder.
+const MAX_ANSWERS: usize = 4;
 
 // The asm masks below hard-code the buffer sizes; keep them in lockstep.
 const _: () = assert!(DNS_SCRATCH_SIZE == 512);
@@ -60,13 +69,60 @@ const _: () = assert!(DNS_QNAME_MAX == 128);
 // is a hard bound (power-of-two mask) it cannot lose.
 // ---------------------------------------------------------------------------
 
+/// AND `i` down to `[0, mask]` (mask a power-of-two-minus-one) with a mask the
+/// optimizer cannot remove. A plain `i & mask` in Rust is elided by LLVM the
+/// moment a surrounding guard (e.g. `if pos >= LEN break`) makes it provably
+/// redundant — but the verifier loses that guard across a spill/reload of the
+/// index and then sees the *unmasked* value, rejecting the access ("invalid
+/// access to map value ... R1 max value is outside of the allowed memory
+/// range"). Emitting the AND through inline asm keeps it in the program text,
+/// so the verifier always reads a hard power-of-two `var_off` bound on the
+/// access register, spill/reload notwithstanding.
+#[inline(always)]
+fn mask_idx(i: usize, mask: usize) -> usize {
+    #[cfg(target_arch = "bpf")]
+    unsafe {
+        let mut x = i;
+        core::arch::asm!(
+            "{x} &= {m}",
+            x = inout(reg) x,
+            m = in(reg) mask,
+        );
+        x
+    }
+    #[cfg(not(target_arch = "bpf"))]
+    {
+        i & mask
+    }
+}
+
 #[inline(always)]
 fn bget(buf: &[u8; DNS_SCRATCH_SIZE], i: usize) -> u8 {
-    // Mask into range: `i & (LEN-1)` on a fixed `[u8; LEN]` (LEN a power of
-    // two) is provably < LEN, so the verifier accepts the access and LLVM
-    // keeps the mask (it is load-bearing for the array bound, not a
-    // redundant runtime check it could elide).
-    buf[i & (DNS_SCRATCH_SIZE - 1)]
+    // `get_unchecked` (not `buf[..]`) so no Rust bounds-check/panic path is
+    // emitted: the asm AND below — opaque to LLVM, transparent to the verifier
+    // — is the sole, non-elidable bound.
+    unsafe { *buf.get_unchecked(mask_idx(i, DNS_SCRATCH_SIZE - 1)) }
+}
+
+/// Normalize a running parse offset to a clean `[0, DNS_SCRATCH_SIZE]` scalar.
+///
+/// `pos` grows by variable, attacker-influenced amounts inside the answer loop
+/// (`pos += rdlength`, rdlength up to 65535). Left alone its tracked range
+/// widens without bound, so each unrolled iteration enters with a distinct
+/// abstract value and the verifier cannot prune equivalent states — the
+/// program explodes past the 1M-insn complexity budget. Laundering `pos`
+/// through black_box drops LLVM's knowledge of the range (so it keeps the cap
+/// branch) and the verifier re-derives a bounded `[0, 512]` scalar, identical
+/// at every iteration boundary. Offsets at/after the scratch end read zeros
+/// (the buffer is zero-filled) and fail the record checks, so clamping the
+/// out-of-range case to the end rather than wrapping is safe.
+#[inline(always)]
+fn clamp_off(pos: usize) -> usize {
+    let mut p = core::hint::black_box(pos);
+    if p > DNS_SCRATCH_SIZE {
+        p = DNS_SCRATCH_SIZE;
+    }
+    p
 }
 
 #[inline(always)]
@@ -83,10 +139,10 @@ fn bget_u32(buf: &[u8; DNS_SCRATCH_SIZE], i: usize) -> u32 {
 }
 
 /// Masked write into the fixed-width qname buffer (the write mirror of
-/// `bget`): `i & (LEN-1)` keeps the store provably in bounds.
+/// `bget`): the non-elidable asm AND keeps the store provably in bounds.
 #[inline(always)]
 fn qset(buf: &mut [u8; DNS_QNAME_MAX], i: usize, v: u8) {
-    buf[i & (DNS_QNAME_MAX - 1)] = v;
+    unsafe { *buf.get_unchecked_mut(mask_idx(i, DNS_QNAME_MAX - 1)) = v };
 }
 
 /// Load one byte straight from the skb. Used only for the fixed-offset
@@ -118,7 +174,7 @@ fn copy_qname(
     // Phase 1: hop labels to find the terminator.
     let mut offset = start_offset;
     let mut end: usize = 0;
-    for _i in 0..MAX_SKIP_LABELS {
+    for _i in 0..MAX_QNAME_LABELS {
         if offset >= DNS_SCRATCH_SIZE {
             return None;
         }
@@ -255,16 +311,25 @@ fn try_parse_dns(ctx: &SkBuffContext) -> Result<(), ()> {
     // zeros (which lets the accessors skip a per-read length compare) and
     // stale bytes from a previous packet never influence parsing.
     let avail = pkt_len - dns_offset;
-    let n = if avail > DNS_SCRATCH_SIZE {
-        DNS_SCRATCH_SIZE
-    } else {
-        avail
-    };
     let scratch = unsafe { DNS_SCRATCH.get_ptr_mut(0).ok_or(())? };
     let buf = unsafe { &mut (*scratch).data };
     let words = buf.as_mut_ptr() as *mut u64;
     for w in 0..(DNS_SCRATCH_SIZE / 8) {
         unsafe { words.add(w).write(0) };
+    }
+    // Clamp the copy length to [DNS_HEADER_SIZE, DNS_SCRATCH_SIZE] right before
+    // the call. `avail >= DNS_HEADER_SIZE` already holds, but bpf_skb_load_bytes
+    // rejects a possibly-zero length and the verifier loses the lower bound
+    // across `avail`'s spill/reload (it sees [0, ..]). A plain guard is no use:
+    // LLVM proves it redundant and deletes it. Laundering `avail` through
+    // black_box makes both bounds opaque to LLVM, so it keeps the refining
+    // branches — and the verifier, walking them, derives n ∈ [12, 512].
+    let mut n = core::hint::black_box(avail);
+    if n < DNS_HEADER_SIZE {
+        return Err(());
+    }
+    if n > DNS_SCRATCH_SIZE {
+        n = DNS_SCRATCH_SIZE;
     }
     let rc = unsafe {
         aya_ebpf::helpers::gen::bpf_skb_load_bytes(
@@ -302,6 +367,9 @@ fn try_parse_dns(ctx: &SkBuffContext) -> Result<(), ()> {
         if a >= ancount as usize {
             break;
         }
+        // Re-normalize the offset to a clean [0, 512] scalar at every iteration
+        // boundary so the verifier can prune equivalent states (see clamp_off).
+        pos = clamp_off(pos);
         if pos >= DNS_SCRATCH_SIZE {
             break;
         }

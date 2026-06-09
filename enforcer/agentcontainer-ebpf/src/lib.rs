@@ -11,6 +11,11 @@
 
 #![no_std]
 #![no_main]
+// Inline asm on the BPF target is still unstable (asm_experimental_arch). The
+// DNS parser needs it to emit a non-elidable mask on scratch-buffer indices —
+// a plain `i & (LEN-1)` is optimized away once a guard makes it redundant,
+// after which the verifier rejects the access. See network::dns::mask_idx.
+#![feature(asm_experimental_arch)]
 // BPF map accessor safety requirements vary across nightly versions.
 // Some map methods (HashMap::get) require unsafe while others (LpmTrie::get)
 // don't. Allow unused_unsafe so we can uniformly wrap all map operations.
