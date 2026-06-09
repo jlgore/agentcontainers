@@ -44,3 +44,6 @@ docs/node_modules/
 
 # Rust build output (enforcer workspace)
 enforcer/target/
+
+# sift-platform demo runtime state (up.sh)
+examples/sift-platform/.run/

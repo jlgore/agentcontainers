@@ -22,6 +22,9 @@
 #   --skip-enforcer-image  Don't pull/tag the enforcer image (e.g. not built yet).
 #   --skip-signing-tools   Don't install cosign + crane (sign/verify/attest demos).
 #   --skip-smoke           Don't run the post-install enforcer smoke test.
+#   --with-sift-demo       After the host is ready, bring up the SIFT platform
+#                          demo (examples/sift-platform/up.sh). Skipped while a
+#                          reboot is pending; run again after rebooting.
 #   -h, --help             Show this help.
 #
 # Environment:
@@ -47,6 +50,7 @@ SKIP_LSM=0
 SKIP_ENFORCER_IMAGE=0
 SKIP_SIGNING_TOOLS=0
 SKIP_SMOKE=0
+WITH_SIFT_DEMO=0
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REBOOT_REQUIRED=0
@@ -79,6 +83,7 @@ while [ $# -gt 0 ]; do
     --skip-enforcer-image) SKIP_ENFORCER_IMAGE=1; shift ;;
     --skip-signing-tools) SKIP_SIGNING_TOOLS=1; shift ;;
     --skip-smoke) SKIP_SMOKE=1; shift ;;
+    --with-sift-demo) WITH_SIFT_DEMO=1; shift ;;
     -h|--help) usage ;;
     *) die "unknown option: $1 (try --help)" ;;
   esac
@@ -324,6 +329,9 @@ if [ "$REBOOT_REQUIRED" -eq 1 ]; then
   printf " Run:   ${C_GREEN}sudo reboot${C_RESET}\n"
   printf " Then re-run this script to finish (it will skip what's done\n"
   printf " and run the enforcer smoke test).\n"
+  if [ "$WITH_SIFT_DEMO" -eq 1 ]; then
+    printf " Re-run with ${C_GREEN}--with-sift-demo${C_RESET} to also bring up the SIFT demo.\n"
+  fi
   printf "${C_YELLOW}========================================================${C_RESET}\n"
   exit 0
 fi
@@ -348,6 +356,23 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Phase 8 — optional SIFT platform demo
+# ---------------------------------------------------------------------------
+if [ "$WITH_SIFT_DEMO" -eq 1 ]; then
+  step "SIFT platform demo (examples/sift-platform/up.sh)"
+  demo_up="$REPO_ROOT/examples/sift-platform/up.sh"
+  if [ ! -x "$demo_up" ]; then
+    warn "demo script not found/executable at $demo_up — skipping"
+  elif [ "$TARGET_USER" != "root" ]; then
+    # Run as the interactive user (fresh login picks up the docker group), so
+    # the demo state lands in their home and matches later manual use.
+    sudo -u "$TARGET_USER" -H bash "$demo_up" || warn "demo bring-up reported errors"
+  else
+    bash "$demo_up" || warn "demo bring-up reported errors"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # Done
 # ---------------------------------------------------------------------------
 printf "\n${C_GREEN}Bootstrap complete.${C_RESET}\n"
@@ -361,6 +386,10 @@ Next steps:
        agentcontainer exec minimal-agent -- bash
        agentcontainer stop minimal-agent
   3. Or scaffold your own:  agentcontainer init  (in any project dir)
+  4. SIFT forensic platform demo (build + run under enforcement):
+       $REPO_ROOT/examples/sift-platform/up.sh     # bring up
+       $REPO_ROOT/examples/sift-platform/down.sh   # tear down
+     (or re-run this script with --with-sift-demo to do it automatically)
 
 Enforcer image in use: $ENFORCER_IMAGE
 EOF

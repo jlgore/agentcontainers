@@ -64,23 +64,33 @@ funneled to `/run/secrets` and `.pyc` writes are disabled.
 
 ## Run
 
+The whole lifecycle is scripted (idempotent). `up.sh` builds the image if
+needed, resolves the agent base image's amd64 digest (avoids the org-policy
+multi-arch 404), starts the hardened gateway, runs the agent under enforcement,
+and starts the MCP proxy:
+
 ```bash
-# 1. Start the gateway (hardened, host port 4508).
+./up.sh       # build (if needed) + gateway + agent + proxy
+./down.sh     # tear it all down
+```
+
+`up.sh` prints the endpoints and how to `agentcontainer exec sift-agent`. From a
+freshly bootstrapped host you can also do it in one shot:
+
+```bash
+sudo ./scripts/bootstrap.sh --with-sift-demo   # host setup, then up.sh
+```
+
+<details><summary>The equivalent manual steps</summary>
+
+```bash
 docker run -d --name sift-gateway \
   --read-only --cap-drop ALL --security-opt no-new-privileges:true \
   --tmpfs /run/secrets:rw,exec -p 4508:4508 sift-gateway:demo
-
-# 2. Start the agent under enforcement (Docker runtime; enforcer auto-starts).
-agentcontainer run -d
-
-# 3. Front the SIFT platform through the agentcontainers proxy (different port;
-#    the gateway already uses 4508).
-agentcontainer mcp start --port 4510
-#    -> "Backends: sift", and the 49 SIFT tools are proxied with policy/audit.
-
-agentcontainer stop sift-agent
-docker rm -f sift-gateway
+agentcontainer run -d                  # agent under enforcement
+agentcontainer mcp start --port 4510   # proxy: "Backends: sift", 49 tools
 ```
+</details>
 
 ## What this demonstrates (validated on Ubuntu 24.04 / Docker Engine)
 
