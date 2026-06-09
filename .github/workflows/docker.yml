@@ -51,7 +51,12 @@ jobs:
         with:
           context: enforcer
           file: enforcer/Dockerfile
-          platforms: linux/amd64,linux/arm64
+          # amd64-only for now. The arm64 cross-build fails because the `ring`
+          # crate's cc-based build script needs aarch64-linux-gnu-gcc, which the
+          # cargo-zigbuild builder image doesn't provide. Re-enable linux/arm64
+          # after installing gcc-aarch64-linux-gnu and exporting CC for the
+          # target in enforcer/Dockerfile. The SIFT/judge workstations are amd64.
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
