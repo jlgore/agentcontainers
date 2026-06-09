@@ -207,15 +207,13 @@ mod linux {
     };
     use agentcontainer_common::events as bpf_events;
     use agentcontainer_common::maps::{
-        CgroupStats, DomainKey, FsInodeKey, LpmDataV4, LpmDataV6, PortKeyV4, SecretAclKey,
-        SecretAclValue, FS_PERM_READ, FS_PERM_WRITE, LPM_CGROUP_PREFIX,
+        CgroupStats, FsInodeKey, LpmDataV4, LpmDataV6, PortKeyV4, SecretAclKey, SecretAclValue,
+        FS_PERM_READ, FS_PERM_WRITE, LPM_CGROUP_PREFIX,
     };
-    use agentcontainer_common::siphash::{siphash128_bytes, SipHashKey};
     use aya::maps::lpm_trie::Key as LpmKey;
-    use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, LpmTrie, PerCpuHashMap, RingBuf};
+    use aya::maps::{HashMap as AyaHashMap, LpmTrie, PerCpuHashMap, RingBuf};
     use aya::programs::{CgroupAttachMode, CgroupSkb, CgroupSkbAttachType, CgroupSockAddr, Lsm};
     use aya::{Btf, Ebpf};
-    use std::io::Read;
     use std::os::unix::fs::MetadataExt;
 
     /// Well-known paths where the BPF ELF may be found, in priority order.
@@ -268,6 +266,10 @@ mod linux {
     /// insertions via aya.
     pub struct BpfPolicyManager {
         /// The loaded eBPF programs (network hooks, LSM hooks, DNS parser).
+        /// Holds the policy maps; the event-reader thread does NOT share this
+        /// Mutex — it takes the ring buffer maps out at startup and owns them
+        /// (see `spawn_event_readers`), so policy updates never contend with
+        /// the readers.
         programs: std::sync::Mutex<Ebpf>,
 
         /// Tracks cgroup_id -> container_id for ring buffer event correlation.
@@ -291,20 +293,18 @@ mod linux {
         /// to asynchronous kernel events by event timestamp.
         correlations: CorrelationWindows,
 
-        /// SipHash-2-4 key shared with the BPF DNS parser (written to the
-        /// SIPHASH_KEY map at startup). Used to hash policy domains when
-        /// populating TRACKED_DOMAINS.
-        siphash_key: SipHashKey,
-
-        /// Reverse map of policy-domain SipHash digests to the hostnames
-        /// that produced them. The key is random per session, so a raw
-        /// digest in a DNS observation event is opaque to the auditor —
-        /// this map lets the event carry the human-readable domain.
-        domain_names: DomainNames,
+        /// Per-cgroup tracked policy domains for DNS observation: maps a
+        /// container's cgroup_id to the set of hostnames it declared,
+        /// keyed by their DNS wire-format bytes (lowercased,
+        /// length-prefixed, no terminator) → readable hostname. The DNS
+        /// event reader matches the kernel-emitted question name against
+        /// this set and drops everything else. Hashing moved out of the
+        /// kernel (verifier limits), so identification lives here.
+        tracked_domains: TrackedDomains,
     }
 
-    /// Digest → hostname reverse map shared with the DNS event reader.
-    type DomainNames = std::sync::Arc<RwLock<HashMap<[u8; 16], String>>>;
+    /// cgroup_id → (wire-format question name → readable hostname).
+    type TrackedDomains = std::sync::Arc<RwLock<HashMap<u64, HashMap<Vec<u8>, String>>>>;
 
     impl BpfPolicyManager {
         /// Load BPF programs from the compiled ELF object.
@@ -334,11 +334,6 @@ mod linux {
             // kernel; nothing enforces until each program is attached.
             Self::attach_programs(&mut bpf)?;
 
-            // Generate and publish the SipHash key shared with the BPF DNS
-            // parser. Kept on the manager so apply_network can hash policy
-            // domains identically when populating TRACKED_DOMAINS.
-            let siphash_key = Self::init_siphash_key(&mut bpf)?;
-
             info!("BPF programs loaded and attached successfully");
 
             let registry = ContainerRegistry::new();
@@ -351,8 +346,7 @@ mod linux {
                 container_cgroups: RwLock::new(HashMap::new()),
                 container_pids: RwLock::new(HashMap::new()),
                 correlations: std::sync::Arc::new(RwLock::new(HashMap::new())),
-                siphash_key,
-                domain_names: std::sync::Arc::new(RwLock::new(HashMap::new())),
+                tracked_domains: std::sync::Arc::new(RwLock::new(HashMap::new())),
             };
 
             // Spawn background ring buffer readers for all event sources.
@@ -468,26 +462,6 @@ mod linux {
             Ok(())
         }
 
-        /// Generate a random SipHash-2-4 key and write it to the SIPHASH_KEY
-        /// map so the BPF DNS parser and userspace hash domains identically.
-        fn init_siphash_key(bpf: &mut Ebpf) -> anyhow::Result<SipHashKey> {
-            let mut kb = [0u8; 16];
-            std::fs::File::open("/dev/urandom")
-                .and_then(|mut f| f.read_exact(&mut kb))
-                .map_err(|e| anyhow::anyhow!("reading /dev/urandom for SipHash key: {e}"))?;
-            let key = SipHashKey {
-                k0: u64::from_ne_bytes(kb[..8].try_into().unwrap()),
-                k1: u64::from_ne_bytes(kb[8..].try_into().unwrap()),
-            };
-
-            let map_data = bpf
-                .map_mut("SIPHASH_KEY")
-                .ok_or_else(|| anyhow::anyhow!("BPF map SIPHASH_KEY not found"))?;
-            let mut map: AyaArray<_, SipHashKey> = AyaArray::try_from(map_data)?;
-            map.set(0, key, 0)?;
-            Ok(key)
-        }
-
         /// Spawn background tasks that drain all BPF ring buffers and publish
         /// parsed events to the [`EventBus`].
         ///
@@ -496,20 +470,44 @@ mod linux {
         /// are parsed into [`EnforcementEvent`]s and fanned out via the
         /// [`EventBus`] to all gRPC stream subscribers.
         fn spawn_event_readers(&self) {
-            // Spawn a dedicated OS thread that holds the BPF programs lock and
-            // runs all ring buffer readers. We pass a raw pointer to self.programs
-            // because the Mutex<Ebpf> is not Arc-wrapped. This is safe because
-            // BpfPolicyManager lives for the process lifetime (created at startup,
-            // never dropped).
-            let programs_ptr = &self.programs as *const std::sync::Mutex<Ebpf>;
-            // SAFETY: BpfPolicyManager is created once at startup and lives until
-            // process exit. The thread we spawn accesses programs through this
-            // pointer for its entire lifetime.
-            let programs: &'static std::sync::Mutex<Ebpf> = unsafe { &*programs_ptr };
             let bus = self.event_bus.clone();
             let registry = self.registry.clone();
             let correlations = self.correlations.clone();
-            let domain_names = self.domain_names.clone();
+            let tracked = self.tracked_domains.clone();
+
+            // Take the ring buffer maps OUT of the Ebpf so the reader thread
+            // owns them outright and never touches the programs Mutex. A
+            // reader that locked the Mutex for its whole life (the old
+            // design leaked the guard) deadlocks every subsequent policy
+            // update — and a raw pointer into the Ebpf dangles once the
+            // manager is moved into its Arc. Owned RingBufs sidestep both:
+            // the kernel maps persist (the BPF programs hold their own
+            // references); only the userspace handles move here.
+            let (mut net, mut fs, mut proc_evs, mut cred, mut dns) = {
+                let mut bpf = self.programs.lock().unwrap();
+                let mut take = |name: &str| -> Option<RingBuf<aya::maps::MapData>> {
+                    match bpf.take_map(name) {
+                        Some(map) => match RingBuf::try_from(map) {
+                            Ok(rb) => Some(rb),
+                            Err(e) => {
+                                warn!(map = name, error = %e, "map is not a ring buffer");
+                                None
+                            }
+                        },
+                        None => {
+                            warn!(map = name, "ring buffer map not found");
+                            None
+                        }
+                    }
+                };
+                (
+                    take("NET_EVENTS"),
+                    take("FS_EVENTS"),
+                    take("PROC_EVENTS"),
+                    take("CRED_EVENTS"),
+                    take("DNS_EVENTS"),
+                )
+            };
 
             std::thread::Builder::new()
                 .name("event-readers".into())
@@ -520,67 +518,74 @@ mod linux {
                         .expect("event reader runtime");
 
                     let local = tokio::task::LocalSet::new();
-                    local.block_on(&rt, async {
-                        // Leak the MutexGuard — held for the process lifetime.
-                        // Ring buffer readers need 'static refs to MapData inside.
-                        let bpf = Box::leak(Box::new(programs.lock().unwrap()));
+                    local.block_on(&rt, async move {
                         let mut handles = Vec::new();
 
                         macro_rules! spawn_reader {
-                            ($map_name:expr, $event_type:ty, $parse_fn:expr) => {
-                                if let Some(map_data) = bpf.map($map_name) {
-                                    if let Ok(ring_buf) = RingBuf::try_from(map_data) {
-                                        let b = bus.clone();
-                                        let r = registry.clone();
-                                        let c = correlations.clone();
-                                        // `move` so closure-typed parsers
-                                        // (e.g. the DNS name enricher) are
-                                        // owned by the task; plain fn-item
-                                        // parsers are Copy and unaffected.
-                                        handles.push(tokio::task::spawn_local(async move {
-                                            Self::run_ring_buf_reader(
-                                                ring_buf,
-                                                b,
-                                                r,
-                                                c,
-                                                move |data, cid| {
-                                                    if data.len()
-                                                        >= std::mem::size_of::<$event_type>()
-                                                    {
-                                                        let raw: $event_type = unsafe {
-                                                            std::ptr::read_unaligned(
-                                                                data.as_ptr() as *const _
-                                                            )
-                                                        };
-                                                        Some($parse_fn(&raw, cid))
-                                                    } else {
-                                                        None
-                                                    }
-                                                },
-                                            )
-                                            .await;
-                                        }));
-                                        info!("{} ring buffer reader started", $map_name);
-                                    }
+                            ($name:expr, $ring:expr, $event_type:ty, $parse_fn:expr) => {
+                                if let Some(ring_buf) = $ring.take() {
+                                    let b = bus.clone();
+                                    let r = registry.clone();
+                                    let c = correlations.clone();
+                                    handles.push(tokio::task::spawn_local(async move {
+                                        Self::run_ring_buf_reader(
+                                            ring_buf,
+                                            b,
+                                            r,
+                                            c,
+                                            move |data, cid| {
+                                                if data.len() >= std::mem::size_of::<$event_type>()
+                                                {
+                                                    let raw: $event_type = unsafe {
+                                                        std::ptr::read_unaligned(
+                                                            data.as_ptr() as *const _
+                                                        )
+                                                    };
+                                                    $parse_fn(&raw, cid)
+                                                } else {
+                                                    None
+                                                }
+                                            },
+                                        )
+                                        .await;
+                                    }));
+                                    info!("{} ring buffer reader started", $name);
                                 }
                             };
                         }
 
-                        spawn_reader!("NET_EVENTS", bpf_events::NetworkEvent, parse_network_event);
-                        spawn_reader!("FS_EVENTS", bpf_events::FsEvent, parse_fs_event);
-                        spawn_reader!("PROC_EVENTS", bpf_events::ExecEvent, parse_exec_event);
-                        spawn_reader!("CRED_EVENTS", bpf_events::CredEvent, parse_cred_event);
-                        // DNS observations: enrich with the readable domain
-                        // name — the SipHash key is random per session, so
-                        // the raw digest is opaque to the auditor.
+                        spawn_reader!("NET_EVENTS", net, bpf_events::NetworkEvent, |r, c| Some(
+                            parse_network_event(r, c)
+                        ));
+                        spawn_reader!("FS_EVENTS", fs, bpf_events::FsEvent, |r, c| Some(
+                            parse_fs_event(r, c)
+                        ));
+                        spawn_reader!("PROC_EVENTS", proc_evs, bpf_events::ExecEvent, |r, c| Some(
+                            parse_exec_event(r, c)
+                        ));
+                        spawn_reader!("CRED_EVENTS", cred, bpf_events::CredEvent, |r, c| Some(
+                            parse_cred_event(r, c)
+                        ));
+                        // DNS observations: the kernel emits every response
+                        // for an enforced cgroup. Match the question name
+                        // against this cgroup's tracked-domain set; publish
+                        // tracked names with the readable hostname attached,
+                        // drop the rest.
                         let parse_dns = move |raw: &bpf_events::DnsEvent, cid: &str| {
+                            let len = (raw.qname_len as usize).min(raw.qname.len());
+                            let qname = &raw.qname[..len];
+                            let host = {
+                                let guard = tracked.read().unwrap();
+                                guard
+                                    .get(&raw.cgroup_id)
+                                    .and_then(|m| m.get(qname))
+                                    .cloned()
+                            }?;
                             let mut ev = parse_dns_event(raw, cid);
-                            if let Some(name) = domain_names.read().unwrap().get(&raw.domain_hash) {
-                                ev.details.insert("domain".into(), name.clone());
-                            }
-                            ev
+                            ev.details.insert("domain".into(), host);
+                            Some(ev)
                         };
-                        spawn_reader!("DNS_EVENTS", bpf_events::DnsEvent, parse_dns);
+                        spawn_reader!("DNS_EVENTS", dns, bpf_events::DnsEvent, parse_dns);
 
                         for h in handles {
                             let _ = h.await;
@@ -602,7 +607,7 @@ mod linux {
         /// The loop terminates when the ring buffer returns no items (i.e. the BPF
         /// programs have been unloaded) — this is expected during normal shutdown.
         async fn run_ring_buf_reader<F>(
-            mut ring_buf: RingBuf<&aya::maps::MapData>,
+            mut ring_buf: RingBuf<aya::maps::MapData>,
             bus: EventBus,
             registry: ContainerRegistry,
             correlations: CorrelationWindows,
@@ -849,55 +854,29 @@ mod linux {
             }
         }
 
-        /// Insert a policy host into TRACKED_DOMAINS for DNS observation.
-        /// IP literals are skipped (they never appear in DNS questions).
-        /// The hash matches the BPF DNS parser: SipHash-2-4 over the
-        /// lowercased dotted name without a trailing dot. The digest →
-        /// hostname mapping is recorded so observation events can carry
-        /// the readable name.
-        fn track_domain(
-            bpf: &mut Ebpf,
-            sip_key: &SipHashKey,
-            names: &DomainNames,
-            cgroup_id: u64,
-            host: &str,
-        ) -> anyhow::Result<()> {
+        /// Encode a policy host as the DNS wire-format question name the
+        /// kernel emits: lowercased, length-prefixed labels, no terminating
+        /// zero. Returns None for IP literals (never appear in DNS
+        /// questions), malformed labels, or names whose wire form exceeds
+        /// what the kernel carries (DNS_QNAME_MAX) — such a name could never
+        /// match a kernel event, so tracking it would be dead weight.
+        fn domain_wire(host: &str) -> Option<Vec<u8>> {
             if host.is_empty() || host.parse::<std::net::IpAddr>().is_ok() {
-                return Ok(());
+                return None;
             }
             let canon = host.trim_end_matches('.').to_ascii_lowercase();
-            // Hash a FIXED-width zero-padded DNS wire-format buffer
-            // (length-prefixed labels, no terminator), byte-identical to
-            // what the BPF parser hashes — a constant hash length is what
-            // keeps SipHash inside the BPF verifier's limits, so userspace
-            // must match the same padded width. The digest is opaque; only
-            // both sides agreeing matters.
-            const HASH_NAME_LEN: usize = 128;
-            const MAX_NAME_BYTES: usize = 120;
-            let mut wire = [0u8; HASH_NAME_LEN];
-            let mut w = 0usize;
+            let mut wire = Vec::with_capacity(canon.len() + 1);
             for label in canon.split('.') {
                 if label.is_empty() || label.len() > 63 {
-                    anyhow::bail!("invalid hostname label in policy host {canon:?}");
+                    return None;
                 }
-                if w + 1 + label.len() > MAX_NAME_BYTES {
-                    anyhow::bail!("policy host {canon:?} too long to track for DNS observation");
-                }
-                wire[w] = label.len() as u8;
-                w += 1;
-                wire[w..w + label.len()].copy_from_slice(label.as_bytes());
-                w += label.len();
+                wire.push(label.len() as u8);
+                wire.extend_from_slice(label.as_bytes());
             }
-            let hash = siphash128_bytes(sip_key, &wire);
-            let key = DomainKey { cgroup_id, hash };
-            let map_data = bpf
-                .map_mut("TRACKED_DOMAINS")
-                .ok_or_else(|| anyhow::anyhow!("BPF map TRACKED_DOMAINS not found"))?;
-            let mut map: AyaHashMap<_, DomainKey, u8> = AyaHashMap::try_from(map_data)?;
-            map.insert(key, 1, 0)?;
-            names.write().unwrap().insert(hash, canon.clone());
-            info!(host = %canon, cgroup_id, "tracking domain for DNS observation");
-            Ok(())
+            if wire.len() > agentcontainer_common::events::DNS_QNAME_MAX {
+                return None;
+            }
+            Some(wire)
         }
 
         /// Remove the per-cgroup *network* policy entries for `cgroup_id` —
@@ -911,9 +890,6 @@ mod linux {
             Self::cleanup_lpm_entries::<LpmDataV4>(bpf, "ALLOWED_V4", cgroup_id, |k| k.cgroup_id);
             Self::cleanup_lpm_entries::<LpmDataV6>(bpf, "ALLOWED_V6", cgroup_id, |k| k.cgroup_id);
             Self::cleanup_hash_entries::<PortKeyV4, u8>(bpf, "ALLOWED_PORTS", cgroup_id, |k| {
-                k.cgroup_id
-            });
-            Self::cleanup_hash_entries::<DomainKey, u8>(bpf, "TRACKED_DOMAINS", cgroup_id, |k| {
                 k.cgroup_id
             });
         }
@@ -1028,6 +1004,7 @@ mod linux {
                     }
 
                     self.correlations.write().unwrap().remove(&cgroup_id);
+                    self.tracked_domains.write().unwrap().remove(&cgroup_id);
 
                     // Remove this cgroup's entries from every per-cgroup policy
                     // map (network LPM tries, ports, inodes, execs, secret ACLs)
@@ -1145,22 +1122,25 @@ mod linux {
             let mut bpf = self.programs.lock().unwrap();
             Self::cleanup_network_entries(&mut bpf, cgroup_id);
 
-            // Track hostname-typed policy entries for DNS observation: the
-            // BPF DNS parser only emits events for (cgroup_id, domain_hash)
-            // pairs present in TRACKED_DOMAINS.
-            let hosts = policy
-                .allowed_hosts
-                .iter()
-                .chain(policy.egress_rules.iter().map(|r| &r.host));
-            for host in hosts {
-                if let Err(e) = Self::track_domain(
-                    &mut bpf,
-                    &self.siphash_key,
-                    &self.domain_names,
-                    cgroup_id,
-                    host,
-                ) {
-                    warn!(host, error = %e, "failed to add domain to TRACKED_DOMAINS");
+            // Rebuild this cgroup's tracked-domain set for DNS observation
+            // (the userspace match table the event reader consults). Rebuilt
+            // each apply_network so the 5-minute refresh REPLACES rather
+            // than accumulates, mirroring the IP-set swap above.
+            {
+                let hosts = policy
+                    .allowed_hosts
+                    .iter()
+                    .chain(policy.egress_rules.iter().map(|r| &r.host));
+                let mut set = HashMap::new();
+                for host in hosts {
+                    if let Some(wire) = Self::domain_wire(host) {
+                        set.insert(wire, host.trim_end_matches('.').to_ascii_lowercase());
+                    }
+                }
+                if set.is_empty() {
+                    self.tracked_domains.write().unwrap().remove(&cgroup_id);
+                } else {
+                    self.tracked_domains.write().unwrap().insert(cgroup_id, set);
                 }
             }
 

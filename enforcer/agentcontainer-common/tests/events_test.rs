@@ -16,33 +16,32 @@ fn test_verdict_values() {
 }
 
 #[test]
-fn test_dns_event_has_domain_hash() {
-    let hash_bytes = 0xDEADBEEF_CAFEBABE_12345678_9ABCDEF0u128.to_ne_bytes();
+fn test_dns_event_carries_qname() {
+    let mut qname = [0u8; DNS_QNAME_MAX];
+    // wire format for "example.com": 7 'example' 3 'com'
+    let wire = b"\x07example\x03com";
+    qname[..wire.len()].copy_from_slice(wire);
     let evt = DnsEvent {
-        timestamp_ns: 0,
-        pid: 0,
-        uid: 0,
-        event_type: EventType::DnsResponse as u32,
-        ttl: 300,
-        cgroup_id: 42,
-        domain_hash: hash_bytes,
-        addr_v4: [0u8; 4],
-        addr_v6: [0u8; 16],
+        timestamp_ns: 1,
+        pid: 2,
+        uid: 3,
+        event_type: 0,
+        ttl: 60,
+        cgroup_id: 99,
+        addr_v4: [93, 184, 216, 34],
+        addr_v6: [0; 16],
         record_type: 1,
-        _pad: [0u8; 3],
+        qname_len: wire.len() as u8,
+        _pad: [0; 2],
+        qname,
     };
-    assert_eq!(evt.ttl, 300);
-    assert_eq!(evt.domain_hash, hash_bytes);
-}
+    assert_eq!(&evt.qname[..evt.qname_len as usize], wire);
 
-#[test]
-fn test_dns_event_size_reduced() {
-    // DnsEvent with cgroup_id and [u8; 16] hash: 72 bytes.
-    // Much smaller than old 304-byte version with [u8; 256] domain.
+    // DnsEvent layout: u64-aligned, qname dominates the size.
     let size = core::mem::size_of::<DnsEvent>();
     assert_eq!(
-        size, 72,
-        "DnsEvent should be exactly 72 bytes, got {}",
+        size, 184,
+        "DnsEvent should be exactly 184 bytes, got {}",
         size
     );
 }

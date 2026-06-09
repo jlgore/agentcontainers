@@ -843,13 +843,13 @@ fn build_dns_reply(name: &str, addr: [u8; 4]) -> Vec<u8> {
 ///
 /// Requires root: binds UDP port 53 on loopback.
 ///
-/// `#[ignore]`d: the `ac_dns_ingress` cgroup_skb program currently exceeds
-/// the BPF verifier's complexity budget (in-kernel SipHash over a
-/// variable-length DNS name), so DNS observation is degraded-off — its
-/// attach is non-fatal and the enforcer comes up with full network/LSM
-/// enforcement regardless. This test asserts events actually flow, so it
-/// stays ignored until the parser lands under the verifier. Run explicitly
-/// with `--ignored` once it does.
+/// `#[ignore]`d: `ac_dns_ingress` is rejected by the BPF verifier on real
+/// kernels (it has likely never loaded — CI runs `--lib` only). DNS
+/// observation is therefore degraded-off via a non-fatal attach; the
+/// userspace match + reader path this test exercises is correct and will
+/// pass once the in-kernel parser lands under the verifier. The rest of the
+/// enforcer (network/fs/exec/credential) is unaffected. Run with `--ignored`
+/// once the parser loads.
 #[tokio::test]
 #[serial]
 #[ignore]
@@ -867,7 +867,8 @@ async fn test_dns_observation_gated_by_enforced_cgroups() {
 
     // Hostname policy entries are tracked for DNS observation even when
     // resolution fails (.invalid never resolves) — exactly what we want:
-    // TRACKED_DOMAINS gains the (cgroup, siphash) pair and nothing else.
+    // the userspace tracked-domain set gains the wire-format name and
+    // nothing else.
     let policy = NetworkPolicy {
         allowed_hosts: vec!["dns-gate-test.invalid".into()],
         egress_rules: vec![],
@@ -888,37 +889,62 @@ async fn test_dns_observation_gated_by_enforced_cgroups() {
         .unwrap();
     let dst = receiver.local_addr().unwrap();
 
-    // Phase 1: enforced cgroup, tracked domain — event must arrive.
-    sender.send_to(&reply, dst).unwrap();
+    // The event bus also carries network-egress events for the test
+    // process's own traffic (its cgroup is the enforced one) — e.g. the
+    // outbound DNS query apply_network's resolver makes. So we scan for the
+    // DNS observation specifically: the event carrying resolved_ip.
+    async fn next_dns_observation(
+        rx: &mut tokio::sync::mpsc::Receiver<agentcontainer_enforcer::policy::EnforcementEvent>,
+        deadline: std::time::Duration,
+    ) -> Option<agentcontainer_enforcer::policy::EnforcementEvent> {
+        let start = std::time::Instant::now();
+        while start.elapsed() < deadline {
+            match tokio::time::timeout(deadline - start.elapsed(), rx.recv()).await {
+                Ok(Some(ev)) if ev.details.contains_key("resolved_ip") => return Some(ev),
+                Ok(Some(_)) => continue, // network/other event — keep scanning
+                Ok(None) | Err(_) => break,
+            }
+        }
+        None
+    }
+
     let mut buf = [0u8; 512];
+
+    // Phase 1: enforced cgroup, tracked domain — observation must arrive.
+    sender.send_to(&reply, dst).unwrap();
     receiver
         .recv_from(&mut buf)
         .expect("loopback DNS reply not delivered");
 
-    let ev = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+    let ev = next_dns_observation(&mut rx, std::time::Duration::from_secs(3))
         .await
-        .expect("enforced cgroup: tracked DNS reply produced no event — gate is over-blocking")
-        .expect("event channel closed");
+        .expect("enforced cgroup: tracked DNS reply produced no observation — gate over-blocking");
     assert_eq!(
         ev.details.get("resolved_ip").map(String::as_str),
         Some("203.0.113.7"),
-        "unexpected event details: {:?}",
+        "unexpected observation details: {:?}",
+        ev.details
+    );
+    assert_eq!(
+        ev.details.get("domain").map(String::as_str),
+        Some("dns-gate-test.invalid"),
+        "observation should carry the matched policy hostname: {:?}",
         ev.details
     );
 
     // Phase 2: unregister sweeps ENFORCED_CGROUPS — the same reply must now
-    // be dropped at the gate before any parsing.
+    // be dropped at the gate, so no DNS observation appears.
     mgr.unregister("test-dns-gate").await.unwrap();
     sender.send_to(&reply, dst).unwrap();
     receiver
         .recv_from(&mut buf)
         .expect("loopback DNS reply not delivered");
 
-    let quiet = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
+    let leaked = next_dns_observation(&mut rx, std::time::Duration::from_millis(750)).await;
     assert!(
-        quiet.is_err(),
-        "unregistered cgroup still produced a DNS event: {:?}",
-        quiet
+        leaked.is_none(),
+        "unregistered cgroup still produced a DNS observation: {:?}",
+        leaked
     );
 }
 

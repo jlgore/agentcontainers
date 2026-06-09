@@ -306,9 +306,9 @@ pub fn parse_cred_event(raw: &bpf::CredEvent, container_id: &str) -> Enforcement
 pub fn parse_dns_event(raw: &bpf::DnsEvent, container_id: &str) -> EnforcementEvent {
     let mut details = HashMap::new();
 
-    // Domain hash as hex string.
-    let hash_hex: String = raw.domain_hash.iter().map(|b| format!("{b:02x}")).collect();
-    details.insert("domain_hash".into(), hash_hex);
+    // The readable domain is attached by the reader (which matched this
+    // event's wire-format question name against the tracked set). Record
+    // type / TTL / resolved IP are filled here.
 
     // Record type.
     let record_type = match raw.record_type {
@@ -468,6 +468,9 @@ mod tests {
 
     #[test]
     fn test_parse_dns_event() {
+        let mut qname = [0u8; bpf::DNS_QNAME_MAX];
+        let wire = b"\x07example\x03com";
+        qname[..wire.len()].copy_from_slice(wire);
         let raw = bpf::DnsEvent {
             timestamp_ns: 5_000_000,
             pid: 300,
@@ -475,14 +478,12 @@ mod tests {
             event_type: bpf::EventType::DnsResponse as u32,
             ttl: 3600,
             cgroup_id: 1004,
-            domain_hash: [
-                0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54,
-                0x32, 0x10,
-            ],
             addr_v4: [93, 184, 216, 34], // 93.184.216.34
             addr_v6: [0; 16],
             record_type: 1, // A
-            _pad: [0; 3],
+            qname_len: wire.len() as u8,
+            _pad: [0; 2],
+            qname,
         };
 
         let ev = parse_dns_event(&raw, "ctr-dns");
@@ -493,10 +494,7 @@ mod tests {
         assert_eq!(ev.pid, 300);
         assert_eq!(ev.timestamp_ns, 5_000_000);
 
-        assert_eq!(
-            ev.details.get("domain_hash").unwrap(),
-            "abcdef0123456789fedcba9876543210"
-        );
+        // The readable domain is attached by the reader, not parse_dns_event.
         assert_eq!(ev.details.get("record_type").unwrap(), "A");
         assert_eq!(ev.details.get("ttl").unwrap(), "3600");
         assert_eq!(ev.details.get("resolved_ip").unwrap(), "93.184.216.34");

@@ -11,8 +11,6 @@
 
 #![no_std]
 #![no_main]
-// BPF inline asm (dns.rs index-mask bounds proof for the verifier).
-#![feature(asm_experimental_arch)]
 // BPF map accessor safety requirements vary across nightly versions.
 // Some map methods (HashMap::get) require unsafe while others (LpmTrie::get)
 // don't. Allow unused_unsafe so we can uniformly wrap all map operations.

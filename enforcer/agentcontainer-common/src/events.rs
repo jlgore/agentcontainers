@@ -45,12 +45,12 @@ pub struct NetworkEvent {
 
 /// Event emitted by the DNS ingress parser.
 ///
-/// Contains a keyed SipHash-2-4 128-bit digest of the normalized domain name.
-/// Userspace pre-computes hashes of tracked domains using the same key (from
-/// the SIPHASH_KEY BPF map) and matches on `domain_hash`.
-///
-/// This replaces the previous 256-byte domain copy approach. With 128-bit
-/// keyed hashes, birthday collision probability is ~2^-64 — negligible.
+/// Carries the question name in raw DNS wire format (length-prefixed labels,
+/// lowercased, no terminating zero). Userspace matches these bytes against
+/// its per-cgroup tracked-domain set. Hashing was moved out of the kernel:
+/// an in-kernel SipHash over a variable-length name exceeded the BPF
+/// verifier's complexity budget, so the kernel now does only a bounded copy
+/// and userspace owns identification.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DnsEvent {
@@ -60,16 +60,18 @@ pub struct DnsEvent {
     pub event_type: u32,
     pub ttl: u32,
     pub cgroup_id: u64,
-    /// SipHash-2-4 128-bit digest of the lowercased, dot-separated domain name.
-    /// Stored as [u8; 16] (native-endian) to avoid u128 alignment padding in repr(C).
-    pub domain_hash: [u8; 16],
     /// Resolved IPv4 address (if A record). Zero if not applicable.
     pub addr_v4: [u8; 4],
     /// Resolved IPv6 address (if AAAA record). Zero if not applicable.
     pub addr_v6: [u8; 16],
     /// DNS record type (1 = A, 28 = AAAA).
     pub record_type: u8,
-    pub _pad: [u8; 3],
+    /// Valid byte count in `qname` (<= DNS_QNAME_MAX).
+    pub qname_len: u8,
+    pub _pad: [u8; 2],
+    /// Lowercased DNS wire-format question name (length-prefixed labels, no
+    /// terminating zero). Matched byte-for-byte by userspace.
+    pub qname: [u8; DNS_QNAME_MAX],
 }
 
 /// Event emitted by filesystem enforcement.
@@ -142,6 +144,9 @@ pub const EVENT_CRED_OPEN: u32 = 5; // Must match EventType::CredentialAccess
 
 // --- DNS constants ---
 
+/// Maximum DNS wire-format question name carried in a DnsEvent. Covers
+/// every realistic policy hostname; longer names are not observed.
+pub const DNS_QNAME_MAX: usize = 128;
 pub const DNS_PORT: u16 = 53;
 pub const DNS_HEADER_SIZE: usize = 12;
 pub const DNS_MAX_LABELS: usize = 8;
