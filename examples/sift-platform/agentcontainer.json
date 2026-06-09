@@ -1,0 +1,56 @@
+{
+  // Run an agent with the mainline SIFT forensic platform (AppliedIR/sift-mcp)
+  // available as a single MCP tool, under agentcontainers enforcement.
+  //
+  // The "sift" tool is a container-type MCP server: agentcontainers starts the
+  // sift-gateway image as a hardened sidecar (read-only rootfs, caps dropped)
+  // on a private bridge network and proxies its HTTP MCP endpoint to the agent.
+  // The gateway itself aggregates forensic-mcp, sift-mcp, case-mcp, report-mcp.
+  //
+  // Build the image first:  ./build.sh   (produces sift-gateway:demo)
+  "name": "sift-agent",
+  // Pinned to the linux/amd64 image-manifest digest, not the multi-arch tag:
+  // org-policy extraction fetches the manifest with image-manifest Accept
+  // headers only, so a multi-arch index tag 404s. A concrete manifest digest
+  // resolves cleanly (no policy layer -> DefaultPolicy) and is the digest
+  // pinning the tool recommends for TOCTOU safety anyway.
+  // Digest via: crane digest --platform linux/amd64 mcr.microsoft.com/devcontainers/base:ubuntu
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu@sha256:3397b3751886e669eb873b4dfbebecc9c9e4bc413451d1f2540c62d5b615d6da",
+
+  "agent": {
+    "capabilities": {
+      "filesystem": {
+        "read": ["/workspace/**"],
+        "write": ["/workspace/**"]
+      },
+      "network": {
+        "egress": [
+          { "host": "api.github.com", "port": 443 }
+        ]
+      }
+    },
+
+    "tools": {
+      "mcp": {
+        // The sift-gateway is an HTTP MCP server. agentcontainers attaches it
+        // as a "remote" backend: the MCP proxy can host container backends only
+        // over stdio (container+http is not yet implemented), and the in-`run`
+        // container-tool path needs the sandbox runtime (Docker Desktop). On a
+        // plain Docker Engine host this remote wiring is the supported path.
+        // Start the gateway first:  docker run -d --name sift-gateway \
+        //   --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+        //   --tmpfs /run/secrets:rw,exec -p 4508:4508 sift-gateway:demo
+        "sift": {
+          "type": "remote",
+          "url": "http://localhost:4508/mcp"
+        }
+      }
+    },
+
+    "policy": {
+      "escalation": "prompt",
+      "auditLog": true,
+      "onCapabilityViolation": "deny"
+    }
+  }
+}

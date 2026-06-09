@@ -1,0 +1,63 @@
+# Valhuntir gateway config for the containerized demo.
+#
+# Differences from config/gateway.yaml.example in the upstream repo:
+#   - host 0.0.0.0 so the agentcontainers bridge network can reach it
+#   - no api_keys section  -> auth disabled (single-user mode), so the
+#     agentcontainers MCP proxy connects without a bearer token
+#   - only the self-contained local backends are enabled; the ML-heavy
+#     (forensic-rag), Windows, OpenCTI, and remote HTTP backends are omitted
+#   - backends launch via the absolute venv python (the hardened sidecar gives
+#     subprocesses no PATH) and carry the env they need to write under the one
+#     writable tmpfs (/run/secrets). VHIR_* are auto-merged from the parent.
+
+gateway:
+  host: "0.0.0.0"
+  port: 4508
+  log_level: "INFO"
+
+# api_keys intentionally omitted -> single-user mode (no auth).
+
+backends:
+  forensic-mcp:
+    type: stdio
+    command: "/app/venv/bin/python"
+    args: ["-m", "forensic_mcp", "--deferred-tools"]
+    env:
+      PATH: "${PATH}"
+      HOME: "${HOME}"
+      TMPDIR: "${TMPDIR}"
+      PYTHONDONTWRITEBYTECODE: "1"
+    enabled: true
+
+  sift-mcp:
+    type: stdio
+    command: "/app/venv/bin/python"
+    args: ["-m", "sift_mcp"]
+    env:
+      PATH: "${PATH}"
+      HOME: "${HOME}"
+      TMPDIR: "${TMPDIR}"
+      PYTHONDONTWRITEBYTECODE: "1"
+    enabled: true
+
+  case-mcp:
+    type: stdio
+    command: "/app/venv/bin/python"
+    args: ["-m", "case_mcp"]
+    env:
+      PATH: "${PATH}"
+      HOME: "${HOME}"
+      TMPDIR: "${TMPDIR}"
+      PYTHONDONTWRITEBYTECODE: "1"
+    enabled: true
+
+  report-mcp:
+    type: stdio
+    command: "/app/venv/bin/python"
+    args: ["-m", "report_mcp"]
+    env:
+      PATH: "${PATH}"
+      HOME: "${HOME}"
+      TMPDIR: "${TMPDIR}"
+      PYTHONDONTWRITEBYTECODE: "1"
+    enabled: true
