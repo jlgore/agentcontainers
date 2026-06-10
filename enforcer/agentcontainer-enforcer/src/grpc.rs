@@ -1062,6 +1062,27 @@ impl Enforcer for EnforcerService {
         std::fs::create_dir_all(&proc_root)
             .map_err(|e| Status::internal(format!("mkdir {}: {}", proc_root, e)))?;
 
+        // Own the secrets by the account the container actually runs as. The
+        // enforcer writes them as root (it is root), so a non-root agent
+        // (USER != root in the image) cannot read its own secrets unless we
+        // chown them. The uid/gid is read from the init process's
+        // /proc/<pid>/status (real uid/gid, first field after the label).
+        let (agent_uid, agent_gid) = {
+            let status = std::fs::read_to_string(format!("/proc/{}/status", init_pid))
+                .map_err(|e| Status::internal(format!("read /proc/{}/status: {}", init_pid, e)))?;
+            let field = |label: &str| -> u32 {
+                status
+                    .lines()
+                    .find_map(|l| l.strip_prefix(label))
+                    .and_then(|r| r.split_whitespace().next())
+                    .and_then(|t| t.parse().ok())
+                    .unwrap_or(0)
+            };
+            (field("Uid:"), field("Gid:"))
+        };
+        std::os::unix::fs::chown(&proc_root, Some(agent_uid), Some(agent_gid))
+            .map_err(|e| Status::internal(format!("chown {}: {}", proc_root, e)))?;
+
         let mut count = 0u32;
         for secret in &req.secrets {
             let path = format!("{}/{}", proc_root, secret.name);
@@ -1078,6 +1099,9 @@ impl Enforcer for EnforcerService {
 
             std::fs::rename(&tmp_path, &path)
                 .map_err(|e| Status::internal(format!("rename {} -> {}: {}", tmp_path, path, e)))?;
+
+            std::os::unix::fs::chown(&path, Some(agent_uid), Some(agent_gid))
+                .map_err(|e| Status::internal(format!("chown {}: {}", path, e)))?;
 
             count += 1;
         }
