@@ -44,7 +44,9 @@ docker push ghcr.io/<you>/claude-agent:demo     # make the package public
 registry, so the image must be pushed (a local-only image is rejected). Point the
 `image` field in each example's `agentcontainer.json` at your reference.
 
-## Start the host guard (both examples)
+## Start the host services (both examples)
+
+**1. Guard** — the out-of-band decision authority:
 
 ```sh
 sudo mkdir -p /run/ac && sudo chown "$(id -u):$(id -g)" /run/ac
@@ -55,6 +57,19 @@ agentcontainer guard serve \
 
 Leave it running; denials prompt here (or approve from another terminal with
 `agentcontainer approve`).
+
+**2. Enforcer** — pre-start it with the image that carries the secret-injection
+fixes (`CAP_SYS_PTRACE` + chown-to-agent-uid). `agentcontainer run` discovers
+and adopts a running enforcer, so it won't fall back to the default image:
+
+```sh
+agentcontainer enforcer start --image ghcr.io/<you>/agentcontainer-enforcer:latest
+```
+
+> Without this, `run -d` auto-starts the enforcer from the built-in
+> `DefaultEnforcerImage`, which may predate those fixes and fail the API-key
+> example at secret injection. (Alternatively, set `agent.enforcer.image` in the
+> example's `agentcontainer.json` to the same reference.)
 
 ---
 
