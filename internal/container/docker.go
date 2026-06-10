@@ -159,6 +159,19 @@ func (d *DockerRuntime) Start(ctx context.Context, cfg *config.AgentContainer, o
 
 	containerCfg, hostCfg, networkCfg := d.buildContainerConfig(cfg, opts)
 
+	// When the policy enables egress ("bridge"), the container attaches to a
+	// per-agent user-defined bridge for embedded DNS (see buildContainerConfig).
+	// Create it before ContainerCreate so the attachment resolves.
+	netPolicy := opts.Policy
+	if netPolicy == nil {
+		netPolicy = defaultContainerPolicy()
+	}
+	if netPolicy.NetworkMode == "bridge" {
+		if err := d.ensureAgentNetwork(ctx, agentNetworkName(cfg.Name)); err != nil {
+			return nil, fmt.Errorf("docker runtime: ensuring agent network: %w", err)
+		}
+	}
+
 	d.logger.Info("creating container",
 		zap.String("image", imageRef),
 		zap.String("name", cfg.Name),
@@ -447,12 +460,23 @@ func (d *DockerRuntime) buildContainerConfig(
 		ReadonlyRootfs: p.ReadonlyRootfs,
 	}
 
-	// Apply network mode from policy.
-	if p.NetworkMode != "" {
+	networkCfg := &network.NetworkingConfig{}
+
+	// Network attachment. "bridge" (set by policy resolution when egress rules
+	// are present) must NOT use Docker's default bridge: that bridge has no
+	// embedded DNS resolver, so the container's resolv.conf points at an
+	// external nameserver on :53, and the egress default-deny blocks that —
+	// breaking all name resolution. Attach to a per-agent user-defined bridge
+	// instead, which runs Docker's embedded resolver at 127.0.0.11 (loopback,
+	// which the enforcer always allows). This mirrors how the MCP proxy
+	// attaches its backends. "none" and any explicit mode pass through.
+	if p.NetworkMode == "bridge" {
+		networkCfg.EndpointsConfig = map[string]*network.EndpointSettings{
+			agentNetworkName(cfg.Name): {},
+		}
+	} else if p.NetworkMode != "" {
 		hostCfg.NetworkMode = container.NetworkMode(p.NetworkMode)
 	}
-
-	networkCfg := &network.NetworkingConfig{}
 
 	// Map config mounts from devcontainer.json.
 	hostCfg.Mounts = parseMounts(cfg.Mounts)
@@ -508,6 +532,33 @@ func (d *DockerRuntime) buildContainerConfig(
 	}
 
 	return containerCfg, hostCfg, networkCfg
+}
+
+// agentNetworkName is the deterministic name of the per-agent user-defined
+// bridge network. Keyed by the agent name so repeated runs of the same config
+// reuse one network rather than accumulating per-run networks.
+func agentNetworkName(name string) string {
+	return "ac-net-" + name
+}
+
+// ensureAgentNetwork creates the per-agent user-defined bridge network if it
+// does not already exist. A user-defined bridge — unlike Docker's default
+// bridge — runs the embedded DNS resolver at 127.0.0.11, loopback traffic the
+// enforcer always allows, so name resolution works under default-deny egress.
+// Idempotent: an existing network is reused.
+func (d *DockerRuntime) ensureAgentNetwork(ctx context.Context, name string) error {
+	if _, err := d.client.NetworkInspect(ctx, name, client.NetworkInspectOptions{}); err == nil {
+		return nil
+	}
+	if _, err := d.client.NetworkCreate(ctx, name, client.NetworkCreateOptions{
+		Driver: "bridge",
+		Labels: map[string]string{
+			labelPrefix + "/managed": "true",
+		},
+	}); err != nil {
+		return fmt.Errorf("creating network %s: %w", name, err)
+	}
+	return nil
 }
 
 // defaultContainerPolicy returns a default-deny security policy when no
