@@ -158,6 +158,14 @@ func StartSidecar(ctx context.Context, dockerClient client.APIClient, opts Start
 			"NET_ADMIN",
 			"SYS_ADMIN",
 			"SYS_RESOURCE",
+			// SYS_PTRACE is required to inject secrets: the enforcer writes them
+			// through the agent's /proc/<init_pid>/root magic symlink (see
+			// grpc.rs InjectSecrets). Dereferencing another process's
+			// /proc/<pid>/root triggers ptrace_may_access(), which the yama LSM
+			// at ptrace_scope>=1 (the distro default) denies for non-descendant
+			// processes unless the caller holds CAP_SYS_PTRACE. Without it,
+			// injection fails with EACCES the moment it steps into the agent root.
+			"SYS_PTRACE",
 		},
 		PidMode: container.PidMode("host"),
 		Mounts: []mount.Mount{

@@ -1,0 +1,6 @@
+# Scoped to this Dockerfile (BuildKit reads <dockerfile>.dockerignore). The
+# stage-1 Go build needs only the module sources — not the multi-GB Rust
+# enforcer build tree, the git history, or background task logs.
+.git
+enforcer
+**/*.output

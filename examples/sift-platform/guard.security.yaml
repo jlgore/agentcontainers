@@ -1,0 +1,37 @@
+# Agent tool policy for Claude Code running under `agentcontainer guard`.
+#
+# This layers onto the sift-mcp built-in defaults (rm-protection, blocked
+# system directories, shell-metacharacter scanning, awk program inspection) —
+# it does not replace them. It adds the two classes the defaults leave open for
+# a general agent: network-capable binaries (exfiltration) and interpreter
+# escapes (a shell spawning an inline program to launder a blocked command).
+#
+# Network egress is still enforced in the kernel by the eBPF layer; denying the
+# binaries here is defense in depth and gives a human-readable reason at the
+# tool boundary instead of an opaque connection refusal.
+#
+# Use it with:  agentcontainer guard serve --security-yaml guard.security.yaml
+
+denied_binaries:
+  - curl
+  - wget
+  - nc
+  - ncat
+  - netcat
+  - telnet
+  - socat
+  - ftp
+  - tftp
+
+# Per-binary blocked flags: an interpreter invoked with an inline-program flag
+# is an escape hatch around every other rule, so block it.
+tool_blocked_flags:
+  bash: ["-c"]
+  sh: ["-c"]
+  zsh: ["-c"]
+  dash: ["-c"]
+  python: ["-c"]
+  python3: ["-c"]
+  perl: ["-e"]
+  ruby: ["-e"]
+  node: ["-e", "--eval"]

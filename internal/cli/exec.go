@@ -4,9 +4,13 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"sync"
+	"syscall"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/approval"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/config"
@@ -18,20 +22,30 @@ import (
 
 func newExecCmd() *cobra.Command {
 	var (
-		runtime    string
-		configPath string
-		envVars    []string
+		runtime     string
+		configPath  string
+		envVars     []string
+		interactive bool
+		tty         bool
 	)
 
 	cmd := &cobra.Command{
-		Use:   "exec <container-id> -- <command...>",
+		Use:   "exec [-it] <container-id> -- <command...>",
 		Short: "Execute a command inside a running agent container",
 		Long: `Run a command inside the primary container identified by <container-id>.
 Everything after "--" is treated as the command and its arguments.
 
-The command is checked against the agent capability policy before execution.
-Use --config to specify the agentcontainer.json; if omitted, the config is
-loaded from the working directory.
+Without -i/-t the command runs to completion and its buffered output is checked
+against the agent capability policy before execution.
+
+With -i/-t the command runs interactively with streamed stdio and (with -t) a
+pseudo-TTY — use this to drive Claude Code as a human would:
+
+  agentcontainer exec -it claude-agent -- claude
+
+The interactive process joins the container cgroup, so the eBPF egress
+allowlist and the PreToolUse guard hook gate it exactly as they gate the main
+process; enforcement does not depend on this command.
 
 Environment variables can be injected with -e KEY=VALUE. Secret URI schemes
 (e.g. op://vault/item/field) are resolved on demand before execution.`,
@@ -41,9 +55,12 @@ Environment variables can be injected with -e KEY=VALUE. Secret URI schemes
 			cmdArgs := args[1:]
 
 			if len(cmdArgs) == 0 {
-				return fmt.Errorf("exec: no command specified (usage: ac exec <container-id> -- <command> [args...])")
+				return fmt.Errorf("exec: no command specified (usage: ac exec [-it] <container-id> -- <command> [args...])")
 			}
 
+			if interactive || tty {
+				return runExecInteractive(cmd, containerID, cmdArgs, runtime, envVars, tty)
+			}
 			return runExec(cmd, containerID, cmdArgs, runtime, configPath, envVars)
 		},
 	}
@@ -51,6 +68,8 @@ Environment variables can be injected with -e KEY=VALUE. Secret URI schemes
 	cmd.Flags().StringVar(&runtime, "runtime", "docker", "Container runtime backend (auto|docker|compose|sandbox)")
 	cmd.Flags().StringVarP(&configPath, "config", "c", "", "Path to agentcontainer.json")
 	cmd.Flags().StringArrayVarP(&envVars, "env", "e", nil, "Set environment variables (KEY=VALUE or KEY=op://...)")
+	cmd.Flags().BoolVarP(&interactive, "interactive", "i", false, "Keep stdin attached to the command")
+	cmd.Flags().BoolVarP(&tty, "tty", "t", false, "Allocate a pseudo-TTY (implies --interactive)")
 
 	return cmd
 }
@@ -94,28 +113,9 @@ func runExec(cmd *cobra.Command, containerID string, execCmd []string, runtimeFl
 	brokerRT := approval.NewBroker(rt, approvalMgr)
 
 	// Resolve any secret URI schemes in the --env flag values before executing.
-	// Values like KEY=op://vault/item/field are resolved on demand using a
-	// temporary single-provider Manager that is torn down after resolution.
-	var resolvedEnv []string
-	for _, envStr := range envVars {
-		parts := strings.SplitN(envStr, "=", 2)
-		if len(parts) != 2 {
-			// No "=" — pass through unchanged; the container will handle it.
-			resolvedEnv = append(resolvedEnv, envStr)
-			continue
-		}
-		ref, ok := secrets.ParseSecretURI(parts[1])
-		if !ok {
-			// Plain value — pass through as-is.
-			resolvedEnv = append(resolvedEnv, envStr)
-			continue
-		}
-		ref.Name = parts[0]
-		secret, err := resolveSecretOnDemand(cmd.Context(), ref)
-		if err != nil {
-			return fmt.Errorf("exec: resolving secret for env %q: %w", parts[0], err)
-		}
-		resolvedEnv = append(resolvedEnv, parts[0]+"="+string(secret.Value))
+	resolvedEnv, err := resolveEnvVars(cmd.Context(), envVars)
+	if err != nil {
+		return err
 	}
 
 	// The Runtime.Exec interface only accepts a command slice. When env vars
@@ -149,6 +149,123 @@ func runExec(cmd *cobra.Command, containerID string, execCmd []string, runtimeFl
 		return fmt.Errorf("exec: command exited with code %d", result.ExitCode)
 	}
 
+	return nil
+}
+
+// resolveEnvVars resolves secret URI schemes in --env flag values. Values like
+// KEY=op://vault/item/field are resolved on demand via a temporary
+// single-provider Manager; plain values pass through unchanged.
+func resolveEnvVars(ctx context.Context, envVars []string) ([]string, error) {
+	var resolved []string
+	for _, envStr := range envVars {
+		parts := strings.SplitN(envStr, "=", 2)
+		if len(parts) != 2 {
+			resolved = append(resolved, envStr)
+			continue
+		}
+		ref, ok := secrets.ParseSecretURI(parts[1])
+		if !ok {
+			resolved = append(resolved, envStr)
+			continue
+		}
+		ref.Name = parts[0]
+		secret, err := resolveSecretOnDemand(ctx, ref)
+		if err != nil {
+			return nil, fmt.Errorf("exec: resolving secret for env %q: %w", parts[0], err)
+		}
+		resolved = append(resolved, parts[0]+"="+string(secret.Value))
+	}
+	return resolved, nil
+}
+
+// runExecInteractive runs a command inside the container with streamed stdio and
+// (when tty is set and stdin is a terminal) a raw pseudo-TTY, for human-driven
+// sessions such as an interactive `claude`. Unlike runExec it does not route the
+// command through the approval broker: the human is at the keyboard and the real
+// gate is the in-container PreToolUse hook plus the kernel egress enforcement,
+// both of which apply to this exec because it joins the container cgroup.
+func runExecInteractive(cmd *cobra.Command, containerID string, execCmd []string, runtimeFlag string, envVars []string, tty bool) error {
+	rt, err := newRuntime(runtimeFlag, logger, enforcement.LevelNone)
+	if err != nil {
+		return fmt.Errorf("exec: %w", err)
+	}
+	ie, ok := rt.(container.InteractiveExecer)
+	if !ok {
+		return fmt.Errorf("exec: interactive mode is not supported by the %q runtime", runtimeFlag)
+	}
+
+	resolvedEnv, err := resolveEnvVars(cmd.Context(), envVars)
+	if err != nil {
+		return err
+	}
+
+	opts := container.InteractiveExecOptions{
+		TTY:    tty,
+		Env:    resolvedEnv,
+		Stdin:  cmd.InOrStdin(),
+		Stdout: cmd.OutOrStdout(),
+		Stderr: cmd.ErrOrStderr(),
+	}
+
+	// When a TTY is requested and stdin is a real terminal, put it in raw mode
+	// and forward window-resize events so the in-container REPL behaves.
+	var restore func()
+	if tty {
+		if f, isFile := cmd.InOrStdin().(*os.File); isFile && term.IsTerminal(int(f.Fd())) {
+			fd := int(f.Fd())
+			oldState, rawErr := term.MakeRaw(fd)
+			if rawErr != nil {
+				return fmt.Errorf("exec: setting raw terminal: %w", rawErr)
+			}
+			var once sync.Once
+			restore = func() { once.Do(func() { _ = term.Restore(fd, oldState) }) }
+
+			if w, h, sizeErr := term.GetSize(fd); sizeErr == nil {
+				opts.InitialSize = container.TerminalSize{Rows: uint(h), Cols: uint(w)}
+			}
+
+			resize := make(chan container.TerminalSize, 1)
+			opts.Resize = resize
+			winch := make(chan os.Signal, 1)
+			signal.Notify(winch, syscall.SIGWINCH)
+			go func() {
+				for range winch {
+					if w, h, sizeErr := term.GetSize(fd); sizeErr == nil {
+						select {
+						case resize <- container.TerminalSize{Rows: uint(h), Cols: uint(w)}:
+						default:
+						}
+					}
+				}
+			}()
+			defer func() {
+				signal.Stop(winch)
+				close(winch)
+			}()
+		}
+	}
+	if restore != nil {
+		defer restore()
+	}
+
+	session := &container.Session{
+		ContainerID: containerID,
+		RuntimeType: container.RuntimeType(runtimeFlag),
+	}
+
+	code, execErr := ie.ExecInteractive(cmd.Context(), session, execCmd, opts)
+
+	// Restore the terminal before printing any error so the message renders
+	// with normal line discipline.
+	if restore != nil {
+		restore()
+	}
+	if execErr != nil {
+		return fmt.Errorf("exec: %w", execErr)
+	}
+	if code != 0 {
+		return fmt.Errorf("exec: command exited with code %d", code)
+	}
 	return nil
 }
 

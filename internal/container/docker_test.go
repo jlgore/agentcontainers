@@ -487,6 +487,9 @@ func TestBuildContainerConfig_PolicyNetworkMode(t *testing.T) {
 		name         string
 		networkMode  string
 		expectedMode container.NetworkMode
+		// expectUserNet is true when the container should attach to the per-agent
+		// user-defined bridge (for embedded DNS) instead of carrying a NetworkMode.
+		expectUserNet bool
 	}{
 		{
 			name:         "none mode for isolation",
@@ -494,9 +497,13 @@ func TestBuildContainerConfig_PolicyNetworkMode(t *testing.T) {
 			expectedMode: container.NetworkMode("none"),
 		},
 		{
-			name:         "bridge mode for network access",
-			networkMode:  "bridge",
-			expectedMode: container.NetworkMode("bridge"),
+			// "bridge" must NOT pass through as NetworkMode: the container
+			// attaches to a user-defined bridge so embedded DNS works under
+			// default-deny egress.
+			name:          "bridge mode attaches user-defined network",
+			networkMode:   "bridge",
+			expectedMode:  container.NetworkMode(""),
+			expectUserNet: true,
 		},
 		{
 			name:         "host mode",
@@ -516,8 +523,14 @@ func TestBuildContainerConfig_PolicyNetworkMode(t *testing.T) {
 				},
 			}
 
-			_, hostCfg, _ := rt.buildContainerConfig(cfg, opts)
+			_, hostCfg, networkCfg := rt.buildContainerConfig(cfg, opts)
 			assert.Equal(t, tt.expectedMode, hostCfg.NetworkMode, "should apply network mode from policy")
+			if tt.expectUserNet {
+				_, ok := networkCfg.EndpointsConfig[agentNetworkName(cfg.Name)]
+				assert.True(t, ok, "bridge mode should attach the per-agent user-defined network")
+			} else {
+				assert.Empty(t, networkCfg.EndpointsConfig, "non-bridge modes attach no user-defined network")
+			}
 		})
 	}
 }

@@ -730,18 +730,12 @@ func (p *Proxy) evaluatePolicy(ctx context.Context, sp *serverPolicy, server, to
 	}
 
 	pctx := policyContext(corrID)
+	argsVal := rawArgsValue(args)
 	agg := Decision{Allowed: true, PoliciesEvaluated: sp.eval.PoliciesEvaluated()}
 	seen := make(map[string]bool)
 
 	for _, parsed := range parsedList {
-		input := map[string]any{
-			"server":  server,
-			"tool":    toolName,
-			"args":    rawArgsValue(args),
-			"parsed":  parsed.toInput(),
-			"context": pctx,
-		}
-		d, err := sp.eval.Evaluate(ctx, input)
+		d, err := sp.eval.EvaluateParsed(ctx, server, toolName, argsVal, parsed, pctx)
 		if err != nil {
 			// Fail CLOSED: a broken policy engine never falls open.
 			p.deps.Logger.Error("policy evaluation failed",

@@ -35,6 +35,9 @@ const (
 // Compile-time check that DockerRuntime satisfies the Runtime interface.
 var _ Runtime = (*DockerRuntime)(nil)
 
+// Compile-time check that DockerRuntime supports interactive (TTY) exec.
+var _ InteractiveExecer = (*DockerRuntime)(nil)
+
 // DockerRuntime implements the Runtime interface using the Docker Engine API.
 type DockerRuntime struct {
 	client      client.APIClient
@@ -158,6 +161,19 @@ func (d *DockerRuntime) Start(ctx context.Context, cfg *config.AgentContainer, o
 	}
 
 	containerCfg, hostCfg, networkCfg := d.buildContainerConfig(cfg, opts)
+
+	// When the policy enables egress ("bridge"), the container attaches to a
+	// per-agent user-defined bridge for embedded DNS (see buildContainerConfig).
+	// Create it before ContainerCreate so the attachment resolves.
+	netPolicy := opts.Policy
+	if netPolicy == nil {
+		netPolicy = defaultContainerPolicy()
+	}
+	if netPolicy.NetworkMode == "bridge" {
+		if err := d.ensureAgentNetwork(ctx, agentNetworkName(cfg.Name)); err != nil {
+			return nil, fmt.Errorf("docker runtime: ensuring agent network: %w", err)
+		}
+	}
 
 	d.logger.Info("creating container",
 		zap.String("image", imageRef),
@@ -321,6 +337,100 @@ func (d *DockerRuntime) Exec(ctx context.Context, session *Session, cmd []string
 	}, nil
 }
 
+// ExecInteractive runs cmd inside the session container with streamed stdio and
+// an optional TTY, for human-driven sessions. It returns the command's exit
+// code. The caller owns the terminal; this method owns the docker exec and
+// applies resize events delivered on opts.Resize.
+//
+// Enforcement is unaffected: the exec process is created in the container's
+// cgroup, so the eBPF egress hooks apply, and an interactive `claude` reads the
+// same managed-settings PreToolUse hook as the main process.
+func (d *DockerRuntime) ExecInteractive(ctx context.Context, session *Session, cmd []string, opts InteractiveExecOptions) (int, error) {
+	if session == nil {
+		return 0, fmt.Errorf("docker runtime: nil session")
+	}
+	if len(cmd) == 0 {
+		return 0, fmt.Errorf("docker runtime: empty command")
+	}
+
+	execResp, err := d.client.ExecCreate(ctx, session.ContainerID, client.ExecCreateOptions{
+		Cmd:          cmd,
+		User:         opts.User,
+		WorkingDir:   opts.WorkingDir,
+		Env:          opts.Env,
+		TTY:          opts.TTY,
+		AttachStdin:  opts.Stdin != nil,
+		AttachStdout: opts.Stdout != nil,
+		AttachStderr: opts.Stderr != nil,
+		ConsoleSize:  client.ConsoleSize{Height: opts.InitialSize.Rows, Width: opts.InitialSize.Cols},
+	})
+	if err != nil {
+		return 0, fmt.Errorf("docker runtime: creating exec: %w", err)
+	}
+
+	attach, err := d.client.ExecAttach(ctx, execResp.ID, client.ExecAttachOptions{TTY: opts.TTY})
+	if err != nil {
+		return 0, fmt.Errorf("docker runtime: attaching exec: %w", err)
+	}
+	defer attach.Close()
+
+	// Pump TTY resize events to the exec for the lifetime of this call.
+	if opts.Resize != nil {
+		resizeCtx, cancelResize := context.WithCancel(ctx)
+		defer cancelResize()
+		go func() {
+			for {
+				select {
+				case <-resizeCtx.Done():
+					return
+				case sz, ok := <-opts.Resize:
+					if !ok {
+						return
+					}
+					_, _ = d.client.ExecResize(resizeCtx, execResp.ID, client.ExecResizeOptions{
+						Height: sz.Rows,
+						Width:  sz.Cols,
+					})
+				}
+			}
+		}()
+	}
+
+	// Stream stdin to the exec, then half-close so the process sees EOF.
+	if opts.Stdin != nil {
+		go func() {
+			_, _ = io.Copy(attach.Conn, opts.Stdin)
+			_ = attach.CloseWrite()
+		}()
+	}
+
+	// Stream output back. A TTY merges stdout and stderr onto one stream, so
+	// copy it directly; otherwise demux the multiplexed frames.
+	if opts.TTY {
+		if opts.Stdout != nil {
+			_, _ = io.Copy(opts.Stdout, attach.Reader)
+		}
+	} else {
+		out := opts.Stdout
+		errOut := opts.Stderr
+		if out == nil {
+			out = io.Discard
+		}
+		if errOut == nil {
+			errOut = io.Discard
+		}
+		if _, err := stdcopy.StdCopy(out, errOut, attach.Reader); err != nil {
+			return 0, fmt.Errorf("docker runtime: streaming exec output: %w", err)
+		}
+	}
+
+	inspect, err := d.client.ExecInspect(ctx, execResp.ID, client.ExecInspectOptions{})
+	if err != nil {
+		return 0, fmt.Errorf("docker runtime: inspecting exec: %w", err)
+	}
+	return inspect.ExitCode, nil
+}
+
 // Logs returns a ReadCloser that streams the container's combined stdout/stderr.
 func (d *DockerRuntime) Logs(ctx context.Context, session *Session) (io.ReadCloser, error) {
 	if session == nil {
@@ -447,12 +557,23 @@ func (d *DockerRuntime) buildContainerConfig(
 		ReadonlyRootfs: p.ReadonlyRootfs,
 	}
 
-	// Apply network mode from policy.
-	if p.NetworkMode != "" {
+	networkCfg := &network.NetworkingConfig{}
+
+	// Network attachment. "bridge" (set by policy resolution when egress rules
+	// are present) must NOT use Docker's default bridge: that bridge has no
+	// embedded DNS resolver, so the container's resolv.conf points at an
+	// external nameserver on :53, and the egress default-deny blocks that —
+	// breaking all name resolution. Attach to a per-agent user-defined bridge
+	// instead, which runs Docker's embedded resolver at 127.0.0.11 (loopback,
+	// which the enforcer always allows). This mirrors how the MCP proxy
+	// attaches its backends. "none" and any explicit mode pass through.
+	if p.NetworkMode == "bridge" {
+		networkCfg.EndpointsConfig = map[string]*network.EndpointSettings{
+			agentNetworkName(cfg.Name): {},
+		}
+	} else if p.NetworkMode != "" {
 		hostCfg.NetworkMode = container.NetworkMode(p.NetworkMode)
 	}
-
-	networkCfg := &network.NetworkingConfig{}
 
 	// Map config mounts from devcontainer.json.
 	hostCfg.Mounts = parseMounts(cfg.Mounts)
@@ -508,6 +629,33 @@ func (d *DockerRuntime) buildContainerConfig(
 	}
 
 	return containerCfg, hostCfg, networkCfg
+}
+
+// agentNetworkName is the deterministic name of the per-agent user-defined
+// bridge network. Keyed by the agent name so repeated runs of the same config
+// reuse one network rather than accumulating per-run networks.
+func agentNetworkName(name string) string {
+	return "ac-net-" + name
+}
+
+// ensureAgentNetwork creates the per-agent user-defined bridge network if it
+// does not already exist. A user-defined bridge — unlike Docker's default
+// bridge — runs the embedded DNS resolver at 127.0.0.11, loopback traffic the
+// enforcer always allows, so name resolution works under default-deny egress.
+// Idempotent: an existing network is reused.
+func (d *DockerRuntime) ensureAgentNetwork(ctx context.Context, name string) error {
+	if _, err := d.client.NetworkInspect(ctx, name, client.NetworkInspectOptions{}); err == nil {
+		return nil
+	}
+	if _, err := d.client.NetworkCreate(ctx, name, client.NetworkCreateOptions{
+		Driver: "bridge",
+		Labels: map[string]string{
+			labelPrefix + "/managed": "true",
+		},
+	}); err != nil {
+		return fmt.Errorf("creating network %s: %w", name, err)
+	}
+	return nil
 }
 
 // defaultContainerPolicy returns a default-deny security policy when no

@@ -1,0 +1,40 @@
+{
+  // Claude Code under enforcement, authenticated with a regular Anthropic API
+  // key delivered through the native agentcontainers secret mechanism.
+  //
+  // The key is read from the host ANTHROPIC_API_KEY env var and injected by the
+  // enforcer into the container's /run/secrets tmpfs (never the agent's env).
+  // The enforcer chowns it to the agent's uid, so the non-root agent can read
+  // it. Claude reads it via apiKeyHelper -> ac-api-key, configured in the
+  // workspace settings (apikey/claude-settings.json) rather than baked into the
+  // image's managed settings, so it does not interfere with the OAuth flow.
+  "name": "claude-agent-apikey",
+  "image": "ghcr.io/jlgore/claude-agent:demo",
+
+  "mounts": [
+    "type=bind,source=/run/ac/guard.sock,target=/run/ac/guard.sock"
+  ],
+
+  "agent": {
+    "capabilities": {
+      "filesystem": {
+        "read": ["/workspace/**"],
+        "write": ["/workspace/**"]
+      },
+      "network": {
+        "egress": [
+          { "host": "api.anthropic.com", "port": 443 }
+        ]
+      }
+    },
+
+    "secrets": {
+      "ANTHROPIC_API_KEY": { "provider": "env://ANTHROPIC_API_KEY" }
+    },
+
+    "policy": {
+      "escalation": "prompt",
+      "auditLog": true
+    }
+  }
+}
