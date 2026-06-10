@@ -51,6 +51,22 @@ func (e *Evaluator) PoliciesEvaluated() []string {
 	return append([]string(nil), e.pkgs...)
 }
 
+// EvaluateParsed evaluates one decomposed command against the prepared query
+// using the standard policy input envelope (server/tool/args/parsed/context).
+// It exists so callers outside the proxy — the agent-tool guard — reuse the
+// exact input shape and Rego contract the MCP tool path uses, keeping the
+// envelope in one place. Fail-closed handling (an error means deny) is the
+// caller's responsibility.
+func (e *Evaluator) EvaluateParsed(ctx context.Context, server, tool string, args any, parsed Parsed, pctx map[string]any) (Decision, error) {
+	return e.Evaluate(ctx, map[string]any{
+		"server":  server,
+		"tool":    tool,
+		"args":    args,
+		"parsed":  parsed.toInput(),
+		"context": pctx,
+	})
+}
+
 // Evaluate runs the prepared query against one policy input document
 // (SPEC §5). An evaluation error is returned to the caller, which must
 // fail closed (deny) — a broken policy engine never falls open.
