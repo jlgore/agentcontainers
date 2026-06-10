@@ -1,0 +1,36 @@
+{
+  // Claude Code under enforcement, authenticated with an OAuth token.
+  //
+  // The token (from `claude setup-token`) is supplied at exec time, never baked
+  // into the image or this config:
+  //
+  //   agentcontainer exec -it -e CLAUDE_CODE_OAUTH_TOKEN=<token> \
+  //     -e TMPDIR=/workspace/.tmp claude-agent-oauth -- claude
+  //
+  // `-e` also resolves secret URIs (op://, vault://, env://…) host-side, so the
+  // token need not be plaintext on the command line. See README.md.
+  "name": "claude-agent-oauth",
+  "image": "ghcr.io/jlgore/claude-agent:demo",
+
+  "mounts": [
+    "type=bind,source=/run/ac/guard.sock,target=/run/ac/guard.sock"
+  ],
+
+  "agent": {
+    "capabilities": {
+      "filesystem": {
+        "read": ["/workspace/**"],
+        "write": ["/workspace/**"]
+      },
+      "network": {
+        "egress": [
+          { "host": "api.anthropic.com", "port": 443 }
+        ]
+      }
+    },
+    "policy": {
+      "escalation": "prompt",
+      "auditLog": true
+    }
+  }
+}

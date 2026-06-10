@@ -1,5 +1,4 @@
 {
-  "apiKeyHelper": "/usr/local/bin/ac-api-key",
   "hooks": {
     "PreToolUse": [
       {

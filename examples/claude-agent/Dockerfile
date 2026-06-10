@@ -34,27 +34,36 @@ RUN apt-get update \
 
 COPY --from=build /out/agentcontainer /usr/local/bin/agentcontainer
 
-# Managed settings are root-owned and world-readable but NOT writable. Claude
-# Code treats /etc/claude-code/managed-settings.json as the highest-precedence
-# settings source, so the agent cannot override the guard hook or the
-# apiKeyHelper from its own user/project config.
+# Managed settings are root-owned and world-readable but NOT writable. They
+# carry ONLY the PreToolUse guard hook — the one thing that must be
+# non-overridable. Auth (an OAuth token or an API key) is supplied per
+# deployment, NOT baked in: a managed apiKeyHelper would take precedence over
+# CLAUDE_CODE_OAUTH_TOKEN and silently break the OAuth flow. Claude Code treats
+# /etc/claude-code/managed-settings.json as its highest-precedence settings
+# source, so the agent cannot remove or rewrite the hook.
 COPY examples/claude-agent/managed-settings.json /etc/claude-code/managed-settings.json
 RUN chown root:root /etc/claude-code/managed-settings.json \
     && chmod 0644 /etc/claude-code/managed-settings.json
 
-# apiKeyHelper: emit the key from the tmpfs secret, never an env var.
+# apiKeyHelper for the API-key example: emit the key from the /run/secrets tmpfs
+# (never an env var). Referenced from a project settings.json, not managed
+# settings — see examples/claude-agent/apikey/.
 COPY examples/claude-agent/api-key-helper.sh /usr/local/bin/ac-api-key
 RUN chmod 0755 /usr/local/bin/ac-api-key
 
 COPY examples/claude-agent/entrypoint.sh /usr/local/bin/claude-agent-entrypoint
 RUN chmod 0755 /usr/local/bin/claude-agent-entrypoint
 
-# Run as the node base image's unprivileged user (uid 1000). That uid matches
-# the host user running `guard serve`, so the 0600 guard socket is accessible
-# across the bind mount (see README "uid alignment"). HOME lives under the
-# writable /workspace mount because the enforcer mounts the rootfs read-only.
+# Run as the node base image's unprivileged user (uid 1000). The enforcer
+# chowns injected secrets to this uid so the agent can read them; the same uid
+# matches the host user running `guard serve`, so the 0600 guard socket is
+# accessible across the bind mount (see README "uid alignment"). HOME and TMPDIR
+# both live under the writable /workspace mount because the enforcer mounts the
+# rootfs read-only — and the native claude binary needs a writable TMPDIR or it
+# exits silently.
 ENV HOME=/workspace \
     CLAUDE_CONFIG_DIR=/workspace/.claude \
+    TMPDIR=/workspace/.tmp \
     NODE_NO_WARNINGS=1
 WORKDIR /workspace
 USER node
