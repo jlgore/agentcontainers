@@ -2,10 +2,12 @@
   // Run an agent with the mainline SIFT forensic platform (AppliedIR/sift-mcp)
   // available as a single MCP tool, under agentcontainers enforcement.
   //
-  // The "sift" tool is a container-type MCP server: agentcontainers starts the
-  // sift-gateway image as a hardened sidecar (read-only rootfs, caps dropped)
-  // on a private bridge network and proxies its HTTP MCP endpoint to the agent.
-  // The gateway itself aggregates forensic-mcp, sift-mcp, case-mcp, report-mcp.
+  // The "sift" tool is a container-type MCP server with the "http" transport:
+  // the MCP proxy (agentcontainer mcp start) launches the sift-gateway image as
+  // a hardened sidecar (caps dropped, no-new-privileges) on a private bridge
+  // network, registers its cgroup with the eBPF enforcer, and proxies its HTTP
+  // MCP endpoint to the agent. The gateway itself aggregates forensic-mcp,
+  // sift-mcp, case-mcp, report-mcp.
   //
   // Build the image first:  ./build.sh   (produces sift-gateway:demo)
   "name": "sift-agent",
@@ -26,17 +28,27 @@
 
     "tools": {
       "mcp": {
-        // The sift-gateway is an HTTP MCP server. agentcontainers attaches it
-        // as a "remote" backend: the MCP proxy can host container backends only
-        // over stdio (container+http is not yet implemented), and the in-`run`
-        // container-tool path needs the sandbox runtime (Docker Desktop). On a
-        // plain Docker Engine host this remote wiring is the supported path.
-        // Start the gateway first:  docker run -d --name sift-gateway \
-        //   --read-only --cap-drop ALL --security-opt no-new-privileges:true \
-        //   --tmpfs /run/secrets:rw,exec -p 4508:4508 sift-gateway:demo
+        // The sift-gateway is an HTTP MCP server. agentcontainers hosts it as a
+        // container-type backend over the "http" transport: the MCP proxy
+        // launches the image itself, freezes it, registers its cgroup with the
+        // eBPF enforcer (default-deny egress applied to its BPF maps — the
+        // gateway's 4 sub-servers are local stdio subprocesses, so it needs no
+        // outbound network), unfreezes, then connects to its Streamable HTTP
+        // endpoint at :4508/mcp over the per-session bridge. The gateway is
+        // kernel-enforced, not just the proxy in front of it.
+        //
+        // The proxy owns the gateway lifecycle — no standalone `docker run` is
+        // needed. `mcp start` requires a running enforcer for container backends
+        // (set agent.enforcer.required: false to opt out). On a plain Docker
+        // Engine host this proxy path is the supported way to host container MCP
+        // tools; the in-`run` container-tool path needs the sandbox runtime
+        // (Docker Desktop).
         "sift": {
-          "type": "remote",
-          "url": "http://localhost:4508/mcp"
+          "type": "container",
+          "image": "sift-gateway:demo",
+          "transport": "http",
+          "port": 4508,
+          "path": "/mcp"
         }
       }
     },

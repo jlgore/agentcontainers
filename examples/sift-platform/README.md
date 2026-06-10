@@ -13,38 +13,24 @@ attaches it to the agent:
 
 ```
             agentcontainers MCP proxy (policy / approval / audit)
-                       │  type: remote (Streamable HTTP)
+                       │  type: container + http (proxy launches & enforces it)
                        ▼
    sift-gateway:demo  ──┬─▶ forensic-mcp   (stdio subprocess)
-   (HTTP :4508)         ├─▶ sift-mcp
-                        ├─▶ case-mcp
-                        └─▶ report-mcp        49 tools total
+   (HTTP :4508)         ├─▶ sift-mcp        ── its own cgroup registered with
+                        ├─▶ case-mcp           the eBPF enforcer (default-deny
+                        └─▶ report-mcp          egress)        49 tools total
 
    agent container ── registered with the eBPF enforcer (cgroup connect4/6,
                       file_open LSM, process) ── network egress allowlist applied
 ```
 
-## Hosting model: why `remote`, not `container`
+## Hosting model: `container` + `http` (kernel-enforced)
 
-This example wires the gateway as a **`type: remote`** MCP backend for
-simplicity, but `container` + `http` is also supported by the MCP proxy and
-gives the gateway kernel enforcement — see the alternative below.
-
-One thing to know about a plain Docker **Engine** host (no Docker Desktop): the
-in-`run` container-MCP path is only wired by the **sandbox** runtime, which
-needs Docker Desktop's `sandboxd` (a microVM backend); on Docker Engine
-`--runtime sandbox` fails with `dial unix .../sandboxd.sock: no such file`. The
-MCP proxy (`agentcontainer mcp start`) does not need the sandbox runtime — it
-launches container backends directly via the Docker API.
-
-**Remote (this example):** the gateway runs as a standalone container and the
-proxy connects to its HTTP endpoint as a remote backend. Simple, but the gateway
-itself is not registered with the enforcer.
-
-**Container + http (kernel-enforced):** point the tool at the image instead of a
-URL and the proxy launches the gateway container, registers its cgroup with the
-eBPF enforcer (network/file/process policy on BPF maps), and connects over HTTP
-on the per-session bridge network:
+This example wires the gateway as a **`type: container`** backend with the
+**`http`** transport. The MCP proxy launches the gateway image itself, registers
+its cgroup with the eBPF enforcer (network/file/process policy on BPF maps),
+freezes it until enforcement is applied, then connects over HTTP on the
+per-session bridge network:
 
 ```jsonc
 "sift": {
@@ -55,6 +41,25 @@ on the per-session bridge network:
   "path": "/mcp"
 }
 ```
+
+So the gateway itself is kernel-enforced, not just the proxy in front of it. An
+absent `policy.network` means **default-deny egress** for the gateway cgroup,
+which is exactly right here — its four sub-servers are local stdio subprocesses,
+so the gateway makes no outbound connections; the proxy reaches it via ingress
+on the bridge.
+
+One thing to know about a plain Docker **Engine** host (no Docker Desktop): the
+in-`run` container-MCP path is only wired by the **sandbox** runtime, which
+needs Docker Desktop's `sandboxd` (a microVM backend); on Docker Engine
+`--runtime sandbox` fails with `dial unix .../sandboxd.sock: no such file`. The
+MCP proxy (`agentcontainer mcp start`) does not need the sandbox runtime — it
+launches container backends directly via the Docker API, which is why this
+example hosts the gateway through the proxy.
+
+**Alternative — `type: remote`:** run the gateway as a standalone container
+(`docker run … -p 4508:4508 sift-gateway:demo`) and point the tool at
+`url: http://localhost:4508/mcp`. Simpler, but the gateway is not registered
+with the enforcer — only the proxy's policy/approval/audit apply.
 
 ## Files
 
@@ -97,20 +102,23 @@ sudo ./scripts/bootstrap.sh --with-sift-demo   # host setup, then up.sh
 <details><summary>The equivalent manual steps</summary>
 
 ```bash
-docker run -d --name sift-gateway \
-  --read-only --cap-drop ALL --security-opt no-new-privileges:true \
-  --tmpfs /run/secrets:rw,exec -p 4508:4508 sift-gateway:demo
-agentcontainer run -d                  # agent under enforcement
-agentcontainer mcp start --port 4510   # proxy: "Backends: sift", 49 tools
+agentcontainer run -d                  # agent under enforcement (starts the enforcer)
+agentcontainer mcp start --port 4510   # proxy launches the gateway backend,
+                                       # registers its cgroup → "Backends: sift", 49 tools
 ```
+
+The proxy reads `agentcontainer.json`, launches `sift-gateway:demo` as a
+kernel-enforced `container` + `http` backend, and tears it down on exit — there
+is no standalone gateway container to start or stop.
 </details>
 
 ## What this demonstrates (validated on Ubuntu 24.04 / Docker Engine)
 
 - The mainline SIFT platform runs containerized under the hardened sidecar
   profile and serves **49 tools** across 4 backends.
-- The agentcontainers MCP proxy aggregates it (`Backends: sift`) with a hash-
-  chained audit log.
+- The agentcontainers MCP proxy launches the gateway as a `container` + `http`
+  backend, registers its cgroup with the enforcer (default-deny egress on its
+  BPF maps), and aggregates it (`Backends: sift`) with a hash-chained audit log.
 - The agent runs under live BPF enforcement: the enforcer registers the agent's
   cgroup and applies the egress allowlist (`hosts=["api.github.com"]`), blocks
   the cloud-metadata IP (`169.254.169.254/32`), and applies filesystem/process

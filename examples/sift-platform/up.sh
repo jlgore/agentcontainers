@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 # Bring up the SIFT platform demo under agentcontainers enforcement.
 #
-# Idempotent. Builds the gateway image if missing, starts the hardened gateway,
-# runs the agent under enforcement, and starts the MCP proxy fronting the 49
-# SIFT tools.
+# Idempotent. Builds the gateway image if missing, runs the agent under
+# enforcement, and starts the MCP proxy. The proxy launches the sift-gateway
+# itself as a kernel-enforced container backend (type: container + http) and
+# fronts the 49 SIFT tools — no standalone gateway container to manage.
 #
 # Assumes scripts/bootstrap.sh has already prepared the host (Docker, the
 # agentcontainer CLI, the enforcer image, BPF LSM).
 #
-# Env: IMAGE=sift-gateway:demo  GATEWAY_PORT=4508  PROXY_PORT=4510
+# Env: IMAGE=sift-gateway:demo  PROXY_PORT=4510
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
 IMAGE="${IMAGE:-sift-gateway:demo}"
-GATEWAY_PORT="${GATEWAY_PORT:-4508}"
 PROXY_PORT="${PROXY_PORT:-4510}"
 RUN_DIR="$HERE/.run"
 
@@ -40,42 +40,37 @@ else
   "$HERE/build.sh"
 fi
 
-# 2. Gateway container (hardened, mirrors the MCP-sidecar profile).
-log "Starting gateway on :$GATEWAY_PORT"
-docker rm -f sift-gateway >/dev/null 2>&1 || true
-docker run -d --name sift-gateway \
-  --read-only --cap-drop ALL --security-opt no-new-privileges:true \
-  --tmpfs /run/secrets:rw,exec -p "${GATEWAY_PORT}:4508" "$IMAGE" >/dev/null
-for _ in $(seq 1 20); do
-  [ "$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:${GATEWAY_PORT}/health" 2>/dev/null)" = "200" ] && break
-  sleep 1
-done
-[ "$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:${GATEWAY_PORT}/health" 2>/dev/null)" = "200" ] \
-  && ok "gateway healthy" || die "gateway did not become healthy (docker logs sift-gateway)"
-
-# 3. Agent under enforcement (enforcer auto-starts).
+# 2. Agent under enforcement (enforcer auto-starts — the proxy needs it for the
+#    container backend).
 log "Starting agent under enforcement"
 agentcontainer run -d 2>&1 | grep -avE 'lockfile not found' || true
 
-# 4. MCP proxy fronting the SIFT platform.
-log "Starting MCP proxy on :$PROXY_PORT"
+# 3. MCP proxy. It launches the sift-gateway as a kernel-enforced container
+#    backend (type: container + http), registers its cgroup with the enforcer,
+#    and fronts the 49 SIFT tools. First start pulls/boots the gateway, so allow
+#    a longer settle than a remote backend.
+log "Starting MCP proxy on :$PROXY_PORT (launches the gateway backend)"
 if [ -f "$RUN_DIR/proxy.pid" ] && kill -0 "$(cat "$RUN_DIR/proxy.pid")" 2>/dev/null; then
   ok "proxy already running (pid $(cat "$RUN_DIR/proxy.pid"))"
 else
   nohup agentcontainer mcp start --port "$PROXY_PORT" > "$RUN_DIR/proxy.log" 2>&1 &
   echo $! > "$RUN_DIR/proxy.pid"
-  sleep 6
+  for _ in $(seq 1 30); do
+    grep -aqE 'Backends:' "$RUN_DIR/proxy.log" && break
+    kill -0 "$(cat "$RUN_DIR/proxy.pid")" 2>/dev/null || break
+    sleep 1
+  done
   if grep -aqE 'Backends:' "$RUN_DIR/proxy.log"; then
     ok "$(grep -aE 'Backends:' "$RUN_DIR/proxy.log" | head -1)"
   else
-    warn "proxy not confirmed; last log lines:"; tail -3 "$RUN_DIR/proxy.log" >&2
+    warn "proxy not confirmed; last log lines:"; tail -5 "$RUN_DIR/proxy.log" >&2
   fi
 fi
 
 cat <<EOT
 
 ${G}SIFT platform is up under enforcement.${Z}
-  gateway:   http://localhost:${GATEWAY_PORT}/health        (49 tools)
+  gateway:   kernel-enforced container backend (ac-mcp-sift-*), 49 tools
   MCP proxy: http://localhost:${PROXY_PORT}/                (policy / approval / audit)
   agent:     agentcontainer ps   ·   agentcontainer exec sift-agent -- <cmd>
   enforcer:  agentcontainer enforcer status

@@ -110,9 +110,10 @@ cd examples/sift-platform
 
 `up.sh` is idempotent. It builds `sift-gateway:demo` from mainline
 [`AppliedIR/sift-mcp`](https://github.com/AppliedIR/sift-mcp) (the first build
-clones upstream + `vhir-cli` and takes a few minutes), starts the hardened
-gateway, runs the agent under enforcement, and starts the MCP proxy aggregating
-the **49 SIFT tools** with policy / approval / audit.
+clones upstream + `vhir-cli` and takes a few minutes), runs the agent under
+enforcement, and starts the MCP proxy. The proxy launches the gateway itself as
+a kernel-enforced `container` + `http` backend and aggregates the **49 SIFT
+tools** with policy / approval / audit — no standalone gateway to manage.
 
 ---
 
@@ -154,8 +155,8 @@ attach it two ways:
 
 | Mode | Config | Enforcement | Use when |
 |------|--------|-------------|----------|
-| **remote** (default in the example) | `type: remote`, `url: http://localhost:4508/mcp` | proxy policy/approval/audit only | simplest; gateway runs as a plain container you manage |
-| **container + http** | `type: container`, `image`, `transport: http`, `port`, `path` | **+ kernel netpolicy on the gateway's own cgroup** | you want the gateway itself eBPF-enforced |
+| **container + http** (default in the example) | `type: container`, `image`, `transport: http`, `port`, `path` | **+ kernel netpolicy on the gateway's own cgroup** | you want the gateway itself eBPF-enforced |
+| **remote** | `type: remote`, `url: http://localhost:4508/mcp` | proxy policy/approval/audit only | simplest; gateway runs as a plain container you manage |
 
 Container + http example:
 
