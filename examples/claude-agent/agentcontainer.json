@@ -1,0 +1,47 @@
+{
+  // Claude Code, containerized and gated by the same zero-trust machinery as the
+  // MCP forensic tools. See README.md for the full runbook.
+  //
+  // The agent's Bash is intercepted by a PreToolUse hook (baked into the image's
+  // root-owned managed-settings.json) that ships each command to the host guard
+  // over the bind-mounted socket below. Egress is kernel-enforced; the API key
+  // is injected into /run/secrets and read via apiKeyHelper, never an env var.
+  "name": "claude-agent",
+  "image": "claude-agent:demo",
+
+  // The host guard socket. `agentcontainer guard serve --socket /run/ac/guard.sock`
+  // creates it; the container connects to it to get an allow/deny/ask verdict.
+  // Mounted read-write because connecting to a unix socket needs write access to
+  // the socket inode — the socket's 0600 perms and the out-of-band host
+  // authority are the protection, not the mount mode. Only the socket file is
+  // mounted, so the agent cannot create anything else under /run/ac.
+  "mounts": [
+    "type=bind,source=/run/ac/guard.sock,target=/run/ac/guard.sock"
+  ],
+
+  "agent": {
+    "capabilities": {
+      "filesystem": {
+        "read": ["/workspace/**"],
+        "write": ["/workspace/**"]
+      },
+      "network": {
+        "egress": [
+          { "host": "api.anthropic.com", "port": 443 }
+        ]
+      }
+    },
+
+    "secrets": {
+      // Read the key from the host ANTHROPIC_API_KEY env var and inject it into
+      // the container's /run/secrets tmpfs. apiKeyHelper (ac-api-key) reads it
+      // from there. Swap the provider for vault/op/infisical/oidc in production.
+      "ANTHROPIC_API_KEY": { "provider": "env://ANTHROPIC_API_KEY" }
+    },
+
+    "policy": {
+      "escalation": "prompt",
+      "auditLog": true
+    }
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "apiKeyHelper": "/usr/local/bin/ac-api-key",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/agentcontainer guard hook --socket /run/ac/guard.sock"
+          }
+        ]
+      }
+    ]
+  }
+}
