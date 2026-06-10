@@ -13,7 +13,8 @@ require (
 	github.com/stretchr/testify v1.11.1
 	github.com/tailscale/hujson v0.0.0-20250605163823-992244df8c5a
 	go.uber.org/zap v1.27.1
-	golang.org/x/sys v0.44.0
+	golang.org/x/sys v0.46.0
+	golang.org/x/term v0.44.0
 	golang.org/x/text v0.37.0
 	google.golang.org/grpc v1.81.0
 	google.golang.org/protobuf v1.36.11

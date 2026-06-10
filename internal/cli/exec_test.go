@@ -117,6 +117,44 @@ func TestExecRuntimeDefault(t *testing.T) {
 	}
 }
 
+func TestExecInteractiveFlags(t *testing.T) {
+	cmd := newExecCmd()
+	if err := cmd.ParseFlags([]string{"-it", "abc123", "--", "claude"}); err != nil {
+		t.Fatalf("parsing -it: %v", err)
+	}
+	for _, name := range []string{"interactive", "tty"} {
+		v, err := cmd.Flags().GetBool(name)
+		if err != nil {
+			t.Fatalf("get %s: %v", name, err)
+		}
+		if !v {
+			t.Errorf("flag %q = false, want true (from -it)", name)
+		}
+	}
+}
+
+func TestResolveEnvVars(t *testing.T) {
+	t.Setenv("MY_TEST_SECRET", "supersecret")
+
+	got, err := resolveEnvVars(context.Background(), []string{
+		"FOO=bar",                  // plain passthrough
+		"BARE",                     // no "=" passthrough
+		"KEY=env://MY_TEST_SECRET", // resolved from env provider
+	})
+	if err != nil {
+		t.Fatalf("resolveEnvVars: %v", err)
+	}
+	want := []string{"FOO=bar", "BARE", "KEY=supersecret"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
 func TestResolveSecretOnDemand_EnvProvider(t *testing.T) {
 	t.Setenv("MY_TEST_SECRET", "supersecret")
 

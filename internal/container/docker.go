@@ -35,6 +35,9 @@ const (
 // Compile-time check that DockerRuntime satisfies the Runtime interface.
 var _ Runtime = (*DockerRuntime)(nil)
 
+// Compile-time check that DockerRuntime supports interactive (TTY) exec.
+var _ InteractiveExecer = (*DockerRuntime)(nil)
+
 // DockerRuntime implements the Runtime interface using the Docker Engine API.
 type DockerRuntime struct {
 	client      client.APIClient
@@ -332,6 +335,100 @@ func (d *DockerRuntime) Exec(ctx context.Context, session *Session, cmd []string
 		Stdout:   stdout.Bytes(),
 		Stderr:   stderr.Bytes(),
 	}, nil
+}
+
+// ExecInteractive runs cmd inside the session container with streamed stdio and
+// an optional TTY, for human-driven sessions. It returns the command's exit
+// code. The caller owns the terminal; this method owns the docker exec and
+// applies resize events delivered on opts.Resize.
+//
+// Enforcement is unaffected: the exec process is created in the container's
+// cgroup, so the eBPF egress hooks apply, and an interactive `claude` reads the
+// same managed-settings PreToolUse hook as the main process.
+func (d *DockerRuntime) ExecInteractive(ctx context.Context, session *Session, cmd []string, opts InteractiveExecOptions) (int, error) {
+	if session == nil {
+		return 0, fmt.Errorf("docker runtime: nil session")
+	}
+	if len(cmd) == 0 {
+		return 0, fmt.Errorf("docker runtime: empty command")
+	}
+
+	execResp, err := d.client.ExecCreate(ctx, session.ContainerID, client.ExecCreateOptions{
+		Cmd:          cmd,
+		User:         opts.User,
+		WorkingDir:   opts.WorkingDir,
+		Env:          opts.Env,
+		TTY:          opts.TTY,
+		AttachStdin:  opts.Stdin != nil,
+		AttachStdout: opts.Stdout != nil,
+		AttachStderr: opts.Stderr != nil,
+		ConsoleSize:  client.ConsoleSize{Height: opts.InitialSize.Rows, Width: opts.InitialSize.Cols},
+	})
+	if err != nil {
+		return 0, fmt.Errorf("docker runtime: creating exec: %w", err)
+	}
+
+	attach, err := d.client.ExecAttach(ctx, execResp.ID, client.ExecAttachOptions{TTY: opts.TTY})
+	if err != nil {
+		return 0, fmt.Errorf("docker runtime: attaching exec: %w", err)
+	}
+	defer attach.Close()
+
+	// Pump TTY resize events to the exec for the lifetime of this call.
+	if opts.Resize != nil {
+		resizeCtx, cancelResize := context.WithCancel(ctx)
+		defer cancelResize()
+		go func() {
+			for {
+				select {
+				case <-resizeCtx.Done():
+					return
+				case sz, ok := <-opts.Resize:
+					if !ok {
+						return
+					}
+					_, _ = d.client.ExecResize(resizeCtx, execResp.ID, client.ExecResizeOptions{
+						Height: sz.Rows,
+						Width:  sz.Cols,
+					})
+				}
+			}
+		}()
+	}
+
+	// Stream stdin to the exec, then half-close so the process sees EOF.
+	if opts.Stdin != nil {
+		go func() {
+			_, _ = io.Copy(attach.Conn, opts.Stdin)
+			_ = attach.CloseWrite()
+		}()
+	}
+
+	// Stream output back. A TTY merges stdout and stderr onto one stream, so
+	// copy it directly; otherwise demux the multiplexed frames.
+	if opts.TTY {
+		if opts.Stdout != nil {
+			_, _ = io.Copy(opts.Stdout, attach.Reader)
+		}
+	} else {
+		out := opts.Stdout
+		errOut := opts.Stderr
+		if out == nil {
+			out = io.Discard
+		}
+		if errOut == nil {
+			errOut = io.Discard
+		}
+		if _, err := stdcopy.StdCopy(out, errOut, attach.Reader); err != nil {
+			return 0, fmt.Errorf("docker runtime: streaming exec output: %w", err)
+		}
+	}
+
+	inspect, err := d.client.ExecInspect(ctx, execResp.ID, client.ExecInspectOptions{})
+	if err != nil {
+		return 0, fmt.Errorf("docker runtime: inspecting exec: %w", err)
+	}
+	return inspect.ExitCode, nil
 }
 
 // Logs returns a ReadCloser that streams the container's combined stdout/stderr.

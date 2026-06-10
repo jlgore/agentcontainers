@@ -132,6 +132,59 @@ type EventStreamer interface {
 	EnforcementEvents(containerID string) <-chan enforcement.Event
 }
 
+// InteractiveExecer is an optional interface that runtimes can implement to
+// run a command inside the session container with a TTY and streamed stdio,
+// for human-driven sessions (e.g. an interactive `claude`). Callers type-assert
+// the runtime to check for support, mirroring EventStreamer:
+//
+//	if ie, ok := rt.(InteractiveExecer); ok {
+//	    code, err := ie.ExecInteractive(ctx, session, cmd, opts)
+//	}
+//
+// Unlike Exec, it does not buffer output: stdio is wired straight through, so
+// the process joins the container cgroup and remains subject to the same eBPF
+// egress enforcement and PreToolUse guard hook as the main process.
+type InteractiveExecer interface {
+	ExecInteractive(ctx context.Context, session *Session, cmd []string, opts InteractiveExecOptions) (int, error)
+}
+
+// TerminalSize is a TTY size in character rows and columns.
+type TerminalSize struct {
+	Rows uint
+	Cols uint
+}
+
+// InteractiveExecOptions configures an interactive exec. The caller owns the
+// terminal (raw mode, signal handling); the runtime owns the container exec and
+// pumps resize events to it.
+type InteractiveExecOptions struct {
+	// TTY allocates a pseudo-terminal for the exec. When true, stdout and
+	// stderr are merged onto a single stream (no stdcopy demux).
+	TTY bool
+
+	// User overrides the user the exec runs as ("uid", "uid:gid", or name).
+	// Empty means the image's configured user.
+	User string
+
+	// WorkingDir overrides the exec working directory. Empty means the image's.
+	WorkingDir string
+
+	// Env are KEY=VALUE pairs added to the exec environment.
+	Env []string
+
+	// Stdin, Stdout, Stderr are the streams to wire to the exec. A nil Stdin
+	// means no stdin is attached.
+	Stdin  io.Reader
+	Stdout io.Writer
+	Stderr io.Writer
+
+	// InitialSize is the starting TTY size (ignored when TTY is false).
+	InitialSize TerminalSize
+
+	// Resize, when non-nil, delivers TTY resize events to apply to the exec.
+	Resize <-chan TerminalSize
+}
+
 // ExecResult holds the output of an executed command.
 type ExecResult struct {
 	// ExitCode is the process exit code. Zero indicates success.
