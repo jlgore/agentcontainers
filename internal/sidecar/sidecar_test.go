@@ -436,6 +436,50 @@ func TestStartSidecar_ContainerLabels(t *testing.T) {
 	}
 }
 
+// TestStartSidecar_RequestsSysPtrace is a regression guard for commit ac99c64.
+// The enforcer injects secrets through the agent's /proc/<init_pid>/root magic
+// symlink (grpc.rs InjectSecrets). Dereferencing another process's
+// /proc/<pid>/root triggers ptrace_may_access(), which the yama LSM at
+// ptrace_scope>=1 (the distro default) denies for non-descendant processes
+// unless the caller holds CAP_SYS_PTRACE. If this capability is ever dropped
+// from the sidecar HostConfig, secret injection silently fails with EACCES.
+func TestStartSidecar_RequestsSysPtrace(t *testing.T) {
+	var capAdd []string
+	mock := &mockDockerClient{
+		containerCreateFn: func(ctx context.Context, opts client.ContainerCreateOptions) (client.ContainerCreateResult, error) {
+			capAdd = opts.HostConfig.CapAdd
+			return client.ContainerCreateResult{ID: "cap-id"}, nil
+		},
+	}
+
+	origProber := defaultHealthProber
+	defaultHealthProber = alwaysHealthy
+	defer func() { defaultHealthProber = origProber }()
+
+	_, err := StartSidecar(context.Background(), mock, StartOptions{Required: true})
+	if err != nil {
+		t.Fatalf("StartSidecar() unexpected error: %v", err)
+	}
+
+	// Every capability the enforcer relies on must be requested. SYS_PTRACE is
+	// the one that regressed in the field; the rest guard against an
+	// over-aggressive future trim.
+	for _, want := range []string{"BPF", "NET_ADMIN", "SYS_ADMIN", "SYS_RESOURCE", "SYS_PTRACE"} {
+		if !containsCap(capAdd, want) {
+			t.Errorf("sidecar HostConfig.CapAdd = %v, missing required capability %q", capAdd, want)
+		}
+	}
+}
+
+func containsCap(caps []string, want string) bool {
+	for _, c := range caps {
+		if c == want {
+			return true
+		}
+	}
+	return false
+}
+
 // ---------------------------------------------------------------------------
 // StopSidecar tests
 // ---------------------------------------------------------------------------
