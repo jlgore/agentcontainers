@@ -19,7 +19,7 @@ use std::sync::Once;
 use std::time::Duration;
 
 use serial_test::serial;
-use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
+use testcontainers::core::{ExecCommand, IntoContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
@@ -99,6 +99,19 @@ async fn connect_with_retry(uri: &str) -> EnforcerClient<tonic::transport::Chann
 
 /// A cgroup path guaranteed to exist inside the container.
 const CONTAINER_CGROUP_PATH: &str = "/sys/fs/cgroup";
+
+/// Run a command inside the container and return its trimmed stdout.
+async fn exec_stdout(
+    container: &testcontainers::ContainerAsync<GenericImage>,
+    cmd: &[&str],
+) -> String {
+    let mut res = container
+        .exec(ExecCommand::new(cmd.iter().map(|s| s.to_string())))
+        .await
+        .expect("exec failed");
+    let out = res.stdout_to_vec().await.expect("read exec stdout failed");
+    String::from_utf8(out).expect("exec stdout not utf-8").trim().to_string()
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -599,4 +612,111 @@ async fn test_full_lifecycle() {
         "error should mention 'not registered', got: {}",
         after_unreg.error
     );
+}
+
+/// Regression test for the secret-injection chown fix (commit 8540db6).
+///
+/// The enforcer runs as root and injects secrets through the agent's
+/// `/proc/<init_pid>/root/run/secrets` magic symlink. A non-root agent (the
+/// common case — `USER 1000` in the image) cannot read root-owned secrets, so
+/// `inject_secrets` must chown the secrets dir and every file to the agent's
+/// real uid/gid (read from `/proc/<init_pid>/status`). If that chown ever
+/// regresses, secrets land as `root:root 0400` and a non-root agent silently
+/// fails to authenticate.
+///
+/// We stand up a long-lived process as uid/gid 1000 *inside* the enforcer
+/// container (so `/proc/<pid>/root` resolves to the container's own root),
+/// register it as the agent, inject a secret, and assert the resulting file is
+/// owned by 1000:1000 with mode 0400 — not root.
+#[tokio::test]
+#[serial]
+async fn test_inject_secrets_chowns_to_agent_uid() {
+    let (container, uri) = start_enforcer().await;
+    let mut client = connect_with_retry(&uri).await;
+
+    // Spawn a process whose real uid/gid is 1000, backgrounded so it outlives
+    // the exec session (reparented to the container's PID 1). `echo $!` reports
+    // its PID in the container's PID namespace — exactly what the enforcer sees
+    // in its own /proc.
+    let pid_str = exec_stdout(
+        &container,
+        &[
+            "sh",
+            "-c",
+            "setpriv --reuid=1000 --regid=1000 --clear-groups sleep 300 >/dev/null 2>&1 & echo $!",
+        ],
+    )
+    .await;
+    let init_pid: u32 = pid_str
+        .parse()
+        .unwrap_or_else(|_| panic!("expected a PID, got {pid_str:?}"));
+    assert!(init_pid > 1, "agent PID should be a real process: {init_pid}");
+
+    // Confirm the process really is uid 1000 before we rely on it.
+    let proc_uid = exec_stdout(
+        &container,
+        &["sh", "-c", &format!("awk '/^Uid:/{{print $2}}' /proc/{init_pid}/status")],
+    )
+    .await;
+    assert_eq!(proc_uid, "1000", "target process should run as uid 1000");
+
+    // Register the agent with its real init PID.
+    client
+        .register_container(RegisterContainerRequest {
+            container_id: "test-secret-chown".into(),
+            cgroup_path: CONTAINER_CGROUP_PATH.into(),
+            init_pid,
+        })
+        .await
+        .expect("register failed");
+
+    // Inject a secret (mode 0 -> default 0400).
+    let resp = client
+        .inject_secrets(InjectSecretsRequest {
+            container_id: "test-secret-chown".into(),
+            secrets: vec![SecretEntry {
+                name: "ANTHROPIC_API_KEY".into(),
+                value: b"sk-ant-regression".to_vec(),
+                mode: 0,
+            }],
+            base_path: String::new(),
+        })
+        .await
+        .expect("inject_secrets RPC failed")
+        .into_inner();
+    assert!(resp.success, "inject_secrets should succeed: {}", resp.error);
+    assert_eq!(resp.injected_count, 1, "exactly one secret injected");
+
+    // The agent shares the container's mount namespace, so /proc/<pid>/root/run
+    // is just /run. Verify ownership + mode of both the dir and the file.
+    let dir_owner = exec_stdout(&container, &["stat", "-c", "%u:%g", "/run/secrets"]).await;
+    assert_eq!(
+        dir_owner, "1000:1000",
+        "secrets dir must be owned by the agent uid, not root"
+    );
+
+    let file_meta = exec_stdout(
+        &container,
+        &["stat", "-c", "%u:%g:%a", "/run/secrets/ANTHROPIC_API_KEY"],
+    )
+    .await;
+    assert_eq!(
+        file_meta, "1000:1000:400",
+        "secret file must be owned 1000:1000 mode 0400, not root:root"
+    );
+
+    // And the agent can actually read its own secret.
+    let content = exec_stdout(
+        &container,
+        &[
+            "setpriv",
+            "--reuid=1000",
+            "--regid=1000",
+            "--clear-groups",
+            "cat",
+            "/run/secrets/ANTHROPIC_API_KEY",
+        ],
+    )
+    .await;
+    assert_eq!(content, "sk-ant-regression", "agent (uid 1000) should read its secret");
 }
