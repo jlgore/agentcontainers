@@ -8,7 +8,7 @@ Three layers wrap the agent:
 
 | Layer | Mechanism | Stops |
 |-------|-----------|-------|
-| **Tool policy** | PreToolUse hook → host `guard serve` → OPA + HITL | `curl`, `bash -c`, `rm -rf /`, shell metacharacters, blocked dirs — with a human-readable reason and an approval escalation |
+| **Tool policy** | PreToolUse hook → host `guard serve` → OPA + HITL | Bash *and* the file mutators (Write/Edit/MultiEdit/NotebookEdit): `curl`, `bash -c`, `rm -rf /`, shell metacharacters, and writes outside the workspace (e.g. `/etc`, home dotfiles) — each with a human-readable reason and an approval escalation |
 | **Network** | eBPF egress allowlist (kernel) | any connection except `api.anthropic.com:443` |
 | **Auth** | OAuth token, or API key injected into `/run/secrets` | credentials kept out of the image and (for the API key) out of the agent's environment |
 
@@ -135,6 +135,14 @@ Ask Claude to run `curl https://example.com`. The hook denies it
 (*"binary 'curl' is blocked by security policy and cannot be overridden"*) and
 Claude reports the block; the attempt is recorded in the host audit chain
 (`~/.ac/audit/<session>.jsonl`, hash-linked). A benign `ls` passes through.
+
+The file mutators are gated the same way. Ask Claude to write to a path outside
+its workspace — e.g. *"create the file /etc/ac-test with the text hi"*. The hook
+denies the `Write` (*"output denied: '/etc/ac-test' — without an active case,
+output is only allowed in /tmp or the current working directory"*) and, if a
+human is at the `guard serve` TTY (or `agentcontainer approve`), escalates for
+approval. A write inside the workspace (`/workspace/...`) passes through. This
+closes the hole where an agent edits files directly instead of shelling out.
 
 ## Enforcer requirements
 

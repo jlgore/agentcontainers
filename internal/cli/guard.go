@@ -321,7 +321,7 @@ tamper-resistant placement for a containerized agent.`,
 		},
 	}
 
-	cmd.Flags().StringVar(&matcher, "matcher", "Bash", "Tool matcher (regex), e.g. \"Bash\" or \"Bash|Write|Edit\"")
+	cmd.Flags().StringVar(&matcher, "matcher", "Bash|Write|Edit|MultiEdit|NotebookEdit", "Tool matcher (regex). Covers the guard-modeled tools by default: Bash plus the file mutators")
 	cmd.Flags().StringVar(&command, "command", "agentcontainer guard hook", "Hook command to run")
 	cmd.Flags().StringVar(&write, "write", "", "Merge into this settings file instead of printing")
 	cmd.Flags().BoolVar(&managed, "managed", false, "Target the system managed-settings.json (implies --write that path)")

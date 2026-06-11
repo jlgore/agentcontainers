@@ -77,12 +77,67 @@ func TestDecideEscalatesAndHumanDenies(t *testing.T) {
 	}
 }
 
-func TestDecideAllowsNonBashTool(t *testing.T) {
+func TestDecideAllowsUnmodeledTool(t *testing.T) {
 	svc := newTestService(t, nil)
-	in, _ := json.Marshal(map[string]string{"file_path": "/etc/passwd", "content": "x"})
-	v := svc.Decide(context.Background(), Request{ToolName: "Write", ToolInput: in})
+	in, _ := json.Marshal(map[string]string{"url": "https://example.com"})
+	v := svc.Decide(context.Background(), Request{ToolName: "WebFetch", ToolInput: in})
 	if v.Decision != DecisionAllow {
-		t.Fatalf("decision = %q, want allow (Write not yet gated)", v.Decision)
+		t.Fatalf("decision = %q, want allow (tool not modeled by the guard)", v.Decision)
+	}
+}
+
+func writeReq(tool, field, path, cwd string) Request {
+	in, _ := json.Marshal(map[string]string{field: path, "content": "x"})
+	return Request{ToolName: tool, ToolInput: in, Cwd: cwd}
+}
+
+// noActiveCase clears VHIR_CASE_DIR so the output-path policy uses its
+// no-case branch (writes confined to /tmp + cwd), independent of the
+// developer's environment.
+func noActiveCase(t *testing.T) { t.Helper(); t.Setenv("VHIR_CASE_DIR", "") }
+
+func TestDecideAllowsWriteInsideCwd(t *testing.T) {
+	noActiveCase(t)
+	svc := newTestService(t, nil)
+	v := svc.Decide(context.Background(), writeReq("Write", "file_path", "/workspace/notes.txt", "/workspace"))
+	if v.Decision != DecisionAllow {
+		t.Fatalf("decision = %q (reason %q), want allow for a write inside cwd", v.Decision, v.Reason)
+	}
+}
+
+func TestDecideDeniesWriteOutsideCwd(t *testing.T) {
+	// A write to a system path outside the agent's cwd must not slip past the
+	// guard the way it did when only Bash was gated.
+	noActiveCase(t)
+	svc := newTestService(t, nil)
+	for _, tc := range []struct{ tool, field, path string }{
+		{"Write", "file_path", "/etc/passwd"},
+		{"Edit", "file_path", "/usr/local/bin/x"},
+		{"MultiEdit", "file_path", "/root/.bashrc"},
+		{"NotebookEdit", "notebook_path", "/etc/evil.ipynb"},
+	} {
+		v := svc.Decide(context.Background(), writeReq(tc.tool, tc.field, tc.path, "/workspace"))
+		if v.Decision != DecisionDeny {
+			t.Errorf("%s %s: decision = %q, want deny", tc.tool, tc.path, v.Decision)
+		}
+		if v.Reason == "" {
+			t.Errorf("%s %s: expected a denial reason", tc.tool, tc.path)
+		}
+	}
+}
+
+func TestDecideWriteEscalatesToHuman(t *testing.T) {
+	noActiveCase(t)
+	broker := approval.NewToolCallBroker(5 * time.Second)
+	go autoResolve(broker, true, "carol")
+	svc := newTestService(t, broker)
+
+	v := svc.Decide(context.Background(), writeReq("Write", "file_path", "/etc/hosts", "/workspace"))
+	if v.Decision != DecisionAllow {
+		t.Fatalf("decision = %q (reason %q), want allow after human approval", v.Decision, v.Reason)
+	}
+	if v.Decider != "carol" {
+		t.Errorf("decider = %q, want carol", v.Decider)
 	}
 }
 

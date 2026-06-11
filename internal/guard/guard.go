@@ -1,7 +1,8 @@
-// Package guard evaluates an AI agent's own tool calls — Claude Code's Bash,
-// and (later) Write/Edit/WebFetch — against the same OPA policy that gates the
-// MCP forensic tools, escalating policy denials to a human via the approval
-// broker and recording every decision in the audit log.
+// Package guard evaluates an AI agent's own tool calls — Claude Code's Bash
+// (shell commands) and its file-mutating tools (Write/Edit/MultiEdit/
+// NotebookEdit) — against the same OPA policy that gates the MCP forensic
+// tools, escalating policy denials to a human via the approval broker and
+// recording every decision in the audit log.
 //
 // It is the out-of-band authority a Claude Code PreToolUse hook consults: the
 // agent runs the thin `agentcontainer guard hook` client inside its container,
@@ -17,6 +18,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -94,17 +97,18 @@ func New(opts Options) *Service {
 // an error: an internal failure (policy engine error, broker unavailable)
 // resolves to a deny — the guard fails closed.
 func (s *Service) Decide(ctx context.Context, req Request) Verdict {
-	line := commandLine(req)
-	if line == "" {
-		// No shell command to reason about (a non-Bash tool, or an empty
-		// command). The shell policy has no say here yet, so allow — the
-		// eBPF floor still applies to anything the command would touch.
-		v := Verdict{Decision: DecisionAllow, Reason: "no shell command to evaluate"}
-		s.record(req, line, v, false)
+	act, ok := s.activity(req)
+	if !ok {
+		// No policy-evaluated action (a tool the guard doesn't model, or an
+		// empty command/path). The semantic policy has no say here, so allow —
+		// the eBPF floor still applies to anything the action would touch.
+		v := Verdict{Decision: DecisionAllow, Reason: "no policy-evaluated action"}
+		s.record(req, "", v, false)
 		return v
 	}
+	line := act.subject
 
-	allowed, reasons, err := s.evaluate(ctx, req, line)
+	allowed, reasons, err := s.evaluate(ctx, req, act.parsed)
 	if err != nil {
 		// Fail CLOSED: a broken policy engine never falls open.
 		v := Verdict{Decision: DecisionDeny, Reason: "policy engine error: " + err.Error()}
@@ -148,12 +152,11 @@ func (s *Service) Decide(ctx context.Context, req Request) Verdict {
 	return v
 }
 
-// evaluate decomposes the shell line and evaluates every sub-command against
-// the policy. It denies if any sub-command denies; reasons are the
-// deduplicated, human-facing union (sift.<pkg> prefixes stripped).
-func (s *Service) evaluate(ctx context.Context, req Request, line string) (allowed bool, reasons []string, err error) {
+// evaluate runs every decomposed sub-command/action against the policy. It
+// denies if any denies; reasons are the deduplicated, human-facing union
+// (sift.<pkg> prefixes stripped).
+func (s *Service) evaluate(ctx context.Context, req Request, parsedList []mcpproxy.Parsed) (allowed bool, reasons []string, err error) {
 	pctx := s.policyContext(req)
-	parsedList := mcpproxy.DecomposeShellLine(line, s.outputFlags)
 	if len(parsedList) == 0 {
 		parsedList = []mcpproxy.Parsed{{}}
 	}
@@ -161,7 +164,7 @@ func (s *Service) evaluate(ctx context.Context, req Request, line string) (allow
 	allowed = true
 	seen := make(map[string]bool)
 	for _, parsed := range parsedList {
-		d, evErr := s.eval.EvaluateParsed(ctx, "agent", req.ToolName, line, parsed, pctx)
+		d, evErr := s.eval.EvaluateParsed(ctx, "agent", req.ToolName, nil, parsed, pctx)
 		if evErr != nil {
 			return false, nil, evErr
 		}
@@ -180,8 +183,15 @@ func (s *Service) evaluate(ctx context.Context, req Request, line string) (allow
 }
 
 // policyContext builds the runtime context document for policy evaluation.
+//
+// case_dir is set (mirroring the MCP proxy, which reads VHIR_CASE_DIR) so the
+// output-path policy is well-defined: the rego rules key off case_dir == ""
+// vs non-empty, and an *absent* field reads as undefined in Rego — which
+// silently disables both the blocked-dir and the catch-all output denials.
+// Empty (no active case) confines file writes to /tmp and the agent's cwd.
 func (s *Service) policyContext(req Request) map[string]any {
 	return map[string]any{
+		"case_dir":  os.Getenv("VHIR_CASE_DIR"),
 		"cwd":       req.Cwd,
 		"examiner":  s.examiner,
 		"sessionId": req.SessionID,
@@ -215,23 +225,86 @@ func (s *Service) record(req Request, line string, v Verdict, escalated bool) {
 	}
 }
 
-// commandLine extracts the shell command a tool call carries, or "" when the
-// tool is not one the shell policy evaluates. Bash is the only shell-bearing
-// Claude Code tool today; Write/Edit/WebFetch get path/network handling in a
-// later stage.
-func commandLine(req Request) string {
-	switch req.ToolName {
-	case "Bash":
+// activity is a tool call decomposed into the policy input the evaluator
+// consumes (parsed sub-commands/actions) plus a human-facing subject used for
+// the audit record and the approval prompt.
+type activity struct {
+	parsed  []mcpproxy.Parsed
+	subject string
+}
+
+// fileMutators are the Claude Code tools that write to the filesystem. Each
+// carries a single target path under the field named here. Gating them closes
+// the hole where an agent bypasses the shell policy by editing files directly
+// (e.g. appending to ~/.bashrc or overwriting /etc/hosts) instead of shelling
+// out. The target path is mapped to parsed.output_paths so the existing
+// output-path policy governs it: without an active case, writes are confined
+// to /tmp and the agent's cwd; anything else (system dirs, home dotfiles)
+// denies and escalates to a human.
+var fileMutators = map[string]string{
+	"Write":        "file_path",
+	"Edit":         "file_path",
+	"MultiEdit":    "file_path",
+	"NotebookEdit": "notebook_path",
+}
+
+// activity decomposes a tool call for policy evaluation. The bool is false when
+// the tool is not one the guard models, or it carries no command/path — the
+// caller treats that as allow (the eBPF floor still applies).
+func (s *Service) activity(req Request) (activity, bool) {
+	switch {
+	case req.ToolName == "Bash":
 		var in struct {
 			Command string `json:"command"`
 		}
-		if err := json.Unmarshal(req.ToolInput, &in); err != nil {
-			return ""
+		if err := json.Unmarshal(req.ToolInput, &in); err != nil || in.Command == "" {
+			return activity{}, false
 		}
-		return in.Command
+		parsed := mcpproxy.DecomposeShellLine(in.Command, s.outputFlags)
+		if len(parsed) == 0 {
+			parsed = []mcpproxy.Parsed{{}}
+		}
+		return activity{parsed: parsed, subject: in.Command}, true
+
 	default:
+		field, ok := fileMutators[req.ToolName]
+		if !ok {
+			return activity{}, false
+		}
+		path := toolPath(req.ToolInput, field)
+		if path == "" {
+			return activity{}, false
+		}
+		// Synthesize a parsed action whose output_paths is the write target.
+		// The binary is the (lowercased) tool name — it matches no denied
+		// binary, so only the path-oriented policies have a say.
+		parsed := mcpproxy.Parsed{
+			Binary:      strings.ToLower(req.ToolName),
+			OutputPaths: []string{path},
+			Args:        []string{path},
+			Via:         "structured",
+		}
+		return activity{parsed: []mcpproxy.Parsed{parsed}, subject: req.ToolName + " " + path}, true
+	}
+}
+
+// toolPath extracts and absolutizes a file path from a tool's input. Claude
+// Code requires absolute paths for file tools, but we resolve lexically (no
+// symlink following) as defense against a relative or "." path slipping
+// through — the policy reasons about a clean absolute path either way.
+func toolPath(raw json.RawMessage, field string) string {
+	var in map[string]any
+	if err := json.Unmarshal(raw, &in); err != nil {
 		return ""
 	}
+	p, _ := in[field].(string)
+	if p == "" {
+		return ""
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		return abs
+	}
+	return filepath.Clean(p)
 }
 
 // deprefix strips the "sift.<pkg>: " prefix from a policy reason for
