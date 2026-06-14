@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/jlgore/agentcontainers/compare/ac-enforcer-v0.1.1...ac-enforcer-v0.1.2) (2026-06-14)
+
+
+### Bug Fixes
+
+* **enforcer:** default omitted egress protocol to tcp ([e7107b0](https://github.com/jlgore/agentcontainers/commit/e7107b08229e542bd54a380a379724e2b931aa61))
+
 ## [0.1.1](https://github.com/jlgore/agentcontainers/compare/ac-enforcer-v0.1.0...ac-enforcer-v0.1.1) (2026-06-14)
 
 
