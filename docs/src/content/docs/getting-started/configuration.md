@@ -187,6 +187,26 @@ Configure the BPF enforcer sidecar:
 | `image` | OCI reference for the agentcontainer-enforcer container |
 | `required` | If `true` (default), `agentcontainer run` fails if the sidecar cannot start. Set to `false` only for local development. |
 | `addr` | gRPC address of a pre-existing sidecar (skip auto-start) |
+| `insecureDev` | If `true`, run the control plane in plaintext (no mTLS). Development-only opt-in; see [control-plane security](/concepts/enforcement/#control-plane-security). Default `false`. |
+
+#### Control-plane security
+
+Managed enforcer sidecars are hardened by default:
+
+- The gRPC port is published only on `127.0.0.1`, never on all host interfaces.
+- The enforcer generates **ephemeral mutual-TLS** credentials at startup
+  (`--creds-dir`). `agentcontainer` retrieves the client certificate over the
+  Docker API and presents it on every call, including health probes. No
+  long-lived keys are stored.
+- The connection profile (address + certificates) is passed explicitly to each
+  client; `agentcontainer` does not rely on `AC_ENFORCER_*` process-global
+  environment variables for managed sidecars.
+
+A **pre-existing** sidecar (`addr` set) is reached with mTLS when
+`AC_ENFORCER_TLS_CA`, `AC_ENFORCER_TLS_CERT`, and `AC_ENFORCER_TLS_KEY` are
+present in the environment. A non-loopback endpoint with no credentials is
+**rejected** unless `insecureDev` is set, which logs a prominent warning. The
+connection is never silently downgraded from TLS to plaintext.
 
 ## Complete example
 

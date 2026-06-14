@@ -84,6 +84,13 @@ type EnforcerConfig struct {
 	// auto-start is skipped entirely. Overridden by AC_ENFORCER_ADDR env var.
 	// Example: "127.0.0.1:50051" or "unix:///run/agentcontainer-enforcer.sock"
 	Addr string `json:"addr,omitempty"`
+
+	// InsecureDev disables mutual TLS on the enforcer control plane, allowing a
+	// plaintext gRPC connection. It is a development-only opt-in: managed
+	// sidecars otherwise run ephemeral mTLS, and a non-loopback plaintext
+	// endpoint is rejected without this flag. A prominent warning is logged
+	// whenever it takes effect. Default: false (mTLS required).
+	InsecureDev bool `json:"insecureDev,omitempty"`
 }
 
 // Capabilities declares what the agent is allowed to do.

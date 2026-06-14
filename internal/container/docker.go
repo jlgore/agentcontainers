@@ -55,6 +55,7 @@ type dockerOptions struct {
 	logger           *zap.Logger
 	stopTimeout      time.Duration
 	enforcementLevel *enforcement.Level
+	strategy         enforcement.Strategy
 }
 
 // defaultDockerOptions returns sensible defaults for the Docker runtime.
@@ -96,10 +97,24 @@ func WithStopTimeout(d time.Duration) DockerOption {
 
 // WithEnforcementLevel sets the enforcement level for the Docker runtime.
 // When set to a level other than LevelNone, a Strategy is created during
-// NewDockerRuntime and used for container security enforcement.
+// NewDockerRuntime from process environment (AC_ENFORCER_*). Prefer
+// WithEnforcementStrategy, which threads an explicit connection profile and
+// does not depend on process-global environment variables.
 func WithEnforcementLevel(level enforcement.Level) DockerOption {
 	return func(o *dockerOptions) {
 		o.enforcementLevel = &level
+	}
+}
+
+// WithEnforcementStrategy injects a pre-built enforcement strategy (e.g. one
+// constructed from a sidecar's connection profile via
+// enforcement.NewStrategyFromProfile). When set it takes precedence over
+// WithEnforcementLevel, so the runtime never has to read AC_ENFORCER_* itself.
+func WithEnforcementStrategy(s enforcement.Strategy) DockerOption {
+	return func(o *dockerOptions) {
+		if s != nil {
+			o.strategy = s
+		}
 	}
 }
 
@@ -126,12 +141,21 @@ func NewDockerRuntime(opts ...DockerOption) (*DockerRuntime, error) {
 		stopTimeout: o.stopTimeout,
 	}
 
-	// Create enforcement strategy if a level was requested.
-	if o.enforcementLevel != nil && *o.enforcementLevel != enforcement.LevelNone {
+	// Prefer an explicitly injected strategy (built from a connection profile).
+	// Fall back to deriving one from the enforcement level via the environment.
+	switch {
+	case o.strategy != nil:
+		d.strategy = o.strategy
+		d.logger.Info("enforcement strategy configured",
+			zap.String("level", d.strategy.Level().String()),
+			zap.String("source", "profile"),
+		)
+	case o.enforcementLevel != nil && *o.enforcementLevel != enforcement.LevelNone:
 		level := *o.enforcementLevel
 		d.strategy = enforcement.NewStrategy(level)
 		d.logger.Info("enforcement strategy configured",
 			zap.String("level", level.String()),
+			zap.String("source", "env"),
 		)
 	}
 

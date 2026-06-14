@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"sync"
 	"time"
@@ -147,6 +148,123 @@ func GRPCOptsFromEnv() ([]GRPCOption, error) {
 	}
 
 	return []GRPCOption{WithInsecure()}, nil
+}
+
+// ConnectionProfile is the complete set of information needed to reach an
+// agentcontainer-enforcer endpoint and authenticate to it. It is threaded
+// explicitly from sidecar startup into every enforcer client (runtime, MCP
+// proxy, health probe), replacing the previous AC_ENFORCER_* process-global
+// environment coupling.
+type ConnectionProfile struct {
+	// Addr is the gRPC endpoint, e.g. "127.0.0.1:50051".
+	Addr string
+
+	// CACertPath, ClientCertPath, and ClientKeyPath are PEM file paths for
+	// mutual TLS. When all three are set the connection uses mTLS. When empty
+	// the connection is plaintext, which is permitted only for a loopback Addr
+	// unless InsecureDev is set.
+	CACertPath     string
+	ClientCertPath string
+	ClientKeyPath  string
+
+	// InsecureDev permits a plaintext connection to a non-loopback endpoint.
+	// It is an explicit development-only opt-in; a prominent warning is logged
+	// whenever it takes effect. Without it, a non-loopback endpoint with no
+	// mTLS material is rejected rather than silently downgraded to plaintext.
+	InsecureDev bool
+}
+
+// HasMTLS reports whether the profile carries a complete mTLS credential set.
+func (p ConnectionProfile) HasMTLS() bool {
+	return p.CACertPath != "" && p.ClientCertPath != "" && p.ClientKeyPath != ""
+}
+
+// isLoopbackEndpoint reports whether addr names a loopback host. A target with
+// no host part (e.g. ":50051") is treated as loopback. Unix sockets, if ever
+// passed, are also loopback.
+func isLoopbackEndpoint(addr string) bool {
+	host := addr
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		host = h
+	}
+	if host == "" || host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// optionsFromProfile builds the gRPC dial options implied by a connection
+// profile, enforcing the TLS policy:
+//   - complete mTLS material → mutual TLS;
+//   - loopback endpoint with no material → plaintext (host-local trust);
+//   - non-loopback endpoint with no material → plaintext only with an explicit
+//     InsecureDev opt-in (logged), otherwise an error.
+//
+// It never silently downgrades a TLS-credentialed profile to plaintext.
+func optionsFromProfile(p ConnectionProfile, warn func(string)) ([]GRPCOption, error) {
+	if p.HasMTLS() {
+		opt, err := WithMTLSConfig(p.ClientCertPath, p.ClientKeyPath, p.CACertPath)
+		if err != nil {
+			return nil, err
+		}
+		return []GRPCOption{opt}, nil
+	}
+	if isLoopbackEndpoint(p.Addr) {
+		return []GRPCOption{WithInsecure()}, nil
+	}
+	if p.InsecureDev {
+		if warn != nil {
+			warn(fmt.Sprintf("SECURITY: connecting to enforcer at %s over PLAINTEXT via insecure-dev opt-in — control-plane traffic, credentials, and policy are unauthenticated and unencrypted; do not use outside development", p.Addr))
+		}
+		return []GRPCOption{WithInsecure()}, nil
+	}
+	return nil, fmt.Errorf("enforcer endpoint %q is not loopback and no mTLS credentials were supplied; provide client cert/key/CA or set the enforcer insecure-dev opt-in", p.Addr)
+}
+
+// NewStrategyFromProfile builds a gRPC enforcement strategy for the given
+// connection profile, applying the TLS policy in optionsFromProfile. Unlike
+// NewStrategy it does not consult process-global environment variables. The
+// optional warn callback receives a one-line message when an insecure-dev
+// plaintext downgrade takes effect.
+func NewStrategyFromProfile(p ConnectionProfile, warn func(string)) (*GRPCStrategy, error) {
+	opts, err := optionsFromProfile(p, warn)
+	if err != nil {
+		return nil, err
+	}
+	return NewGRPCStrategy(p.Addr, opts...)
+}
+
+// DialEnforcer opens a raw gRPC client connection to an enforcer using the
+// connection profile's TLS policy. It is for callers that need an
+// enforcerapi.EnforcerClient (e.g. the MCP proxy) rather than a Strategy. The
+// returned connection is the caller's to close. It never silently downgrades a
+// credentialed profile to plaintext.
+func DialEnforcer(p ConnectionProfile, warn func(string)) (*grpc.ClientConn, error) {
+	opts, err := optionsFromProfile(p, warn)
+	if err != nil {
+		return nil, err
+	}
+	cfg := defaultGRPCConfig()
+	for _, opt := range opts {
+		opt(cfg)
+	}
+	var dialOpt grpc.DialOption
+	switch {
+	case cfg.insecure:
+		dialOpt = grpc.WithTransportCredentials(insecure.NewCredentials())
+	case cfg.tlsConfig != nil:
+		dialOpt = grpc.WithTransportCredentials(credentials.NewTLS(cfg.tlsConfig))
+	default:
+		dialOpt = grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{}))
+	}
+	conn, err := grpc.NewClient(p.Addr, dialOpt)
+	if err != nil {
+		return nil, fmt.Errorf("dial enforcer %q: %w", p.Addr, err)
+	}
+	return conn, nil
 }
 
 // NewGRPCStrategy creates a gRPC-based enforcement strategy that connects

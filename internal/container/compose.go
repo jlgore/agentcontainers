@@ -78,6 +78,7 @@ type composeOptions struct {
 	execFn execCmdFactory
 
 	enforcementLevel *enforcement.Level
+	strategy         enforcement.Strategy
 }
 
 // execCmdFactory builds an *exec.Cmd for the given program and arguments.
@@ -182,6 +183,18 @@ func WithComposeEnforcementLevel(level enforcement.Level) ComposeOption {
 	}
 }
 
+// WithComposeEnforcementStrategy injects a pre-built enforcement strategy
+// constructed from a sidecar connection profile. When set it takes precedence
+// over WithComposeEnforcementLevel so the runtime never reads AC_ENFORCER_*
+// from the environment.
+func WithComposeEnforcementStrategy(s enforcement.Strategy) ComposeOption {
+	return func(o *composeOptions) {
+		if s != nil {
+			o.strategy = s
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // ComposeRuntime
 // ---------------------------------------------------------------------------
@@ -220,12 +233,21 @@ func NewComposeRuntime(opts ...ComposeOption) (*ComposeRuntime, error) {
 		execFn:      o.execFn,
 	}
 
-	// Create enforcement strategy if a level was requested.
-	if o.enforcementLevel != nil && *o.enforcementLevel != enforcement.LevelNone {
+	// Prefer an explicitly injected strategy (built from a connection profile).
+	// Fall back to deriving one from the enforcement level via the environment.
+	switch {
+	case o.strategy != nil:
+		c.strategy = o.strategy
+		c.logger.Info("enforcement strategy configured",
+			zap.String("level", c.strategy.Level().String()),
+			zap.String("source", "profile"),
+		)
+	case o.enforcementLevel != nil && *o.enforcementLevel != enforcement.LevelNone:
 		level := *o.enforcementLevel
 		c.strategy = enforcement.NewStrategy(level)
 		c.logger.Info("enforcement strategy configured",
 			zap.String("level", level.String()),
+			zap.String("source", "env"),
 		)
 	}
 

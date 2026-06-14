@@ -18,12 +18,20 @@ import (
 type mockDockerClient struct {
 	client.APIClient
 
-	imageInspectFn    func(ctx context.Context, ref string, opts ...client.ImageInspectOption) (client.ImageInspectResult, error)
-	imagePullFn       func(ctx context.Context, ref string, opts client.ImagePullOptions) (client.ImagePullResponse, error)
-	containerCreateFn func(ctx context.Context, opts client.ContainerCreateOptions) (client.ContainerCreateResult, error)
-	containerStartFn  func(ctx context.Context, id string, opts client.ContainerStartOptions) (client.ContainerStartResult, error)
-	containerStopFn   func(ctx context.Context, id string, opts client.ContainerStopOptions) (client.ContainerStopResult, error)
-	containerRemoveFn func(ctx context.Context, id string, opts client.ContainerRemoveOptions) (client.ContainerRemoveResult, error)
+	imageInspectFn      func(ctx context.Context, ref string, opts ...client.ImageInspectOption) (client.ImageInspectResult, error)
+	imagePullFn         func(ctx context.Context, ref string, opts client.ImagePullOptions) (client.ImagePullResponse, error)
+	containerCreateFn   func(ctx context.Context, opts client.ContainerCreateOptions) (client.ContainerCreateResult, error)
+	containerStartFn    func(ctx context.Context, id string, opts client.ContainerStartOptions) (client.ContainerStartResult, error)
+	containerStopFn     func(ctx context.Context, id string, opts client.ContainerStopOptions) (client.ContainerStopResult, error)
+	containerRemoveFn   func(ctx context.Context, id string, opts client.ContainerRemoveOptions) (client.ContainerRemoveResult, error)
+	copyFromContainerFn func(ctx context.Context, id string, opts client.CopyFromContainerOptions) (client.CopyFromContainerResult, error)
+}
+
+func (m *mockDockerClient) CopyFromContainer(ctx context.Context, id string, opts client.CopyFromContainerOptions) (client.CopyFromContainerResult, error) {
+	if m.copyFromContainerFn != nil {
+		return m.copyFromContainerFn(ctx, id, opts)
+	}
+	return client.CopyFromContainerResult{}, errors.New("copy not implemented")
 }
 
 func (m *mockDockerClient) ImageInspect(ctx context.Context, ref string, opts ...client.ImageInspectOption) (client.ImageInspectResult, error) {

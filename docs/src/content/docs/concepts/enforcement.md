@@ -134,6 +134,31 @@ There is no in-process BPF and no iptables/nftables. The sidecar model ensures:
 - The agent container has no access to the enforcement mechanism
 - Policy updates are applied atomically via gRPC `Apply` calls
 
+### Control-plane security
+
+The gRPC channel between the runtime and the enforcer is the control plane: it
+carries policy and secret material, so it is authenticated and confined by
+default.
+
+- **Loopback only.** A managed sidecar publishes its gRPC port on `127.0.0.1`,
+  never on `0.0.0.0`, so it is not reachable from off-host.
+- **Ephemeral mutual TLS.** At startup the enforcer generates a self-signed CA
+  and a server/client certificate pair (`--creds-dir`). The runtime retrieves
+  the client certificate over the Docker API and presents it on every RPC,
+  including health probes. Credentials live only for the session.
+- **Explicit profiles.** The endpoint and its certificates are threaded
+  directly into each client (runtime, MCP proxy, health probe) rather than
+  through `AC_ENFORCER_*` process-global environment variables.
+- **No silent downgrade.** TLS is required for any non-loopback endpoint.
+  Plaintext is permitted only for loopback, or for a non-loopback endpoint when
+  the operator sets the development-only `enforcer.insecureDev` opt-in (which
+  logs a prominent warning). A credentialed profile is never downgraded to
+  plaintext.
+
+This applies to both the host Docker runtime and the per-VM enforcer in
+[Sandbox mode](#enforcement-in-sandbox-mode); the Sandbox retrieves the in-VM
+enforcer's credentials the same way, over its private Docker socket.
+
 ## Stats and audit
 
 The enforcer tracks per-cgroup statistics:

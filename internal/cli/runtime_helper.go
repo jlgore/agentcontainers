@@ -10,10 +10,20 @@ import (
 )
 
 // newRuntime creates the appropriate container runtime based on the runtime
-// flag value. Docker and Compose are fully implemented; Sandbox remains
-// unimplemented. When an enforcement level is provided, it is passed to the
-// Docker runtime for policy enforcement wiring.
+// flag value, for management commands (exec, logs, ps, stop, gc) that operate
+// on existing containers without (re)applying enforcement. For the enforcing
+// start path, use newEnforcingRuntime.
 func newRuntime(runtimeFlag string, log *zap.Logger, enfLevel enforcement.Level) (container.Runtime, error) {
+	return newEnforcingRuntime(runtimeFlag, log, enfLevel, nil, false)
+}
+
+// newEnforcingRuntime creates a container runtime wired for enforcement. When a
+// pre-built enforcement strategy is provided (host-local Docker/Compose), it is
+// injected directly so the runtime never reads AC_ENFORCER_* from the
+// environment. The Sandbox runtime starts its own per-VM enforcer, so it
+// receives the enforcement level and the insecure-dev opt-in instead and builds
+// the strategy from the in-VM sidecar's connection profile.
+func newEnforcingRuntime(runtimeFlag string, log *zap.Logger, enfLevel enforcement.Level, strategy enforcement.Strategy, insecureDev bool) (container.Runtime, error) {
 	runtimeType := container.RuntimeType(runtimeFlag)
 
 	// Auto-detect: probe for Sandbox, fall back to Docker.
@@ -27,6 +37,7 @@ func newRuntime(runtimeFlag string, log *zap.Logger, enfLevel enforcement.Level)
 		rt, err := container.NewDockerRuntime(
 			container.WithDockerLogger(log),
 			container.WithEnforcementLevel(enfLevel),
+			container.WithEnforcementStrategy(strategy),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("creating docker runtime: %w", err)
@@ -36,6 +47,7 @@ func newRuntime(runtimeFlag string, log *zap.Logger, enfLevel enforcement.Level)
 		rt, err := container.NewComposeRuntime(
 			container.WithComposeLogger(log),
 			container.WithComposeEnforcementLevel(enfLevel),
+			container.WithComposeEnforcementStrategy(strategy),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("creating compose runtime: %w", err)
@@ -45,6 +57,7 @@ func newRuntime(runtimeFlag string, log *zap.Logger, enfLevel enforcement.Level)
 		rt, err := container.NewSandboxRuntime(
 			container.WithSandboxLogger(log),
 			container.WithSandboxEnforcementLevel(enfLevel),
+			container.WithSandboxInsecureDev(insecureDev),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("creating sandbox runtime: %w", err)

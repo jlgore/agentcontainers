@@ -20,8 +20,6 @@ import (
 	"github.com/moby/moby/client"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/approval"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/config"
@@ -241,20 +239,33 @@ func buildMCPDeps(cfg *config.AgentContainer, log *zap.Logger) (mcpproxy.Deps, f
 	}
 
 	if needsEnforcer {
+		// The MCP proxy runs as its own process; its enforcer endpoint and mTLS
+		// material are supplied explicitly through the environment it is launched
+		// with (AC_ENFORCER_ADDR + AC_ENFORCER_TLS_*). This is external
+		// configuration, not the in-process AC_ENFORCER_ADDR mutation the
+		// control-plane finding targets.
 		addr := os.Getenv("AC_ENFORCER_ADDR")
 		if addr == "" {
 			addr = "127.0.0.1:50051"
+		}
+		profile := enforcement.ConnectionProfile{
+			Addr:           addr,
+			CACertPath:     os.Getenv("AC_ENFORCER_TLS_CA"),
+			ClientCertPath: os.Getenv("AC_ENFORCER_TLS_CERT"),
+			ClientKeyPath:  os.Getenv("AC_ENFORCER_TLS_KEY"),
+			InsecureDev:    mcpEnforcerInsecureDev(cfg),
 		}
 		// grpc.NewClient is lazy — it never dials. Without an eager probe,
 		// an unreachable enforcer surfaces only at the first backend
 		// launch, after audit sinks and approval channels are already up.
 		// Reaching this branch means enforcement is required (component
 		// servers need the enforcer runtime; container servers only skip
-		// it via enforcer.required: false), so fail `mcp start` here.
-		if !enforcerHealthProbe(addr) {
-			return deps, cleanup, fmt.Errorf("enforcer at %s failed its gRPC health check; the configured MCP servers require it (kernel enforcement, or the component runtime) — start the enforcer sidecar, point AC_ENFORCER_ADDR at it, or set agent.enforcer.required: false to run container servers without kernel enforcement", addr)
+		// it via enforcer.required: false), so fail `mcp start` here. The probe
+		// uses the same TLS credentials a real client presents.
+		if !enforcerProfileProbe(profile) {
+			return deps, cleanup, fmt.Errorf("enforcer at %s failed its gRPC health check; the configured MCP servers require it (kernel enforcement, or the component runtime) — start the enforcer sidecar, point AC_ENFORCER_ADDR at it (with AC_ENFORCER_TLS_* for mTLS), or set agent.enforcer.required: false to run container servers without kernel enforcement", addr)
 		}
-		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := enforcement.DialEnforcer(profile, func(msg string) { log.Warn(msg) })
 		if err != nil {
 			return deps, cleanup, fmt.Errorf("connecting to enforcer at %s: %w", addr, err)
 		}
@@ -267,8 +278,29 @@ func buildMCPDeps(cfg *config.AgentContainer, log *zap.Logger) (mcpproxy.Deps, f
 
 // enforcerHealthProbe is swappable for tests; the default asks the standard
 // gRPC health service (grpc.health.v1, served by the enforcer sidecar) with
-// a 2-second timeout.
+// a 2-second timeout over plaintext.
 var enforcerHealthProbe = enforcement.ProbeEnforcerHealth
+
+// enforcerProfileProbe is swappable for tests; the default probes the enforcer
+// health service using the connection profile's TLS credentials, so an
+// mTLS-only enforcer is checked exactly as a real client connects. For a
+// plaintext (no-mTLS) profile it delegates to enforcerHealthProbe so both share
+// one probe seam.
+var enforcerProfileProbe = func(p enforcement.ConnectionProfile) bool {
+	if p.HasMTLS() {
+		return enforcement.ProbeEnforcerHealthProfile(p)
+	}
+	return enforcerHealthProbe(p.Addr)
+}
+
+// mcpEnforcerInsecureDev reports whether the agent config opted into a plaintext
+// (no-mTLS) enforcer control plane.
+func mcpEnforcerInsecureDev(cfg *config.AgentContainer) bool {
+	if cfg == nil || cfg.Agent == nil || cfg.Agent.Enforcer == nil {
+		return false
+	}
+	return cfg.Agent.Enforcer.InsecureDev
+}
 
 // buildApprovalChannels stands up the HITL broker and its channels when any
 // configured server declares requireApproval tools. Returns a nil broker

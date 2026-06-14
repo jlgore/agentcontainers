@@ -1292,7 +1292,7 @@ func TestSandboxRuntime_Start_AppliesEnforcement(t *testing.T) {
 		WithDockerClientFactory(factory),
 		WithSandboxEnforcementLevel(enforcement.LevelGRPC),
 		WithSidecarStarter(mockStarter),
-		WithStrategyFactory(func(_ string) (enforcement.Strategy, error) {
+		WithStrategyFactory(func(_ enforcement.ConnectionProfile) (enforcement.Strategy, error) {
 			return strat, nil
 		}),
 	)
@@ -1354,7 +1354,7 @@ func TestSandboxRuntime_Start_StrategyFactoryError_NonFatal(t *testing.T) {
 		WithDockerClientFactory(factory),
 		WithSandboxEnforcementLevel(enforcement.LevelGRPC),
 		WithSidecarStarter(mockStarter),
-		WithStrategyFactory(func(_ string) (enforcement.Strategy, error) {
+		WithStrategyFactory(func(_ enforcement.ConnectionProfile) (enforcement.Strategy, error) {
 			return nil, fmt.Errorf("gRPC dial failed")
 		}),
 	)
@@ -1422,7 +1422,7 @@ func TestSandboxRuntime_Start_ApplyError_NonFatal(t *testing.T) {
 		WithDockerClientFactory(factory),
 		WithSandboxEnforcementLevel(enforcement.LevelGRPC),
 		WithSidecarStarter(mockStarter),
-		WithStrategyFactory(func(_ string) (enforcement.Strategy, error) {
+		WithStrategyFactory(func(_ enforcement.ConnectionProfile) (enforcement.Strategy, error) {
 			return strat, nil
 		}),
 	)

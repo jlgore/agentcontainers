@@ -222,9 +222,21 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 	// For Sandbox runtime, the sidecar runs inside the VM (managed by the runtime),
 	// so skip host-level sidecar resolution.
 	var sidecarHandle *sidecar.SidecarHandle
+	var enfStrategy enforcement.Strategy
 	var enfAddr string
+	// livenessProbe checks enforcer reachability from this process using the
+	// same credentials a real client presents; nil disables host-side liveness
+	// (e.g. for an in-VM mTLS enforcer whose credentials live in the runtime).
+	var livenessProbe func(string) bool
 	enfLevel := enforcement.LevelNone
 	var enfSource string
+
+	// insecureDev permits plaintext control-plane connections; it is an explicit
+	// development opt-in surfaced through agent.enforcer.insecureDev.
+	insecureDev := false
+	if cfg.Agent != nil && cfg.Agent.Enforcer != nil {
+		insecureDev = cfg.Agent.Enforcer.InsecureDev
+	}
 
 	if isSandbox {
 		// Sandbox manages its own in-VM enforcer. Set enforcement level to
@@ -233,30 +245,38 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 		enfSource = "in-vm"
 		logger.Info("sandbox runtime: in-VM enforcement, skipping host sidecar")
 	} else {
-		sidecarHandle, enfAddr, err = resolveSidecar(cmd, cfg)
+		sidecarHandle, err = resolveSidecar(cmd, cfg, insecureDev)
 		if err != nil {
 			return fmt.Errorf("run: %w", err)
 		}
 
-		// Determine enforcement level from sidecar resolution.
+		// Build the enforcement strategy from the sidecar's connection profile.
+		// The profile (address + ephemeral mTLS material) is threaded explicitly
+		// into the runtime; no AC_ENFORCER_* environment variable is mutated.
 		if sidecarHandle != nil && sidecarHandle.Addr != "" {
 			enfLevel = enforcement.LevelGRPC
+			enfAddr = sidecarHandle.Addr
 			if sidecarHandle.Managed {
 				enfSource = "auto-started"
 			} else {
 				enfSource = "external"
 			}
-			_ = os.Setenv("AC_ENFORCER_ADDR", enfAddr)
-		} else if enfAddr != "" {
-			// This shouldn't normally occur (handle nil but addr set), but handle it.
-			enfLevel = enforcement.LevelGRPC
-			enfSource = "external"
-			_ = os.Setenv("AC_ENFORCER_ADDR", enfAddr)
+			profile := sidecarHandle.Profile()
+			enfStrategy, err = enforcement.NewStrategyFromProfile(profile, func(msg string) {
+				logger.Warn(msg)
+			})
+			if err != nil {
+				return fmt.Errorf("run: enforcer connection: %w", err)
+			}
+			// Liveness probe uses the same connection profile (mTLS when set).
+			livenessProbe = func(string) bool {
+				return enforcement.ProbeEnforcerHealthProfile(profile)
+			}
 		}
 	}
 	logger.Info("enforcement level resolved", zap.String("level", enfLevel.String()), zap.String("source", enfSource))
 
-	rt, err := newRuntime(runtimeFlag, logger, enfLevel)
+	rt, err := newEnforcingRuntime(runtimeFlag, logger, enfLevel, enfStrategy, insecureDev)
 	if err != nil {
 		return fmt.Errorf("run: %w", err)
 	}
@@ -339,11 +359,14 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 		return fmt.Errorf("run: starting container: %w", err)
 	}
 
-	// For sandbox, read enforcer address from the session (set by the runtime).
+	// For sandbox, the in-VM enforcer address is reported on the session; the
+	// per-VM strategy is built inside the runtime from the sidecar's connection
+	// profile, so no AC_ENFORCER_ADDR mutation is needed here. Host-side liveness
+	// stays disabled (livenessProbe is nil) because the in-VM enforcer's mTLS
+	// credentials live in the runtime, not this process.
 	if isSandbox && session.EnforcerAddr != "" {
 		enfAddr = session.EnforcerAddr
-		_ = os.Setenv("AC_ENFORCER_ADDR", enfAddr)
-		logger.Info("in-VM enforcer address", zap.String("addr", enfAddr))
+		logger.Info("in-VM enforcer address", zap.String("addr", session.EnforcerAddr))
 	}
 
 	// 7b. Log container started and start secret rotation.
@@ -428,8 +451,8 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 	// If enforcement is gRPC and the enforcer becomes unreachable, cancel
 	// the context to trigger container stop (fail-closed).
 	enforcerDead := make(chan struct{})
-	if enfLevel == enforcement.LevelGRPC && enfAddr != "" {
-		go runEnforcerLiveness(ctx, cancel, enfAddr, 10*time.Second, 3, enforcerDead, enforcement.ProbeEnforcerHealth)
+	if enfLevel == enforcement.LevelGRPC && enfAddr != "" && livenessProbe != nil {
+		go runEnforcerLiveness(ctx, cancel, enfAddr, 10*time.Second, 3, enforcerDead, livenessProbe)
 	}
 
 	select {
@@ -529,7 +552,7 @@ func verifyImageSignature(cmd *cobra.Command, cfg *config.AgentContainer, imageR
 
 // resolveSidecar discovers an external sidecar or auto-starts a managed one.
 // Returns a SidecarHandle (possibly nil), the enforcement address to use, and any error.
-func resolveSidecar(cmd *cobra.Command, cfg *config.AgentContainer) (*sidecar.SidecarHandle, string, error) {
+func resolveSidecar(cmd *cobra.Command, cfg *config.AgentContainer, insecureDev bool) (*sidecar.SidecarHandle, error) {
 	var enfCfg *config.EnforcerConfig
 	if cfg.Agent != nil {
 		enfCfg = cfg.Agent.Enforcer
@@ -541,7 +564,10 @@ func resolveSidecar(cmd *cobra.Command, cfg *config.AgentContainer) (*sidecar.Si
 		configAddr = enfCfg.Addr
 	}
 
-	// 1. Check for pre-existing sidecar.
+	// 1. Check for pre-existing sidecar. Its mTLS material, if any, is supplied
+	// out of band through AC_ENFORCER_TLS_* in the environment this process was
+	// launched with (reading explicit external config is not the in-process
+	// global-mutation pattern the control-plane finding targets).
 	result := sidecar.DiscoverExternalSidecar(sidecar.DiscoverOptions{
 		ConfigAddr: configAddr,
 	})
@@ -550,13 +576,20 @@ func resolveSidecar(cmd *cobra.Command, cfg *config.AgentContainer) (*sidecar.Si
 			zap.String("addr", result.Addr),
 			zap.String("source", result.Source),
 		)
-		return &sidecar.SidecarHandle{Addr: result.Addr, Managed: false}, result.Addr, nil
+		return &sidecar.SidecarHandle{
+			Addr:           result.Addr,
+			Managed:        false,
+			CACertPath:     os.Getenv("AC_ENFORCER_TLS_CA"),
+			ClientCertPath: os.Getenv("AC_ENFORCER_TLS_CERT"),
+			ClientKeyPath:  os.Getenv("AC_ENFORCER_TLS_KEY"),
+			InsecureDev:    insecureDev,
+		}, nil
 	}
 
 	// 2. No external sidecar — auto-start if addr override not explicitly set.
 	// If addr is configured but unreachable, that is an error.
 	if configAddr != "" {
-		return nil, "", fmt.Errorf("enforcer addr %q configured but sidecar not reachable", configAddr)
+		return nil, fmt.Errorf("enforcer addr %q configured but sidecar not reachable", configAddr)
 	}
 
 	// 3. Auto-start.
@@ -574,27 +607,32 @@ func resolveSidecar(cmd *cobra.Command, cfg *config.AgentContainer) (*sidecar.Si
 	dockerCli, err := client.New(client.FromEnv)
 	if err != nil {
 		if required {
-			return nil, "", fmt.Errorf("enforcer: docker unavailable: %w", err)
+			return nil, fmt.Errorf("enforcer: docker unavailable: %w", err)
 		}
 		logger.Warn("docker unavailable, enforcement disabled (required: false)", zap.Error(err))
-		return nil, "", nil
+		return nil, nil
 	}
 
 	_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Starting agentcontainer-enforcer sidecar...")
 	handle, err := sidecar.StartSidecar(cmd.Context(), dockerCli, sidecar.StartOptions{
 		Image:    image,
 		Required: required,
+		// Managed host-local sidecar: publish only on loopback and require mTLS
+		// unless the operator explicitly opted into plaintext development mode.
+		HostBindIP:  "127.0.0.1",
+		MTLS:        !insecureDev,
+		InsecureDev: insecureDev,
 	})
 	if err != nil {
-		return nil, "", fmt.Errorf("enforcer: %w", err)
+		return nil, fmt.Errorf("enforcer: %w", err)
 	}
 	if handle == nil {
 		// Only reachable when required: false
 		logger.Warn("enforcer unavailable, enforcement disabled (required: false)")
-		return nil, "", nil
+		return nil, nil
 	}
 
-	return handle, handle.Addr, nil
+	return handle, nil
 }
 
 // buildSecretsManager creates a secrets.Manager from the agent configuration,
