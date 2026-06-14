@@ -1,5 +1,12 @@
 version: 2
 
+# release-please tags the Go CLI component as "ac-vX.Y.Z" (component "ac").
+# Declare the prefix so goreleaser strips it and parses the remaining semver,
+# instead of failing with "invalid semantic version" on the "ac-" prefix.
+monorepo:
+  tag_prefix: ac-
+  dir: .
+
 before:
   hooks:
     - go mod download
