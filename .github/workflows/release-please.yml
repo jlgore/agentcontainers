@@ -58,6 +58,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           COSIGN_EXPERIMENTAL: '1'
+          # Pin goreleaser to the CLI release tag release-please just created
+          # (plain "vX.Y.Z" — the "." component sets include-component-in-tag
+          # false). Avoids git-describe picking the ac-enforcer-* tag at the same
+          # commit, and avoids OSS goreleaser failing to parse a prefixed tag.
+          GORELEASER_CURRENT_TAG: ${{ needs.release-please.outputs.tag_name }}
 
   enforcer-image:
     name: Release enforcer image
