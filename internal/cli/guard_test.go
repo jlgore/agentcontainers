@@ -71,8 +71,13 @@ func TestInstallHookPrint(t *testing.T) {
 		t.Fatalf("unmarshal: %v\n%s", err, out.String())
 	}
 	hooks, ok := frag["hooks"].(map[string]any)
-	if !ok || hooks["PreToolUse"] == nil {
-		t.Fatalf("missing hooks.PreToolUse in %s", out.String())
+	if !ok {
+		t.Fatalf("missing hooks object in %s", out.String())
+	}
+	for _, ev := range []string{"PreToolUse", "PostToolUse", "PostToolUseFailure"} {
+		if hooks[ev] == nil {
+			t.Errorf("missing hooks.%s in %s", ev, out.String())
+		}
 	}
 }
 
@@ -102,13 +107,21 @@ func TestInstallHookMergeIdempotent(t *testing.T) {
 	}
 	var settings struct {
 		Hooks struct {
-			PreToolUse []any `json:"PreToolUse"`
+			PreToolUse         []any `json:"PreToolUse"`
+			PostToolUse        []any `json:"PostToolUse"`
+			PostToolUseFailure []any `json:"PostToolUseFailure"`
 		} `json:"hooks"`
 	}
 	if err := json.Unmarshal(data, &settings); err != nil {
 		t.Fatalf("unmarshal settings: %v", err)
 	}
-	if len(settings.Hooks.PreToolUse) != 1 {
-		t.Fatalf("PreToolUse entries = %d, want 1 (no duplicate)", len(settings.Hooks.PreToolUse))
+	for ev, got := range map[string]int{
+		"PreToolUse":         len(settings.Hooks.PreToolUse),
+		"PostToolUse":        len(settings.Hooks.PostToolUse),
+		"PostToolUseFailure": len(settings.Hooks.PostToolUseFailure),
+	} {
+		if got != 1 {
+			t.Errorf("%s entries = %d, want 1 (no duplicate)", ev, got)
+		}
 	}
 }
