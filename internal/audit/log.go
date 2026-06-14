@@ -81,6 +81,25 @@ func NewLogger(sessionID string, opts ...LoggerOption) (*Logger, error) {
 	}
 
 	path := filepath.Join(l.dir, sessionID+".jsonl")
+	if info, err := os.Stat(path); err == nil && info.Size() > 0 {
+		entries, err := ReadLog(path)
+		if err != nil {
+			return nil, fmt.Errorf("audit: reading existing log: %w", err)
+		}
+		if err := ValidateChain(entries); err != nil {
+			return nil, fmt.Errorf("audit: refusing to append to invalid existing log: %w", err)
+		}
+		for i := range entries {
+			if entries[i].SessionID != sessionID {
+				return nil, fmt.Errorf("audit: existing log entry %d has session ID %q, want %q", i, entries[i].SessionID, sessionID)
+			}
+		}
+		l.sequence = uint64(len(entries))
+		l.prevHash = entries[len(entries)-1].EntryHash
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("audit: inspecting existing log: %w", err)
+	}
+
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("audit: opening log file: %w", err)

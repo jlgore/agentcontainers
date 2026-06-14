@@ -106,14 +106,15 @@ func TestBackendEnforcement(t *testing.T) {
 type fakeDockerClient struct {
 	client.APIClient
 
-	createdConfig *container.Config
-	networkName   string
-	started       bool
-	paused        bool
-	unpaused      bool
-	removed       bool
-	pauseErr      error
-	containerConn net.Conn
+	createdConfig     *container.Config
+	createdHostConfig *container.HostConfig
+	networkName       string
+	started           bool
+	paused            bool
+	unpaused          bool
+	removed           bool
+	pauseErr          error
+	containerConn     net.Conn
 }
 
 func (f *fakeDockerClient) ImageInspect(context.Context, string, ...client.ImageInspectOption) (client.ImageInspectResult, error) {
@@ -135,6 +136,7 @@ func (f *fakeDockerClient) NetworkCreate(_ context.Context, name string, _ clien
 
 func (f *fakeDockerClient) ContainerCreate(_ context.Context, opts client.ContainerCreateOptions) (client.ContainerCreateResult, error) {
 	f.createdConfig = opts.Config
+	f.createdHostConfig = opts.HostConfig
 	return client.ContainerCreateResult{ID: "container-1"}, nil
 }
 
@@ -226,6 +228,7 @@ func TestDialStdioContainerUsesDockerAttachDemux(t *testing.T) {
 	if got := docker.createdConfig.Env; len(got) != 2 || got[0] != "A=1" || got[1] != "B=2" {
 		t.Fatalf("env = %v, want sorted [A=1 B=2]", got)
 	}
+	assertHardenedMCPHostConfig(t, docker.createdHostConfig)
 
 	if err := sc.resume(t.Context()); err != nil {
 		t.Fatalf("resume: %v", err)
@@ -251,6 +254,22 @@ func TestDialStdioContainerUsesDockerAttachDemux(t *testing.T) {
 	}
 	if !docker.removed {
 		t.Fatal("container was not removed during cleanup")
+	}
+}
+
+func assertHardenedMCPHostConfig(t *testing.T, hostCfg *container.HostConfig) {
+	t.Helper()
+	if hostCfg == nil {
+		t.Fatal("container host config is nil")
+	}
+	if !hostCfg.ReadonlyRootfs {
+		t.Error("MCP backend root filesystem must be read-only")
+	}
+	if got := hostCfg.Tmpfs["/run/secrets"]; got == "" {
+		t.Error("MCP backend must have a writable /run/secrets tmpfs")
+	}
+	if len(hostCfg.CapDrop) != 1 || hostCfg.CapDrop[0] != "ALL" {
+		t.Errorf("CapDrop = %v, want [ALL]", hostCfg.CapDrop)
 	}
 }
 
@@ -302,6 +321,7 @@ func TestDialHTTPContainer(t *testing.T) {
 	if !docker.paused {
 		t.Error("container was not frozen before enforcement")
 	}
+	assertHardenedMCPHostConfig(t, docker.createdHostConfig)
 
 	if want := "172.20.0.42:4508"; hc.address != want {
 		t.Errorf("address = %q, want %q", hc.address, want)

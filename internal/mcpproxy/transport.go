@@ -377,8 +377,12 @@ func dialStdioContainer(ctx context.Context, deps Deps, name string, tool *confi
 	hostCfg := &container.HostConfig{
 		Mounts: parseColonMounts(tool.Mounts),
 		// Hardening mirrors the Compose MCP isolation path.
-		CapDrop:     []string{"ALL"},
-		SecurityOpt: []string{"no-new-privileges:true"},
+		CapDrop:        []string{"ALL"},
+		SecurityOpt:    []string{"no-new-privileges:true"},
+		ReadonlyRootfs: true,
+		Tmpfs: map[string]string{
+			"/run/secrets": "rw,nosuid,nodev,noexec,size=256m,mode=1777",
+		},
 	}
 	netCfg := &network.NetworkingConfig{
 		EndpointsConfig: map[string]*network.EndpointSettings{
@@ -529,8 +533,12 @@ func dialHTTPContainer(ctx context.Context, deps Deps, name string, tool *config
 	hostCfg := &container.HostConfig{
 		Mounts: parseColonMounts(tool.Mounts),
 		// Hardening mirrors the stdio and Compose MCP isolation paths.
-		CapDrop:     []string{"ALL"},
-		SecurityOpt: []string{"no-new-privileges:true"},
+		CapDrop:        []string{"ALL"},
+		SecurityOpt:    []string{"no-new-privileges:true"},
+		ReadonlyRootfs: true,
+		Tmpfs: map[string]string{
+			"/run/secrets": "rw,nosuid,nodev,noexec,size=256m,mode=1777",
+		},
 	}
 	netCfg := &network.NetworkingConfig{
 		EndpointsConfig: map[string]*network.EndpointSettings{

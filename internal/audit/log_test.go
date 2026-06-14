@@ -27,6 +27,59 @@ func TestNewLogger(t *testing.T) {
 	}
 }
 
+func TestNewLoggerContinuesExistingChain(t *testing.T) {
+	dir := t.TempDir()
+	actor := Actor{Type: "agent", Name: "claude"}
+
+	first, err := NewLogger("restart-session", WithDir(dir))
+	if err != nil {
+		t.Fatalf("NewLogger first: %v", err)
+	}
+	if err := first.Log(EventExec, actor, WithCommand("first")); err != nil {
+		t.Fatalf("Log first: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close first: %v", err)
+	}
+
+	second, err := NewLogger("restart-session", WithDir(dir))
+	if err != nil {
+		t.Fatalf("NewLogger second: %v", err)
+	}
+	if err := second.Log(EventExec, actor, WithCommand("second")); err != nil {
+		t.Fatalf("Log second: %v", err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatalf("Close second: %v", err)
+	}
+
+	entries, err := ReadLog(filepath.Join(dir, "restart-session.jsonl"))
+	if err != nil {
+		t.Fatalf("ReadLog: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("entries = %d, want 2", len(entries))
+	}
+	if err := ValidateChain(entries); err != nil {
+		t.Fatalf("ValidateChain after restart: %v", err)
+	}
+	if entries[1].Sequence != 1 || entries[1].PrevHash != entries[0].EntryHash {
+		t.Errorf("continued entry = %+v, want sequence 1 linked to first entry", entries[1])
+	}
+}
+
+func TestNewLoggerRefusesInvalidExistingChain(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "broken-session.jsonl")
+	if err := os.WriteFile(path, []byte(`{"sessionId":"broken-session","sequence":0}`+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if _, err := NewLogger("broken-session", WithDir(dir)); err == nil {
+		t.Fatal("NewLogger accepted an invalid existing chain")
+	}
+}
+
 func TestLogEntry(t *testing.T) {
 	dir := t.TempDir()
 	l, err := NewLogger("log-entry-test", WithDir(dir))
