@@ -1,12 +1,16 @@
 //! LSM bprm_check_security hook for process execution enforcement.
 //!
-//! Intercepts execve() and checks the binary's inode against an allowlist:
+//! Intercepts execve() and authorizes the executable's *identity* (device +
+//! inode) against a per-cgroup allowlist:
 //! 0. Check cgroup scoping -- skip non-enforced cgroups.
 //! 1. Read executable inode from linux_binprm->file->f_path.dentry->d_inode.
-//! 2. Check allowed executables map -- allow if inode is present.
-//! 3. Default deny -- block, emit ExecEvent to ring buffer.
+//! 2. Allow only if (device, inode, cgroup) is present in ALLOWED_EXECS.
+//! 3. Otherwise deny (-EACCES). Both allowed and denied attempts are audited.
 //!
-//! Ported from C implementation in internal/ebpf/bpf/lsm/bprm_check.c.
+//! This layer authorizes *which binary* may run. It does not inspect command
+//! arguments — that is the guard layer's responsibility. Once a process is
+//! confirmed to belong to an enforced cgroup, any failure to read or look up
+//! its executable identity is treated as a denial (fail-closed).
 
 use aya_ebpf::helpers::{
     bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid,
@@ -15,12 +19,12 @@ use aya_ebpf::helpers::{
 use aya_ebpf::macros::lsm;
 use aya_ebpf::programs::LsmContext;
 
-use agentcontainer_common::events::{ExecEvent, STAT_PROC_ALLOWED};
-use agentcontainer_common::maps::{FsInodeKey, LSM_ALLOW};
+use agentcontainer_common::events::{ExecEvent, STAT_PROC_ALLOWED, STAT_PROC_BLOCKED};
+use agentcontainer_common::maps::{FsInodeKey, LSM_ALLOW, LSM_DENY};
 
 use crate::maps::{
-    bump_cgroup_stat, ALLOWED_EXECS, CGROUP_STAT_PROC_ALLOWED, ENFORCED_CGROUPS, PROC_EVENTS,
-    PROC_STATS,
+    bump_cgroup_stat, ALLOWED_EXECS, CGROUP_STAT_PROC_ALLOWED, CGROUP_STAT_PROC_BLOCKED,
+    ENFORCED_CGROUPS, PROC_EVENTS, PROC_STATS,
 };
 
 // ---------------------------------------------------------------------------
@@ -118,6 +122,17 @@ fn emit_exec_event(cgroup_id: u64, ino: u64, verdict: u32) {
     }
 }
 
+/// Record a denied execution: bump block stats, audit it, and return LSM_DENY.
+/// `ino` is 0 when the inode could not be read (the identity is unverifiable,
+/// which is itself a denial).
+#[inline(always)]
+fn deny_exec(cgroup_id: u64, ino: u64) -> i32 {
+    bump_stat(STAT_PROC_BLOCKED);
+    bump_cgroup_stat(cgroup_id, CGROUP_STAT_PROC_BLOCKED);
+    emit_exec_event(cgroup_id, ino, 1 /* Verdict::Block */);
+    LSM_DENY
+}
+
 // ---------------------------------------------------------------------------
 // lsm/bprm_check_security -- intercepts process execution (execve).
 // ---------------------------------------------------------------------------
@@ -126,7 +141,10 @@ fn emit_exec_event(cgroup_id: u64, ino: u64, verdict: u32) {
 pub fn ac_bprm_check(ctx: LsmContext) -> i32 {
     match try_bprm_check(&ctx) {
         Ok(ret) => ret,
-        Err(_) => LSM_ALLOW, // Fail-open on BPF read errors (match C behavior)
+        // Fail closed: try_bprm_check only returns Err after the process is
+        // confirmed to belong to an enforced cgroup, so a read failure is an
+        // unverifiable execution and must be denied, not allowed.
+        Err(_) => LSM_DENY,
     }
 }
 
@@ -141,13 +159,13 @@ fn try_bprm_check(ctx: &LsmContext) -> Result<i32, i64> {
     // Read the linux_binprm pointer from the LSM hook's first argument.
     let bprm_ptr: *const LinuxBinprm = unsafe { ctx.arg(0) };
 
-    // Read the executable file pointer from linux_binprm.
+    // Read the executable file pointer from linux_binprm. A missing file or
+    // dentry/inode/superblock means the executable identity cannot be verified;
+    // for an enforced process that is a denial, not an allowance.
     let file_ptr: *const File =
         unsafe { bpf_probe_read_kernel(&(*bprm_ptr).file as *const _ as *const _).map_err(|e| e)? };
     if file_ptr.is_null() {
-        bump_stat(STAT_PROC_ALLOWED);
-        bump_cgroup_stat(cgroup_id, CGROUP_STAT_PROC_ALLOWED);
-        return Ok(LSM_ALLOW);
+        return Ok(deny_exec(cgroup_id, 0));
     }
 
     // Read the dentry pointer from file->f_path.dentry.
@@ -155,9 +173,7 @@ fn try_bprm_check(ctx: &LsmContext) -> Result<i32, i64> {
         bpf_probe_read_kernel(&(*file_ptr).f_path.dentry as *const _ as *const _).map_err(|e| e)?
     };
     if dentry_ptr.is_null() {
-        bump_stat(STAT_PROC_ALLOWED);
-        bump_cgroup_stat(cgroup_id, CGROUP_STAT_PROC_ALLOWED);
-        return Ok(LSM_ALLOW);
+        return Ok(deny_exec(cgroup_id, 0));
     }
 
     // Read the inode pointer from dentry->d_inode.
@@ -165,9 +181,7 @@ fn try_bprm_check(ctx: &LsmContext) -> Result<i32, i64> {
         bpf_probe_read_kernel(&(*dentry_ptr).d_inode as *const _ as *const _).map_err(|e| e)?
     };
     if inode_ptr.is_null() {
-        bump_stat(STAT_PROC_ALLOWED);
-        bump_cgroup_stat(cgroup_id, CGROUP_STAT_PROC_ALLOWED);
-        return Ok(LSM_ALLOW);
+        return Ok(deny_exec(cgroup_id, 0));
     }
 
     // Read the inode number.
@@ -180,9 +194,7 @@ fn try_bprm_check(ctx: &LsmContext) -> Result<i32, i64> {
         bpf_probe_read_kernel(&(*inode_ptr).i_sb as *const _ as *const _).map_err(|e| e)?
     };
     if sb_ptr.is_null() {
-        bump_stat(STAT_PROC_ALLOWED);
-        bump_cgroup_stat(cgroup_id, CGROUP_STAT_PROC_ALLOWED);
-        return Ok(LSM_ALLOW);
+        return Ok(deny_exec(cgroup_id, ino));
     }
 
     let s_dev: u32 =
@@ -197,16 +209,19 @@ fn try_bprm_check(ctx: &LsmContext) -> Result<i32, i64> {
         cgroup_id,
     };
 
-    // Deny-list mode: every exec inside an enforced cgroup is ALLOWED and
-    // audited — the forensic exec trail (kernel_execve events with tool-call
-    // correlation) must be complete. Kernel exec *allowlist* enforcement is
-    // deferred until inode-ancestry matching lands: exact-inode default-deny
-    // would block container-image binaries that policy paths cannot resolve
-    // from the host. ALLOWED_EXECS is still consulted so listed binaries are
-    // distinguishable in stats when allowlist enforcement returns.
-    let _listed = unsafe { ALLOWED_EXECS.get(&key) }.is_some();
-    bump_stat(STAT_PROC_ALLOWED);
-    bump_cgroup_stat(cgroup_id, CGROUP_STAT_PROC_ALLOWED);
-    emit_exec_event(cgroup_id, ino, 0 /* Verdict::Allow */);
-    Ok(LSM_ALLOW)
+    // Allowlist enforcement: an execution is permitted only when its
+    // (device, inode, cgroup) identity is present in ALLOWED_EXECS. Userspace
+    // resolves each configured executable — including PATH-resolved bare names
+    // and shebang interpreters — to its container-namespace inode before the
+    // container is unpaused, so the allowlist reflects the real on-disk files.
+    // Anything else (including an empty allowlist) is denied. Both outcomes are
+    // audited for the forensic exec trail.
+    if unsafe { ALLOWED_EXECS.get(&key) }.is_some() {
+        bump_stat(STAT_PROC_ALLOWED);
+        bump_cgroup_stat(cgroup_id, CGROUP_STAT_PROC_ALLOWED);
+        emit_exec_event(cgroup_id, ino, 0 /* Verdict::Allow */);
+        Ok(LSM_ALLOW)
+    } else {
+        Ok(deny_exec(cgroup_id, ino))
+    }
 }

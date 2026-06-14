@@ -195,6 +195,33 @@ fn prune_windows(items: &mut Vec<ToolWindow>, now: u64) {
     });
 }
 
+/// Container-namespace candidate paths for a bare command `name`, one per
+/// absolute PATH entry in search order (execvp semantics). Relative PATH
+/// entries are ignored — exec from a container must resolve to an absolute
+/// on-disk file.
+fn path_candidates(path_env: &str, name: &str) -> Vec<String> {
+    path_env
+        .split(':')
+        .filter(|d| d.starts_with('/'))
+        .map(|d| format!("{}/{}", d.trim_end_matches('/'), name))
+        .collect()
+}
+
+/// Parse a file's leading bytes; if it is a shebang script (`#!`), return the
+/// interpreter's absolute path (the first whitespace-delimited token after the
+/// `#!`, up to the first newline). None for a non-script or a relative
+/// interpreter (which the kernel rejects anyway).
+fn parse_shebang_interpreter(head: &[u8]) -> Option<String> {
+    let rest = head.strip_prefix(b"#!")?;
+    let line = rest.split(|&b| b == b'\n').next().unwrap_or(rest);
+    let interp = String::from_utf8_lossy(line)
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string();
+    interp.starts_with('/').then_some(interp)
+}
+
 // ===========================================================================
 // Linux implementation — real BPF via aya
 // ===========================================================================
@@ -210,11 +237,17 @@ mod linux {
         tool_identity, CgroupStats, FsInodeKey, LpmDataV4, LpmDataV6, PortKeyV4, SecretAclKey,
         SecretAclValue, SecretToolKey, FS_PERM_READ, FS_PERM_WRITE, LPM_CGROUP_PREFIX,
     };
+    use anyhow::Context as _;
     use aya::maps::lpm_trie::Key as LpmKey;
     use aya::maps::{HashMap as AyaHashMap, LpmTrie, PerCpuHashMap, RingBuf};
     use aya::programs::{CgroupAttachMode, CgroupSkb, CgroupSkbAttachType, CgroupSockAddr, Lsm};
     use aya::{Btf, Ebpf};
     use std::os::unix::fs::MetadataExt;
+
+    /// PATH used to resolve bare command names when the target container exposes
+    /// no PATH of its own. Mirrors the common Debian/Ubuntu default.
+    const DEFAULT_CONTAINER_PATH: &str =
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
     /// Well-known paths where the BPF ELF may be found, in priority order.
     ///
@@ -795,6 +828,104 @@ mod linux {
             }
         }
 
+        /// Map a container-namespace path to the host-visible path the enforcer
+        /// reads through, via `/proc/<init_pid>/root` when a PID is registered.
+        fn host_path_for(&self, container_id: &str, container_path: &str) -> String {
+            match self.container_pids.read().unwrap().get(container_id) {
+                Some(&pid) => format!("/proc/{pid}/root{container_path}"),
+                None => container_path.to_string(),
+            }
+        }
+
+        /// Read the container's `PATH` from its init process environment. None
+        /// if no PID is registered or the variable is absent.
+        fn container_path_env(&self, container_id: &str) -> Option<String> {
+            let pid = *self.container_pids.read().unwrap().get(container_id)?;
+            let data = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+            for kv in data.split(|&b| b == 0) {
+                if let Some(rest) = kv.strip_prefix(b"PATH=") {
+                    return Some(String::from_utf8_lossy(rest).into_owned());
+                }
+            }
+            None
+        }
+
+        /// Resolve a bare command name to its container-namespace path by
+        /// searching the container's `PATH` (falling back to a documented
+        /// default), returning the first directory that holds an executable
+        /// regular file — matching `execvp` semantics.
+        fn resolve_in_path(&self, container_id: &str, name: &str) -> anyhow::Result<String> {
+            let path_env = self
+                .container_path_env(container_id)
+                .unwrap_or_else(|| DEFAULT_CONTAINER_PATH.to_string());
+            for container_path in path_candidates(&path_env, name) {
+                let host = self.host_path_for(container_id, &container_path);
+                if let Ok(meta) = std::fs::metadata(&host) {
+                    if meta.is_file() && (meta.mode() & 0o111) != 0 {
+                        return Ok(container_path);
+                    }
+                }
+            }
+            Err(anyhow::anyhow!(
+                "command {name} not found as an executable in the container PATH ({path_env})"
+            ))
+        }
+
+        /// If `container_path` is a shebang script, return its interpreter's
+        /// absolute path so it too can be allowlisted (the kernel execs the
+        /// interpreter, not the script). Returns None for ELF/other binaries or
+        /// a relative interpreter (which the kernel rejects anyway).
+        fn read_shebang_interpreter(
+            &self,
+            container_id: &str,
+            container_path: &str,
+        ) -> Option<String> {
+            use std::io::Read;
+            let host = self.host_path_for(container_id, container_path);
+            let mut f = std::fs::File::open(&host).ok()?;
+            // "#!" + the first line, bounded.
+            let mut buf = [0u8; 258];
+            let n = f.read(&mut buf).ok()?;
+            parse_shebang_interpreter(&buf[..n])
+        }
+
+        /// Resolve one configured executable spec (absolute path or bare command
+        /// name) into the container-namespace inode triples to allowlist: the
+        /// executable itself plus, for a shebang script, its interpreter. Errors
+        /// if the spec resolves to no real regular file (caller aborts startup).
+        fn resolve_executables(
+            &self,
+            container_id: &str,
+            spec: &str,
+        ) -> anyhow::Result<Vec<(u64, u32, u32)>> {
+            let container_path = if spec.starts_with('/') {
+                spec.to_string()
+            } else if spec.contains('/') {
+                return Err(anyhow::anyhow!(
+                    "executable spec {spec:?} must be an absolute path or a bare command name, \
+                     not a relative path"
+                ));
+            } else {
+                self.resolve_in_path(container_id, spec)?
+            };
+
+            let mut out = Vec::new();
+            let primary = self
+                .resolve_container_inode(container_id, &container_path)
+                .with_context(|| format!("resolve executable {spec} ({container_path})"))?;
+            out.push(primary);
+
+            if let Some(interp) = self.read_shebang_interpreter(container_id, &container_path) {
+                let interp_inode = self
+                    .resolve_container_inode(container_id, &interp)
+                    .with_context(|| {
+                        format!("resolve shebang interpreter {interp} for script {spec}")
+                    })?;
+                out.push(interp_inode);
+            }
+            Ok(out)
+        }
+
         /// Remove entries belonging to `cgroup_id` from a hash map whose key
         /// struct embeds a cgroup_id (extracted via `key_cgroup`).
         fn cleanup_hash_entries<K: aya::Pod, V: aya::Pod>(
@@ -1356,29 +1487,39 @@ mod linux {
             let cgroup_id = self.lookup_cgroup(container_id)?;
             info!(container_id, cgroup_id, binaries = ?policy.allowed_binaries, "applying process policy to BPF maps");
 
-            let mut bpf = self.programs.lock().unwrap();
-
+            // Resolve every configured executable first. bprm_check is
+            // default-deny, so an executable that cannot be resolved uniquely
+            // and safely must abort startup rather than be silently skipped
+            // (which would leave it un-runnable with no signal). Resolving
+            // before any map mutation also avoids a partial allowlist.
+            let mut keys: Vec<(FsInodeKey, String)> = Vec::new();
             for binary in &policy.allowed_binaries {
-                match self.resolve_container_inode(container_id, binary) {
-                    Ok((inode, dev_major, dev_minor)) => {
-                        let key = FsInodeKey {
+                let inodes = self.resolve_executables(container_id, binary)?;
+                for (inode, dev_major, dev_minor) in inodes {
+                    keys.push((
+                        FsInodeKey {
                             inode,
                             dev_major,
                             dev_minor,
                             cgroup_id,
-                        };
-                        let map_data = bpf
-                            .map_mut("ALLOWED_EXECS")
-                            .ok_or_else(|| anyhow::anyhow!("BPF map ALLOWED_EXECS not found"))?;
-                        let mut map: AyaHashMap<_, FsInodeKey, u8> =
-                            AyaHashMap::try_from(map_data)?;
-                        map.insert(key, 1, 0)?;
-                        info!(binary, inode, "added binary inode to ALLOWED_EXECS");
-                    }
-                    Err(e) => {
-                        warn!(binary, error = %e, "failed to resolve binary inode, skipping");
-                    }
+                        },
+                        binary.clone(),
+                    ));
                 }
+            }
+
+            let mut bpf = self.programs.lock().unwrap();
+            let map_data = bpf
+                .map_mut("ALLOWED_EXECS")
+                .ok_or_else(|| anyhow::anyhow!("BPF map ALLOWED_EXECS not found"))?;
+            let mut map: AyaHashMap<_, FsInodeKey, u8> = AyaHashMap::try_from(map_data)?;
+            for (key, binary) in &keys {
+                map.insert(key, 1, 0)?;
+                info!(
+                    binary,
+                    inode = key.inode,
+                    "added binary inode to ALLOWED_EXECS"
+                );
             }
 
             Ok(())
@@ -2128,5 +2269,42 @@ mod tests {
         assert_eq!(due.len(), 1);
         assign_correlation(&mut due[0], &w);
         assert_eq!(due[0].correlation_id, "call-1");
+    }
+
+    #[test]
+    fn path_candidates_preserves_order_and_skips_relative() {
+        let got = path_candidates("/usr/bin:rel:/bin:", "ls");
+        assert_eq!(got, vec!["/usr/bin/ls".to_string(), "/bin/ls".to_string()]);
+    }
+
+    #[test]
+    fn path_candidates_trims_trailing_slash() {
+        assert_eq!(path_candidates("/bin/", "sh"), vec!["/bin/sh".to_string()]);
+    }
+
+    #[test]
+    fn parse_shebang_extracts_absolute_interpreter() {
+        assert_eq!(
+            parse_shebang_interpreter(b"#!/bin/sh\necho hi\n"),
+            Some("/bin/sh".to_string())
+        );
+        // Interpreter with an argument: only the interpreter path is taken.
+        assert_eq!(
+            parse_shebang_interpreter(b"#!/usr/bin/env python3\n"),
+            Some("/usr/bin/env".to_string())
+        );
+        // Leading spaces after #! are tolerated.
+        assert_eq!(
+            parse_shebang_interpreter(b"#!  /bin/bash\n"),
+            Some("/bin/bash".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_shebang_rejects_non_scripts_and_relative() {
+        assert_eq!(parse_shebang_interpreter(b"\x7fELF......"), None);
+        assert_eq!(parse_shebang_interpreter(b"#!sh\n"), None); // relative
+        assert_eq!(parse_shebang_interpreter(b"#!\n"), None); // empty
+        assert_eq!(parse_shebang_interpreter(b""), None);
     }
 }

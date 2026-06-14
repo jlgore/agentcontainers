@@ -336,10 +336,58 @@ async fn test_process_apply_nonexistent_binary() {
         allowed_binaries: vec!["/nonexistent/binary/path/should/not/exist".into()],
     };
 
-    // Should succeed — non-existent paths are skipped with a warning.
-    mgr.apply_process("test-proc-noent", &policy).await.unwrap();
+    // bprm_check is default-deny, so an executable that cannot be resolved must
+    // fail apply (reject startup) rather than be silently skipped.
+    let result = mgr.apply_process("test-proc-noent", &policy).await;
+    assert!(
+        result.is_err(),
+        "an unresolvable executable must fail process-policy application"
+    );
 
     mgr.unregister("test-proc-noent").await.unwrap();
+}
+
+/// A bare command name resolves against the (default) container PATH and is
+/// added to the allowlist by inode.
+#[tokio::test]
+#[serial]
+async fn test_process_resolves_bare_command_via_path() {
+    let mgr = BpfPolicyManager::new().unwrap();
+    let cgroup = own_cgroup_path();
+    mgr.register("test-proc-path", &cgroup, 0).await.unwrap();
+
+    // "true" exists in the default PATH on any Linux system.
+    let policy = ProcessPolicy {
+        allowed_binaries: vec!["true".into()],
+    };
+    mgr.apply_process("test-proc-path", &policy)
+        .await
+        .expect("bare command name should resolve via PATH");
+
+    mgr.unregister("test-proc-path").await.unwrap();
+}
+
+/// A bare command name not present anywhere in PATH fails apply (fail-closed).
+#[tokio::test]
+#[serial]
+async fn test_process_unresolvable_bare_command_fails() {
+    let mgr = BpfPolicyManager::new().unwrap();
+    let cgroup = own_cgroup_path();
+    mgr.register("test-proc-noresolve", &cgroup, 0)
+        .await
+        .unwrap();
+
+    let policy = ProcessPolicy {
+        allowed_binaries: vec!["definitely-not-a-real-binary-xyzzy".into()],
+    };
+    assert!(
+        mgr.apply_process("test-proc-noresolve", &policy)
+            .await
+            .is_err(),
+        "an unresolvable bare command must fail process-policy application"
+    );
+
+    mgr.unregister("test-proc-noresolve").await.unwrap();
 }
 
 // ===========================================================================

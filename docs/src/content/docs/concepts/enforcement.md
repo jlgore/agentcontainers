@@ -71,7 +71,8 @@ Filesystem capabilities are declared in `agent.capabilities.filesystem`:
 
 ### Layer 4: Process enforcement
 
-The BPF LSM `bprm_check_security` hook validates every binary execution against the declared shell capabilities:
+The BPF LSM `bprm_check_security` hook authorizes every binary execution in an
+enforced cgroup against an allowlist of **executable identities**:
 
 ```jsonc
 {
@@ -86,7 +87,29 @@ The BPF LSM `bprm_check_security` hook validates every binary execution against 
 }
 ```
 
-Interpreter injection attacks (e.g., `python3 -c 'import os; os.system("curl ...")'`) are blocked by detecting and denying `-c` and `-e` flags on interpreters.
+The enforcer resolves each allowed command to its container-namespace
+`(device, inode)` before the container is unpaused:
+
+- **Bare command names** (`git`) are resolved against the container's `PATH`
+  (falling back to a documented default PATH), matching `execvp` semantics.
+- **Absolute paths** (`/usr/bin/git`) are resolved directly.
+- **Shebang scripts** also allowlist their interpreter, since the kernel execs
+  the interpreter.
+- An executable that cannot be resolved to a real file **aborts startup** — it
+  is never silently skipped, since that would leave it un-runnable with no signal.
+
+`bprm_check` is **default-deny and fail-closed**: an execution is permitted only
+when its `(device, inode, cgroup)` is in the allowlist. Anything else — an
+unlisted binary, an inode that replaced an allowed path, or any failure to read
+the executable's identity for an enforced process — is denied (`-EACCES`). An
+**empty allowlist therefore denies all new executions**, so process enforcement
+requires the shell capability to enumerate every binary the container runs. Both
+allowed and denied attempts are audited to `PROC_EVENTS`.
+
+This layer authorizes **executable identity** — *which binary* may run. It does
+not inspect command arguments; argument-level policy (e.g. blocking
+`python3 -c '...'` interpreter injection) is the [guard layer's](/concepts/architecture/)
+responsibility.
 
 ### Layer 5: Credential enforcement (CREDLSM)
 
