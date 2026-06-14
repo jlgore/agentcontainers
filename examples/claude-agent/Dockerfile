@@ -35,12 +35,13 @@ RUN apt-get update \
 COPY --from=build /out/agentcontainer /usr/local/bin/agentcontainer
 
 # Managed settings are root-owned and world-readable but NOT writable. They
-# carry ONLY the PreToolUse guard hook — the one thing that must be
-# non-overridable. Auth (an OAuth token or an API key) is supplied per
-# deployment, NOT baked in: a managed apiKeyHelper would take precedence over
-# CLAUDE_CODE_OAUTH_TOKEN and silently break the OAuth flow. Claude Code treats
-# /etc/claude-code/managed-settings.json as its highest-precedence settings
-# source, so the agent cannot remove or rewrite the hook.
+# carry the PreToolUse, PostToolUse, and PostToolUseFailure guard hooks — the
+# one thing that must be non-overridable. Auth (an OAuth token or an API key) is
+# supplied per deployment, NOT baked in: a managed apiKeyHelper would take
+# precedence over CLAUDE_CODE_OAUTH_TOKEN and silently break the OAuth flow.
+# Claude Code treats /etc/claude-code/managed-settings.json as its
+# highest-precedence settings source, so the agent cannot remove or rewrite the
+# hooks.
 COPY examples/claude-agent/managed-settings.json /etc/claude-code/managed-settings.json
 RUN chown root:root /etc/claude-code/managed-settings.json \
     && chmod 0644 /etc/claude-code/managed-settings.json

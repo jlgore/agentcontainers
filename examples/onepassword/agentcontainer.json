@@ -1,22 +1,15 @@
 {
   // 1Password secrets provider example.
-  // Uses the credential-helper provider with the `op` CLI.
+  // Uses the "1password" provider via the `op` CLI.
   // Requires 1Password desktop app for biometric approval.
+  // Inherits filesystem, network, and policy from ../_base; overrides
+  // shell.commands to add "npm run build".
+  "extends": "../_base/agentcontainer.json",
   "name": "onepassword-agent",
-  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
 
   "agent": {
     "capabilities": {
-      "filesystem": {
-        "read": ["/workspace/**", "/run/secrets/**"],
-        "write": ["/workspace/**"]
-      },
-      "network": {
-        "egress": [
-          { "host": "api.github.com", "port": 443 },
-          { "host": "registry.npmjs.org", "port": 443 }
-        ]
-      },
+      // Arrays replace on merge, so re-list the base commands plus the extra.
       "shell": {
         "commands": [
           "npm install",
@@ -30,35 +23,34 @@
 
     "secrets": {
       // GitHub token stored in 1Password.
-      // The op:// URI references an item in your 1Password vault.
-      // Format: op://<vault>/<item>/<field>
+      // Reference the item with structured vault/item/field fields.
       "GITHUB_TOKEN": {
-        "provider": "credential-helper",
-        "path": "op://Development/GitHub PAT/credential",
+        "provider": "1password",
+        "vault": "Development",
+        "item": "GitHub PAT",
+        "field": "credential",
         "ttl": "1h",
         "allowedTools": ["mcp-github"]
       },
 
       // NPM publish token from 1Password.
       "NPM_TOKEN": {
-        "provider": "credential-helper",
-        "path": "op://Development/npm Registry/token",
+        "provider": "1password",
+        "vault": "Development",
+        "item": "npm Registry",
+        "field": "token",
         "ttl": "4h"
       },
 
       // Database connection string from 1Password.
       "DATABASE_URL": {
-        "provider": "credential-helper",
-        "path": "op://Development/Staging DB/connection-string",
+        "provider": "1password",
+        "vault": "Development",
+        "item": "Staging DB",
+        "field": "connection-string",
         "ttl": "1h",
         "allowedTools": ["mcp-postgres"]
       }
-    },
-
-    "policy": {
-      "escalation": "prompt",
-      "auditLog": true,
-      "sessionTimeout": "4h"
     }
   }
 }

@@ -195,7 +195,7 @@ func (f *fakeDockerClient) ContainerRemove(context.Context, string, client.Conta
 
 func TestDialStdioContainerUsesDockerAttachDemux(t *testing.T) {
 	docker := &fakeDockerClient{}
-	sc, err := dialStdioContainer(t.Context(), Deps{Docker: docker, Logger: zaptest.NewLogger(t)}, "sift", config.MCPToolConfig{
+	sc, err := dialStdioContainer(t.Context(), Deps{Docker: docker, Logger: zaptest.NewLogger(t)}, "sift", &config.ContainerTool{
 		Image:   "example/mcp:latest",
 		Command: []string{"mcp-server"},
 		Env:     map[string]string{"B": "2", "A": "1"},
@@ -258,7 +258,7 @@ func TestDialStdioContainerUsesDockerAttachDemux(t *testing.T) {
 // (degraded) rather than failing the backend, and resume is a no-op.
 func TestDialStdioContainerDegradesWhenFreezeUnavailable(t *testing.T) {
 	docker := &fakeDockerClient{pauseErr: errors.New("freezer cgroup controller not available")}
-	sc, err := dialStdioContainer(t.Context(), Deps{Docker: docker, Logger: zaptest.NewLogger(t)}, "sift", config.MCPToolConfig{
+	sc, err := dialStdioContainer(t.Context(), Deps{Docker: docker, Logger: zaptest.NewLogger(t)}, "sift", &config.ContainerTool{
 		Image:   "example/mcp:latest",
 		Command: []string{"mcp-server"},
 	}, "sessionabcdef", "ac-mcp-sessiona")
@@ -282,8 +282,7 @@ func TestDialStdioContainerDegradesWhenFreezeUnavailable(t *testing.T) {
 // to connect to over Streamable HTTP.
 func TestDialHTTPContainer(t *testing.T) {
 	docker := &fakeDockerClient{}
-	hc, err := dialHTTPContainer(t.Context(), Deps{Docker: docker, Logger: zaptest.NewLogger(t)}, "sift", config.MCPToolConfig{
-		Type:      "container",
+	hc, err := dialHTTPContainer(t.Context(), Deps{Docker: docker, Logger: zaptest.NewLogger(t)}, "sift", &config.ContainerTool{
 		Image:     "sift-gateway:demo",
 		Transport: "http",
 		Port:      4508,
@@ -323,8 +322,8 @@ func TestDialHTTPContainer(t *testing.T) {
 // An unset path defaults to "/".
 func TestDialHTTPContainerDefaultPath(t *testing.T) {
 	docker := &fakeDockerClient{}
-	hc, err := dialHTTPContainer(t.Context(), Deps{Docker: docker, Logger: zaptest.NewLogger(t)}, "svc", config.MCPToolConfig{
-		Type: "container", Image: "x:1", Transport: "http", Port: 8080,
+	hc, err := dialHTTPContainer(t.Context(), Deps{Docker: docker, Logger: zaptest.NewLogger(t)}, "svc", &config.ContainerTool{
+		Image: "x:1", Transport: "http", Port: 8080,
 	}, "sessionabcdef", "ac-mcp-sessiona")
 	if err != nil {
 		t.Fatalf("dialHTTPContainer: %v", err)

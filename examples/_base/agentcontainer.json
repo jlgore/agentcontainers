@@ -1,0 +1,38 @@
+{
+  // Shared base for secrets-provider examples.
+  // Other examples set "extends": "../_base/agentcontainer.json" and override
+  // only what differs. Merge semantics: nested objects merge field by field;
+  // scalars and arrays in the child replace the base value entirely. A child
+  // that needs to add to an array (e.g. network.egress) must re-list the base
+  // entries it wants to keep.
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+
+  "agent": {
+    "capabilities": {
+      "filesystem": {
+        "read": ["/workspace/**", "/run/secrets/**"],
+        "write": ["/workspace/**"]
+      },
+      "network": {
+        "egress": [
+          { "host": "api.github.com", "port": 443 },
+          { "host": "registry.npmjs.org", "port": 443 }
+        ]
+      },
+      "shell": {
+        "commands": [
+          "npm install",
+          "npm test",
+          "git status",
+          "git diff"
+        ]
+      }
+    },
+
+    "policy": {
+      "escalation": "prompt",
+      "auditLog": true,
+      "sessionTimeout": "4h"
+    }
+  }
+}

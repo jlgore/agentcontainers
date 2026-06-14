@@ -3,6 +3,7 @@ package secrets
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/oidc"
@@ -86,11 +87,17 @@ func (p *OIDCProvider) Resolve(_ context.Context, ref SecretRef) (*Secret, error
 		ttl = oidc.MaxTTL
 	}
 
+	var scopes []string
+	if scopeStr := ref.Params["scope"]; scopeStr != "" {
+		scopes = strings.Split(scopeStr, ",")
+	}
+
 	token, err := p.issuer.Mint(oidc.MintOptions{
 		Subject:     subject,
 		Audience:    []string{audience},
 		ContainerID: p.containerID,
 		TTL:         ttl,
+		Scopes:      scopes,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("secrets: oidc: mint: %w", err)

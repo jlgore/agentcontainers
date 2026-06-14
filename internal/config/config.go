@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
@@ -32,8 +33,19 @@ type AgentContainer struct {
 	Features map[string]any `json:"features,omitempty"`
 	Mounts   []string       `json:"mounts,omitempty"`
 
+	// Extends is the path to a base agentcontainer.json (relative to this
+	// file's directory) that this config inherits from. The base is loaded
+	// first, then this config is merged over it: scalars and slices in the
+	// child replace those in the base; nested objects merge field by field.
+	Extends string `json:"extends,omitempty"`
+
 	// Agent-specific extensions.
 	Agent *AgentConfig `json:"agent,omitempty"`
+
+	// unknownFields holds dotted paths of keys present in the source document
+	// that do not map to any schema field. Populated at parse time and
+	// surfaced by Validate(). Not serialized.
+	unknownFields []string
 }
 
 // BuildConfig holds container build settings.
@@ -45,6 +57,10 @@ type BuildConfig struct {
 
 // AgentConfig holds all agent-specific configuration under the "agent" key.
 type AgentConfig struct {
+	// OrgPolicy is an OCI reference to a published org policy artifact. When
+	// set (and no --org-policy flag overrides it), the policy is extracted and
+	// merged into this config at runtime. Deny always wins.
+	OrgPolicy    string                  `json:"orgPolicy,omitempty"`
 	Capabilities *Capabilities           `json:"capabilities,omitempty"`
 	Tools        *ToolsConfig            `json:"tools,omitempty"`
 	Secrets      map[string]SecretConfig `json:"secrets,omitempty"`
@@ -165,12 +181,15 @@ type ToolsConfig struct {
 	Skills map[string]SkillConfig   `json:"skills,omitempty"`
 }
 
-// MCPToolConfig declares an MCP server tool.
+// MCPToolConfig is the JSON wire shape for an MCP server tool. It is a flat
+// superset of every type's fields; which fields are legal depends on Type.
 //
-// Validation is type-driven: each type has an allowlist of valid fields
-// (see validateMCPTool). Remote servers must not declare enforcement the
-// runtime cannot deliver — kernel-class policy fields are validation
-// errors on remote, not silent no-ops.
+// Validation is type-driven and falls out of resolution: Resolve maps the
+// wire struct onto a typed accessor view (ContainerTool, ComponentTool, or
+// RemoteTool) that exposes only the fields legal for that type, returning an
+// error for every field that is set but not permitted. Remote servers must
+// not declare enforcement the runtime cannot deliver — kernel-class policy
+// fields are validation errors on remote, not silent no-ops.
 type MCPToolConfig struct {
 	// Type is the tool hosting model: "container" (default), "component"
 	// (WASM Component), or "remote" (URL endpoint, no container lifecycle,
@@ -213,8 +232,60 @@ type MCPToolConfig struct {
 	Env map[string]string `json:"env,omitempty"`
 
 	// Policy declares per-server enforcement rules. Valid on all types;
-	// which sub-fields are valid depends on type (see validateMCPTool).
+	// which sub-fields are valid depends on type (see Resolve).
 	Policy *MCPServerPolicy `json:"policy,omitempty"`
+}
+
+// MCPKind is the resolved hosting model of an MCP tool. Type "" resolves to
+// KindContainer.
+type MCPKind string
+
+const (
+	KindContainer MCPKind = "container"
+	KindComponent MCPKind = "component"
+	KindRemote    MCPKind = "remote"
+)
+
+// ResolvedTool is a discriminated, type-checked view of an MCPToolConfig.
+// Exactly one of Container/Component/Remote is non-nil, selected by Kind.
+// Resolve is the only constructor; a ResolvedTool therefore witnesses that
+// the underlying wire struct passed type-appropriate validation.
+type ResolvedTool struct {
+	Name      string
+	Kind      MCPKind
+	Container *ContainerTool
+	Component *ComponentTool
+	Remote    *RemoteTool
+}
+
+// ContainerTool exposes the fields legal for a container-type MCP tool.
+type ContainerTool struct {
+	Image        string
+	Capabilities []string
+	Secrets      []string
+	Mounts       []string
+	Transport    string
+	Port         int
+	Path         string
+	Command      []string
+	Env          map[string]string
+	Policy       *MCPServerPolicy
+}
+
+// ComponentTool exposes the fields legal for a component-type MCP tool.
+type ComponentTool struct {
+	Image        string
+	Capabilities []string
+	Secrets      []string
+	Limits       *ComponentLimits
+	Policy       *MCPServerPolicy
+}
+
+// RemoteTool exposes the fields legal for a remote-type MCP tool.
+type RemoteTool struct {
+	URL          string
+	Capabilities []string
+	Policy       *MCPServerPolicy
 }
 
 // MCPServerPolicy declares per-MCP-server enforcement rules evaluated by
@@ -295,6 +366,10 @@ type SecretConfig struct {
 	Path         string   `json:"path,omitempty"`
 	Key          string   `json:"key,omitempty"`
 	Mount        string   `json:"mount,omitempty"`
+	Vault        string   `json:"vault,omitempty"`
+	Item         string   `json:"item,omitempty"`
+	Field        string   `json:"field,omitempty"`
+	Scope        []string `json:"scope,omitempty"`
 	AllowedTools []string `json:"allowedTools,omitempty"`
 }
 
@@ -348,11 +423,93 @@ func ParseFile(path string) (*AgentContainer, error) {
 }
 
 func parseFile(path string) (*AgentContainer, error) {
+	return parseFileDepth(path, 0)
+}
+
+// maxExtendsDepth bounds the extends inheritance chain to guard against
+// cycles and pathological nesting.
+const maxExtendsDepth = 16
+
+func parseFileDepth(path string, depth int) (*AgentContainer, error) {
+	if depth > maxExtendsDepth {
+		return nil, fmt.Errorf("extends chain too deep (>%d); possible cycle at %s", maxExtendsDepth, path)
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading file: %w", err)
 	}
 
+	standardized, err := hujson.Standardize(data)
+	if err != nil {
+		return nil, fmt.Errorf("standardizing JSONC: %w", err)
+	}
+
+	var rawChild map[string]any
+	if err := json.Unmarshal(standardized, &rawChild); err != nil {
+		return nil, fmt.Errorf("unmarshaling config: %w", err)
+	}
+
+	// Resolve extends: load the base (relative to this file's directory),
+	// then overlay this config's keys on top. The merged map is what we
+	// unmarshal and validate, so unknown-field detection sees the effective
+	// document.
+	if ext, ok := rawChild["extends"].(string); ok && ext != "" {
+		basePath := ext
+		if !filepath.IsAbs(basePath) {
+			basePath = filepath.Join(filepath.Dir(path), ext)
+		}
+		baseData, err := os.ReadFile(basePath)
+		if err != nil {
+			return nil, fmt.Errorf("reading extends base %q: %w", ext, err)
+		}
+		baseStd, err := hujson.Standardize(baseData)
+		if err != nil {
+			return nil, fmt.Errorf("standardizing extends base %q: %w", ext, err)
+		}
+		var rawBase map[string]any
+		if err := json.Unmarshal(baseStd, &rawBase); err != nil {
+			return nil, fmt.Errorf("unmarshaling extends base %q: %w", ext, err)
+		}
+		// Recurse so the base may itself extend another file (depth-bounded).
+		if _, err := parseFileDepth(basePath, depth+1); err != nil {
+			return nil, err
+		}
+		delete(rawChild, "extends")
+		delete(rawBase, "extends")
+		rawChild = mergeMaps(rawBase, rawChild)
+	}
+
+	merged, err := json.Marshal(rawChild)
+	if err != nil {
+		return nil, fmt.Errorf("re-marshaling merged config: %w", err)
+	}
+	return parseBytes(merged)
+}
+
+// mergeMaps overlays child onto base. Nested objects merge field by field;
+// every other value (scalars, arrays) in child replaces the base value.
+func mergeMaps(base, child map[string]any) map[string]any {
+	out := make(map[string]any, len(base)+len(child))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, cv := range child {
+		if bv, ok := out[k]; ok {
+			bm, bok := bv.(map[string]any)
+			cm, cok := cv.(map[string]any)
+			if bok && cok {
+				out[k] = mergeMaps(bm, cm)
+				continue
+			}
+		}
+		out[k] = cv
+	}
+	return out
+}
+
+// parseBytes standardizes JSONC source bytes and unmarshals them into an
+// AgentContainer, recording any unknown fields for Validate() to surface.
+func parseBytes(data []byte) (*AgentContainer, error) {
 	// Standardize JSONC to plain JSON by stripping comments and trailing commas.
 	// This works for both .json and .jsonc files — valid JSON passes through unchanged.
 	standardized, err := hujson.Standardize(data)
@@ -365,13 +522,101 @@ func parseFile(path string) (*AgentContainer, error) {
 		return nil, fmt.Errorf("unmarshaling config: %w", err)
 	}
 
+	// Detect keys present in the source that map to no schema field so they
+	// surface as validation errors instead of being silently dropped.
+	cfg.unknownFields = detectUnknownFields(standardized)
+
 	return &cfg, nil
+}
+
+// detectUnknownFields decodes the standardized JSON into a generic map and
+// compares it against the AgentContainer schema, returning the dotted paths of
+// any keys that do not map to a known field. Unlike json.Decoder's
+// DisallowUnknownFields, this collects every unknown key in a single pass
+// rather than failing on the first one.
+func detectUnknownFields(data []byte) []string {
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil
+	}
+	var unknown []string
+	walkUnknownFields("", reflect.TypeOf(AgentContainer{}), raw, &unknown)
+	return unknown
+}
+
+// walkUnknownFields recursively compares a decoded JSON object against a struct
+// type, appending dotted paths for keys with no matching json tag.
+func walkUnknownFields(prefix string, t reflect.Type, raw map[string]any, unknown *[]string) {
+	if t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct {
+		return
+	}
+
+	// Build a lookup of json key -> field for this struct.
+	fields := make(map[string]reflect.StructField, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		tag := f.Tag.Get("json")
+		if tag == "" || tag == "-" {
+			continue
+		}
+		name := strings.Split(tag, ",")[0]
+		if name == "" {
+			continue
+		}
+		fields[name] = f
+	}
+
+	for key, val := range raw {
+		f, ok := fields[key]
+		path := key
+		if prefix != "" {
+			path = prefix + "." + key
+		}
+		if !ok {
+			*unknown = append(*unknown, path)
+			continue
+		}
+		// Recurse into nested objects when the field is a struct/pointer.
+		ft := f.Type
+		if ft.Kind() == reflect.Pointer {
+			ft = ft.Elem()
+		}
+		switch ft.Kind() {
+		case reflect.Struct:
+			if child, ok := val.(map[string]any); ok {
+				// ShellCommand accepts a string shorthand or object; skip its
+				// custom-unmarshaled internals to avoid false positives.
+				if ft != reflect.TypeOf(ShellCommand{}) {
+					walkUnknownFields(path, ft, child, unknown)
+				}
+			}
+		case reflect.Map:
+			// map[string]T — recurse into each value against the element type.
+			elem := ft.Elem()
+			if child, ok := val.(map[string]any); ok {
+				for k, v := range child {
+					if vm, ok := v.(map[string]any); ok {
+						walkUnknownFields(path+"."+k, elem, vm, unknown)
+					}
+				}
+			}
+		}
+	}
 }
 
 // Validate checks the AgentContainer configuration for structural correctness.
 // It collects all validation errors and returns them joined via errors.Join.
 func (c *AgentContainer) Validate() error {
 	var errs []error
+
+	// Surface keys that matched no schema field (e.g. typos, or fields used in
+	// examples that the loader would otherwise silently drop).
+	for _, path := range c.unknownFields {
+		errs = append(errs, fmt.Errorf("unknown config field %q", path))
+	}
 
 	// Image or Build must be specified, but not both.
 	hasImage := c.Image != ""
@@ -446,31 +691,87 @@ func (c *AgentContainer) Validate() error {
 	// Validate secrets: Rotation must be a valid duration string if set.
 	if c.Agent != nil {
 		for name, sc := range c.Agent.Secrets {
-			if sc.Rotation != "" {
-				if _, err := time.ParseDuration(sc.Rotation); err != nil {
-					errs = append(errs, fmt.Errorf("agent.secrets[%q].rotation: invalid duration %q: %w", name, sc.Rotation, err))
-				}
-			}
+			errs = append(errs, validateSecret(name, sc)...)
 		}
 	}
 
-	// Validate MCP tool entries.
+	// Validate MCP tool entries. Validation falls out of resolution: each
+	// tool is resolved into its typed view, which rejects fields not legal
+	// for the type.
 	if c.Agent != nil && c.Agent.Tools != nil {
 		for name, tool := range c.Agent.Tools.MCP {
-			errs = append(errs, validateMCPTool(name, tool)...)
+			if _, errs2 := tool.Resolve(name); len(errs2) > 0 {
+				errs = append(errs, errs2...)
+			}
 		}
 	}
 
 	return errors.Join(errs...)
 }
 
-// validateMCPTool enforces the per-type field allowlist for an MCP tool
-// entry. Each type permits a distinct field set:
+// knownSecretProviders is the set of canonical provider identifiers accepted
+// in SecretConfig.Provider. Provider-specific routing (e.g. the op:// CLI vs
+// Connect Server) is selected at runtime via environment, not config.
+var knownSecretProviders = map[string]bool{
+	"env":       true,
+	"oidc":      true,
+	"vault":     true,
+	"infisical": true,
+	"1password": true,
+}
+
+// validateSecret checks a single secret declaration. Structured fields
+// (provider, path, key, mount, role, ...) are canonical. The only URI
+// shorthand still accepted in the provider field is env://NAME; every other
+// scheme (op://, vault://, infisical://, oidc://) must be expressed with
+// structured fields.
+func validateSecret(name string, sc SecretConfig) []error {
+	var errs []error
+	field := func(f string) string { return fmt.Sprintf("agent.secrets[%q].%s", name, f) }
+
+	if sc.Rotation != "" {
+		if _, err := time.ParseDuration(sc.Rotation); err != nil {
+			errs = append(errs, fmt.Errorf("%s: invalid duration %q: %w", field("rotation"), sc.Rotation, err))
+		}
+	}
+
+	switch {
+	case sc.Provider == "":
+		errs = append(errs, fmt.Errorf("%s: provider is required", field("provider")))
+	case strings.HasPrefix(sc.Provider, "env://"):
+		// Accepted shorthand: env://VAR_NAME.
+	case strings.Contains(sc.Provider, "://"):
+		scheme := sc.Provider[:strings.Index(sc.Provider, "://")+3]
+		errs = append(errs, fmt.Errorf("%s: URI shorthand %q is no longer accepted; use structured fields instead (e.g. provider, path, key, mount)", field("provider"), scheme))
+	case !knownSecretProviders[sc.Provider]:
+		errs = append(errs, fmt.Errorf("%s: unknown provider %q (valid: env, oidc, vault, infisical, 1password)", field("provider"), sc.Provider))
+	}
+
+	if sc.Provider == "1password" {
+		if sc.Vault == "" {
+			errs = append(errs, fmt.Errorf("%s: vault is required for the 1password provider", field("vault")))
+		}
+		if sc.Item == "" {
+			errs = append(errs, fmt.Errorf("%s: item is required for the 1password provider", field("item")))
+		}
+	}
+
+	return errs
+}
+
+// Resolve maps the wire MCPToolConfig onto its typed accessor view,
+// validating as it goes. It returns a ResolvedTool whose Kind selects the
+// single non-nil typed view (Container/Component/Remote), plus every
+// validation error encountered. Validation falls out of resolution: any
+// field set on the wire struct but not legal for the resolved type yields an
+// error. Type "" resolves to KindContainer.
+//
+// Per-type field allowlist (the matrix this enforces):
 //
 //	field                                  container  component  remote
 //	image                                  required   required   rejected
 //	url                                    rejected   rejected   required
-//	transport, port                        ok         rejected   rejected
+//	transport, port, path                  ok         rejected   rejected
 //	command, env, mounts                   ok         rejected   rejected
 //	secrets                                ok         ok         rejected
 //	limits                                 rejected   ok         rejected
@@ -478,148 +779,237 @@ func (c *AgentContainer) Validate() error {
 //	  maxConcurrentTools                   ok         ok         ok
 //	policy.network/filesystem/shell/
 //	  securityYaml                         ok         rejected   rejected
-func validateMCPTool(name string, tool MCPToolConfig) []error {
-	var errs []error
+//
+// On a fatal type error (unknown Type) the returned ResolvedTool is zero and
+// the only error describes the invalid type.
+func (t MCPToolConfig) Resolve(name string) (ResolvedTool, []error) {
 	field := func(f string) string { return fmt.Sprintf("agent.tools.mcp[%q].%s", name, f) }
 
-	switch tool.Type {
-	case "", "container", "component", "remote":
-		// Valid values.
+	switch t.Type {
+	case "", "container":
+		return t.resolveContainer(name, field)
+	case "component":
+		return t.resolveComponent(name, field)
+	case "remote":
+		return t.resolveRemote(name, field)
 	default:
-		errs = append(errs, fmt.Errorf("%s: invalid value %q (must be \"container\", \"component\", or \"remote\")", field("type"), tool.Type))
-		return errs
+		return ResolvedTool{}, []error{fmt.Errorf("%s: invalid value %q (must be \"container\", \"component\", or \"remote\")", field("type"), t.Type)}
 	}
-	isComponent := tool.Type == "component"
-	isRemote := tool.Type == "remote"
-	isContainer := !isComponent && !isRemote
+}
 
-	// Image: required for container/component, rejected for remote.
-	if isRemote {
-		if tool.Image != "" {
-			errs = append(errs, fmt.Errorf("%s: image is not valid for remote-type tools", field("image")))
-		}
-	} else if tool.Image == "" {
+func (t MCPToolConfig) resolveContainer(name string, field func(string) string) (ResolvedTool, []error) {
+	var errs []error
+
+	if t.Image == "" {
 		errs = append(errs, fmt.Errorf("%s: image must not be empty", field("image")))
 	}
 
-	// URL: required for remote, rejected otherwise.
-	if isRemote {
-		if tool.URL == "" {
-			errs = append(errs, fmt.Errorf("%s: url is required for remote-type tools", field("url")))
-		} else if u, err := url.Parse(tool.URL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			errs = append(errs, fmt.Errorf("%s: invalid URL %q (must be http or https)", field("url"), tool.URL))
-		}
-	} else if tool.URL != "" {
+	switch t.Transport {
+	case "", "stdio", "http":
+		// Valid values.
+	default:
+		errs = append(errs, fmt.Errorf("%s: invalid value %q (must be \"stdio\" or \"http\")", field("transport"), t.Transport))
+	}
+	if t.Transport == "http" && t.Port <= 0 {
+		errs = append(errs, fmt.Errorf("%s: port must be > 0 when transport is \"http\"", field("port")))
+	}
+	if t.Transport != "http" && t.Port != 0 {
+		errs = append(errs, fmt.Errorf("%s: port is only valid when transport is \"http\"", field("port")))
+	}
+	if t.Transport != "http" && t.Path != "" {
+		errs = append(errs, fmt.Errorf("%s: path is only valid when transport is \"http\"", field("path")))
+	}
+
+	if t.Limits != nil {
+		errs = append(errs, fmt.Errorf("%s: limits are only valid for component-type tools", field("limits")))
+		errs = append(errs, validateLimits(t.Limits, field)...)
+	}
+
+	errs = append(errs, validateSharedPolicy(t.Policy, field)...)
+	errs = append(errs, validateContainerPolicy(t.Policy, field)...)
+
+	view := &ContainerTool{
+		Image:        t.Image,
+		Capabilities: t.Capabilities,
+		Secrets:      t.Secrets,
+		Mounts:       t.Mounts,
+		Transport:    t.Transport,
+		Port:         t.Port,
+		Path:         t.Path,
+		Command:      t.Command,
+		Env:          t.Env,
+		Policy:       t.Policy,
+	}
+	return ResolvedTool{Name: name, Kind: KindContainer, Container: view}, errs
+}
+
+func (t MCPToolConfig) resolveComponent(name string, field func(string) string) (ResolvedTool, []error) {
+	var errs []error
+
+	if t.Image == "" {
+		errs = append(errs, fmt.Errorf("%s: image must not be empty", field("image")))
+	}
+	if t.URL != "" {
 		errs = append(errs, fmt.Errorf("%s: url is only valid for remote-type tools", field("url")))
 	}
-
-	// Transport/port: container only.
-	if isContainer {
-		switch tool.Transport {
-		case "", "stdio", "http":
-			// Valid values.
-		default:
-			errs = append(errs, fmt.Errorf("%s: invalid value %q (must be \"stdio\" or \"http\")", field("transport"), tool.Transport))
-		}
-		if tool.Transport == "http" && tool.Port <= 0 {
-			errs = append(errs, fmt.Errorf("%s: port must be > 0 when transport is \"http\"", field("port")))
-		}
-		if tool.Transport != "http" && tool.Port != 0 {
-			errs = append(errs, fmt.Errorf("%s: port is only valid when transport is \"http\"", field("port")))
-		}
-		if tool.Transport != "http" && tool.Path != "" {
-			errs = append(errs, fmt.Errorf("%s: path is only valid when transport is \"http\"", field("path")))
-		}
-	} else {
-		if tool.Transport != "" {
-			errs = append(errs, fmt.Errorf("%s: transport is only valid for container-type tools", field("transport")))
-		}
-		if tool.Port != 0 {
-			errs = append(errs, fmt.Errorf("%s: port is only valid for container-type tools", field("port")))
-		}
-		if tool.Path != "" {
-			errs = append(errs, fmt.Errorf("%s: path is only valid for container-type tools", field("path")))
-		}
+	if t.Transport != "" {
+		errs = append(errs, fmt.Errorf("%s: transport is only valid for container-type tools", field("transport")))
 	}
-
-	// Command/env/mounts: container only.
-	if !isContainer {
-		if len(tool.Command) > 0 {
-			errs = append(errs, fmt.Errorf("%s: command is only valid for container-type tools", field("command")))
-		}
-		if len(tool.Env) > 0 {
-			errs = append(errs, fmt.Errorf("%s: env is only valid for container-type tools", field("env")))
-		}
+	if t.Port != 0 {
+		errs = append(errs, fmt.Errorf("%s: port is only valid for container-type tools", field("port")))
 	}
-	if isComponent && len(tool.Mounts) > 0 {
+	if t.Path != "" {
+		errs = append(errs, fmt.Errorf("%s: path is only valid for container-type tools", field("path")))
+	}
+	if len(t.Command) > 0 {
+		errs = append(errs, fmt.Errorf("%s: command is only valid for container-type tools", field("command")))
+	}
+	if len(t.Env) > 0 {
+		errs = append(errs, fmt.Errorf("%s: env is only valid for container-type tools", field("env")))
+	}
+	if len(t.Mounts) > 0 {
 		errs = append(errs, fmt.Errorf("%s: mounts are not valid for component-type tools", field("mounts")))
 	}
-	if isRemote && len(tool.Mounts) > 0 {
+	if t.Limits != nil {
+		errs = append(errs, validateLimits(t.Limits, field)...)
+	}
+
+	errs = append(errs, validateSharedPolicy(t.Policy, field)...)
+	errs = append(errs, validateNonContainerPolicy(t.Policy, "component", field)...)
+
+	view := &ComponentTool{
+		Image:        t.Image,
+		Capabilities: t.Capabilities,
+		Secrets:      t.Secrets,
+		Limits:       t.Limits,
+		Policy:       t.Policy,
+	}
+	return ResolvedTool{Name: name, Kind: KindComponent, Component: view}, errs
+}
+
+func (t MCPToolConfig) resolveRemote(name string, field func(string) string) (ResolvedTool, []error) {
+	var errs []error
+
+	if t.Image != "" {
+		errs = append(errs, fmt.Errorf("%s: image is not valid for remote-type tools", field("image")))
+	}
+	if t.URL == "" {
+		errs = append(errs, fmt.Errorf("%s: url is required for remote-type tools", field("url")))
+	} else if u, err := url.Parse(t.URL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		errs = append(errs, fmt.Errorf("%s: invalid URL %q (must be http or https)", field("url"), t.URL))
+	}
+	if t.Transport != "" {
+		errs = append(errs, fmt.Errorf("%s: transport is only valid for container-type tools", field("transport")))
+	}
+	if t.Port != 0 {
+		errs = append(errs, fmt.Errorf("%s: port is only valid for container-type tools", field("port")))
+	}
+	if t.Path != "" {
+		errs = append(errs, fmt.Errorf("%s: path is only valid for container-type tools", field("path")))
+	}
+	if len(t.Command) > 0 {
+		errs = append(errs, fmt.Errorf("%s: command is only valid for container-type tools", field("command")))
+	}
+	if len(t.Env) > 0 {
+		errs = append(errs, fmt.Errorf("%s: env is only valid for container-type tools", field("env")))
+	}
+	if len(t.Mounts) > 0 {
 		errs = append(errs, fmt.Errorf("%s: mounts are not valid for remote-type tools", field("mounts")))
 	}
-
-	// Secrets: rejected on remote (nothing to inject into).
-	if isRemote && len(tool.Secrets) > 0 {
+	if len(t.Secrets) > 0 {
 		errs = append(errs, fmt.Errorf("%s: secrets are not valid for remote-type tools", field("secrets")))
 	}
-
-	// Limits: component only.
-	if !isComponent && tool.Limits != nil {
+	if t.Limits != nil {
 		errs = append(errs, fmt.Errorf("%s: limits are only valid for component-type tools", field("limits")))
-	}
-	if tool.Limits != nil {
-		if tool.Limits.MemoryMB < 0 {
-			errs = append(errs, fmt.Errorf("%s: must be >= 0", field("limits.memory_mb")))
-		}
-		if tool.Limits.TimeoutMs < 0 {
-			errs = append(errs, fmt.Errorf("%s: must be >= 0", field("limits.timeout_ms")))
-		}
-		if tool.Limits.Fuel < 0 {
-			errs = append(errs, fmt.Errorf("%s: must be >= 0", field("limits.fuel")))
-		}
+		errs = append(errs, validateLimits(t.Limits, field)...)
 	}
 
-	// Policy: allowedTools/requireApproval/maxConcurrentTools are valid on
-	// all types; kernel-class fields only on container.
-	if p := tool.Policy; p != nil {
-		if p.MaxConcurrentTools < 0 {
-			errs = append(errs, fmt.Errorf("%s: must be >= 0, got %d", field("policy.maxConcurrentTools"), p.MaxConcurrentTools))
-		}
-		if !isContainer {
-			kind := tool.Type
-			if p.Network != nil {
-				errs = append(errs, fmt.Errorf("%s: network policy is not enforceable for %s-type tools", field("policy.network"), kind))
-			}
-			if p.Filesystem != nil {
-				errs = append(errs, fmt.Errorf("%s: filesystem policy is not enforceable for %s-type tools", field("policy.filesystem"), kind))
-			}
-			if p.Shell != nil {
-				errs = append(errs, fmt.Errorf("%s: shell policy is not enforceable for %s-type tools", field("policy.shell"), kind))
-			}
-			if p.SecurityYAML != "" {
-				errs = append(errs, fmt.Errorf("%s: securityYaml is not enforceable for %s-type tools", field("policy.securityYaml"), kind))
-			}
-		}
-		if p.Shell != nil {
-			for i, cmd := range p.Shell.Commands {
-				if cmd.Binary == "" {
-					errs = append(errs, fmt.Errorf("%s: binary must not be empty", field(fmt.Sprintf("policy.shell.commands[%d]", i))))
-				}
-			}
-		}
-		for toolName, spec := range p.ShellTools {
-			if spec.CommandArg != "" && (spec.BinaryArg != "" || spec.ArgsArg != "") {
-				errs = append(errs, fmt.Errorf("%s: commandArg and binaryArg/argsArg are mutually exclusive", field(fmt.Sprintf("policy.shellTools[%q]", toolName))))
-			}
-		}
-		if p.Network != nil {
-			for i, rule := range p.Network.Egress {
-				if rule.Host == "" {
-					errs = append(errs, fmt.Errorf("%s: host must not be empty", field(fmt.Sprintf("policy.network.egress[%d]", i))))
-				}
+	errs = append(errs, validateSharedPolicy(t.Policy, field)...)
+	errs = append(errs, validateNonContainerPolicy(t.Policy, "remote", field)...)
+
+	view := &RemoteTool{
+		URL:          t.URL,
+		Capabilities: t.Capabilities,
+		Policy:       t.Policy,
+	}
+	return ResolvedTool{Name: name, Kind: KindRemote, Remote: view}, errs
+}
+
+// validateLimits checks the non-negativity of component limit fields. The
+// type-appropriateness of limits is checked by the caller.
+func validateLimits(l *ComponentLimits, field func(string) string) []error {
+	var errs []error
+	if l.MemoryMB < 0 {
+		errs = append(errs, fmt.Errorf("%s: must be >= 0", field("limits.memory_mb")))
+	}
+	if l.TimeoutMs < 0 {
+		errs = append(errs, fmt.Errorf("%s: must be >= 0", field("limits.timeout_ms")))
+	}
+	if l.Fuel < 0 {
+		errs = append(errs, fmt.Errorf("%s: must be >= 0", field("limits.fuel")))
+	}
+	return errs
+}
+
+// validateSharedPolicy checks policy fields legal on every tool type:
+// maxConcurrentTools (>= 0), shell command binaries, shellTools arg shape,
+// and network egress hosts.
+func validateSharedPolicy(p *MCPServerPolicy, field func(string) string) []error {
+	if p == nil {
+		return nil
+	}
+	var errs []error
+	if p.MaxConcurrentTools < 0 {
+		errs = append(errs, fmt.Errorf("%s: must be >= 0, got %d", field("policy.maxConcurrentTools"), p.MaxConcurrentTools))
+	}
+	if p.Shell != nil {
+		for i, cmd := range p.Shell.Commands {
+			if cmd.Binary == "" {
+				errs = append(errs, fmt.Errorf("%s: binary must not be empty", field(fmt.Sprintf("policy.shell.commands[%d]", i))))
 			}
 		}
 	}
+	for toolName, spec := range p.ShellTools {
+		if spec.CommandArg != "" && (spec.BinaryArg != "" || spec.ArgsArg != "") {
+			errs = append(errs, fmt.Errorf("%s: commandArg and binaryArg/argsArg are mutually exclusive", field(fmt.Sprintf("policy.shellTools[%q]", toolName))))
+		}
+	}
+	if p.Network != nil {
+		for i, rule := range p.Network.Egress {
+			if rule.Host == "" {
+				errs = append(errs, fmt.Errorf("%s: host must not be empty", field(fmt.Sprintf("policy.network.egress[%d]", i))))
+			}
+		}
+	}
+	return errs
+}
 
+// validateContainerPolicy is a no-op placeholder: kernel-class policy fields
+// (network/filesystem/shell/securityYaml) are all legal on container-type
+// tools. Kept symmetric with validateNonContainerPolicy for clarity.
+func validateContainerPolicy(_ *MCPServerPolicy, _ func(string) string) []error {
+	return nil
+}
+
+// validateNonContainerPolicy rejects kernel-class policy fields that cannot
+// be enforced without a cgroup (component and remote tools). kind is the
+// tool type label used in the error message.
+func validateNonContainerPolicy(p *MCPServerPolicy, kind string, field func(string) string) []error {
+	if p == nil {
+		return nil
+	}
+	var errs []error
+	if p.Network != nil {
+		errs = append(errs, fmt.Errorf("%s: network policy is not enforceable for %s-type tools", field("policy.network"), kind))
+	}
+	if p.Filesystem != nil {
+		errs = append(errs, fmt.Errorf("%s: filesystem policy is not enforceable for %s-type tools", field("policy.filesystem"), kind))
+	}
+	if p.Shell != nil {
+		errs = append(errs, fmt.Errorf("%s: shell policy is not enforceable for %s-type tools", field("policy.shell"), kind))
+	}
+	if p.SecurityYAML != "" {
+		errs = append(errs, fmt.Errorf("%s: securityYaml is not enforceable for %s-type tools", field("policy.securityYaml"), kind))
+	}
 	return errs
 }

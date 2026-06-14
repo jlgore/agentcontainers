@@ -173,6 +173,20 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 		return fmt.Errorf("run: org policy violation: %w", err)
 	}
 
+	// 1b-ii. An explicit agent.orgPolicy reference points to a dedicated
+	// org policy artifact published separately from the image. Org policy is
+	// strictly additive (deny always wins), so merging it on top of the
+	// image-layer policy can only tighten the effective configuration.
+	if cfg.Agent != nil && cfg.Agent.OrgPolicy != "" {
+		refPolicy, err := orgpolicy.ExtractPolicy(cmd.Context(), cfg.Agent.OrgPolicy)
+		if err != nil {
+			return fmt.Errorf("run: extracting org policy from %s: %w", cfg.Agent.OrgPolicy, err)
+		}
+		if err := orgpolicy.MergePolicy(refPolicy, cfg); err != nil {
+			return fmt.Errorf("run: org policy violation (%s): %w", cfg.Agent.OrgPolicy, err)
+		}
+	}
+
 	// 1c. Verify image signature (F-1) when provenance requires it.
 	// We verify against policyRef (the lockfile-pinned digest) so the
 	// signature check and the policy extraction operate on the same manifest.
@@ -592,11 +606,11 @@ func buildSecretsManager(ctx context.Context, cfg *config.AgentContainer) (*secr
 	var opts []secrets.ManagerOption
 	var cleanups []func()
 
-	// Pre-process secrets to detect URI schemes in the Provider field.
-	// A Provider value like "op://vault/item/field" must be resolved to its
-	// canonical provider name ("1password") before the switch below, otherwise
-	// the raw URI string falls through to the default branch and returns an
-	// "unknown secret provider" error.
+	// Pre-process secrets to expand the env://NAME shorthand into its
+	// canonical provider ("env") plus parsed params. Config validation
+	// rejects every other URI scheme in the provider field, so by the time
+	// we reach this point only env:// shorthand or canonical provider names
+	// remain.
 	processedSecrets := make(map[string]config.SecretConfig, len(cfg.Agent.Secrets))
 	uriRefs := make(map[string]secrets.SecretRef)
 
@@ -713,6 +727,18 @@ func buildSecretsManager(ctx context.Context, cfg *config.AgentContainer) (*secr
 		}
 		if sc.Mount != "" {
 			ref.Params["mount"] = sc.Mount
+		}
+		if sc.Vault != "" {
+			ref.Params["vault"] = sc.Vault
+		}
+		if sc.Item != "" {
+			ref.Params["item"] = sc.Item
+		}
+		if sc.Field != "" {
+			ref.Params["field"] = sc.Field
+		}
+		if len(sc.Scope) > 0 {
+			ref.Params["scope"] = strings.Join(sc.Scope, ",")
 		}
 		refs = append(refs, ref)
 	}

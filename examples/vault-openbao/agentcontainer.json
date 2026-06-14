@@ -2,29 +2,16 @@
   // Vault / OpenBao secrets provider example.
   // Uses Vault Agent sidecar to fetch dynamic credentials.
   // Works with both HashiCorp Vault and OpenBao (API-compatible).
+  // Inherits filesystem/network/shell/policy from ../_base; adds filesystem.deny.
+  "extends": "../_base/agentcontainer.json",
   "name": "vault-agent",
-  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
 
   "agent": {
     "capabilities": {
+      // filesystem merges field by field, so read/write are inherited;
+      // only deny is added here.
       "filesystem": {
-        "read": ["/workspace/**", "/run/secrets/**"],
-        "write": ["/workspace/**"],
         "deny": ["/workspace/.env"]
-      },
-      "network": {
-        "egress": [
-          { "host": "api.github.com", "port": 443 },
-          { "host": "registry.npmjs.org", "port": 443 }
-        ]
-      },
-      "shell": {
-        "commands": [
-          "npm install",
-          "npm test",
-          "git status",
-          "git diff"
-        ]
       }
     },
 
@@ -56,12 +43,6 @@
         "key": "value",
         "ttl": "4h"
       }
-    },
-
-    "policy": {
-      "escalation": "prompt",
-      "auditLog": true,
-      "sessionTimeout": "4h"
     }
   }
 }

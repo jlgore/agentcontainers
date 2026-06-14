@@ -399,10 +399,10 @@ func TestBuildSecretsManager_InfisicalXORValidation(t *testing.T) {
 	}
 }
 
-func TestBuildSecretsManager_URINormalization(t *testing.T) {
-	// A Provider field that is a vault:// URI should be normalised to "vault".
-	// The actual Vault resolve will fail (no server), but the provider wiring
-	// must not return "unknown secret provider".
+func TestBuildSecretsManager_VaultWiring(t *testing.T) {
+	// A vault secret declared with structured fields must wire up the vault
+	// provider. The actual Vault resolve will fail (no server), but the
+	// provider wiring must not return "unknown secret provider".
 	t.Setenv("VAULT_ADDR", "http://127.0.0.1:19200")
 	t.Setenv("VAULT_TOKEN", "test-token")
 
@@ -411,7 +411,7 @@ func TestBuildSecretsManager_URINormalization(t *testing.T) {
 		"image": "alpine:3.19",
 		"agent": {
 			"secrets": {
-				"V": {"provider": "vault://myapp/config"}
+				"V": {"provider": "vault", "path": "myapp/config", "mount": "secret"}
 			}
 		}
 	}`)
@@ -419,7 +419,7 @@ func TestBuildSecretsManager_URINormalization(t *testing.T) {
 	_, _, err := buildSecretsManager(context.Background(), cfg)
 	// Expected: a connection/resolve error from Vault, NOT "unknown secret provider".
 	if err != nil && strings.Contains(err.Error(), "unknown secret provider") {
-		t.Errorf("URI normalization failed: %v", err)
+		t.Errorf("vault provider wiring failed: %v", err)
 	}
 }
 

@@ -301,16 +301,17 @@ func runGuardHook(cmd *cobra.Command, socket string, timeout time.Duration) erro
 		return emitDecision(out, guard.DecisionDeny, "guard: reading hook input failed (fail-closed): "+err.Error())
 	}
 
-	// PostToolUse reports an executed tool (inline mode resolves its ledger).
-	// It carries no permission decision — it cannot block a tool that already
-	// ran — so it fails OPEN: a lost report just leaves the escalation to be
-	// reaped as denied-inferred. PreToolUse (or an older hook sending no event
-	// name) is a policy decision and fails CLOSED.
+	// PostToolUse (success) and PostToolUseFailure (non-zero exit) both report an
+	// executed tool, so inline mode can resolve its ledger from either. They
+	// carry no permission decision — they cannot block a tool that already ran —
+	// so they fail OPEN: a lost report just leaves the escalation to be reaped as
+	// denied-inferred. PreToolUse (or an older hook sending no event name) is a
+	// policy decision and fails CLOSED.
 	var probe struct {
 		HookEventName string `json:"hook_event_name"`
 	}
 	_ = json.Unmarshal(payload, &probe)
-	if probe.HookEventName == "PostToolUse" {
+	if probe.HookEventName == "PostToolUse" || probe.HookEventName == "PostToolUseFailure" {
 		if err := guard.Report(resolveGuardSocket(socket), payload, 5*time.Second, 5*time.Second); err != nil {
 			_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "guard: PostToolUse report failed (ignored):", err)
 		}
@@ -352,9 +353,11 @@ func newGuardInstallHookCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "install-hook",
-		Short: "Emit (or write) the Claude Code settings that wire the PreToolUse hook",
+		Short: "Emit (or write) the Claude Code settings that wire the guard hooks",
 		Long: `Generates the Claude Code settings fragment that routes matching tool
-calls through 'agentcontainer guard hook'.
+calls through 'agentcontainer guard hook'. It wires PreToolUse (the policy
+decision) plus PostToolUse and PostToolUseFailure (execution reports that let
+inline mode resolve its ledger on either outcome).
 
 By default it prints the fragment. With --write <path> it merges the hook into
 an existing settings file. With --managed it targets the system
@@ -378,6 +381,14 @@ tamper-resistant placement for a containerized agent.`,
 // with highest precedence (user/project settings cannot override it).
 const managedSettingsPath = "/etc/claude-code/managed-settings.json"
 
+// guardHookEvents are the Claude Code hook events the guard wires. PreToolUse
+// carries the policy decision; PostToolUse (success) and PostToolUseFailure
+// (non-zero exit) report execution so inline mode can resolve its ledger from
+// either outcome. The same command serves all three (it self-routes on
+// hook_event_name), and the Post* hooks are no-ops in prompt/deny mode, so one
+// settings fragment works for every escalation mode.
+var guardHookEvents = []string{"PreToolUse", "PostToolUse", "PostToolUseFailure"}
+
 func runGuardInstallHook(cmd *cobra.Command, matcher, command, write string, managed bool) error {
 	out := cmd.OutOrStdout()
 
@@ -393,20 +404,23 @@ func runGuardInstallHook(cmd *cobra.Command, matcher, command, write string, man
 	}
 
 	if write == "" {
-		fragment := map[string]any{
-			"hooks": map[string]any{"PreToolUse": []any{entry}},
+		hooks := map[string]any{}
+		for _, ev := range guardHookEvents {
+			hooks[ev] = []any{entry}
 		}
 		enc := json.NewEncoder(out)
 		enc.SetEscapeHTML(false)
 		enc.SetIndent("", "  ")
-		return enc.Encode(fragment)
+		return enc.Encode(map[string]any{"hooks": hooks})
 	}
 
 	return mergeHookIntoSettings(write, entry, command, matcher, out)
 }
 
 // mergeHookIntoSettings loads (or initializes) the settings file and appends
-// the PreToolUse entry if an identical matcher+command isn't already present.
+// the entry to each guard hook event whose matcher+command isn't already
+// present. Events already wired are skipped individually, so re-running is
+// idempotent even if only some events were present before.
 func mergeHookIntoSettings(path string, entry map[string]any, command, matcher string, out io.Writer) error {
 	settings := map[string]any{}
 	if data, err := os.ReadFile(path); err == nil {
@@ -424,18 +438,21 @@ func mergeHookIntoSettings(path string, entry map[string]any, command, matcher s
 		hooks = map[string]any{}
 		settings["hooks"] = hooks
 	}
-	pre, _ := hooks["PreToolUse"].([]any)
 
-	for _, e := range pre {
-		if em, ok := e.(map[string]any); ok {
-			if em["matcher"] == matcher && hookHasCommand(em, command) {
-				_, _ = fmt.Fprintf(out, "Hook already present in %s (matcher %q) — nothing to do.\n", path, matcher)
-				return nil
-			}
+	var added []string
+	for _, ev := range guardHookEvents {
+		existing, _ := hooks[ev].([]any)
+		if hookEntryPresent(existing, matcher, command) {
+			continue
 		}
+		hooks[ev] = append(existing, entry)
+		added = append(added, ev)
 	}
 
-	hooks["PreToolUse"] = append(pre, entry)
+	if len(added) == 0 {
+		_, _ = fmt.Fprintf(out, "Hooks already present in %s (matcher %q) — nothing to do.\n", path, matcher)
+		return nil
+	}
 
 	if dir := filepath.Dir(path); dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -449,8 +466,21 @@ func mergeHookIntoSettings(path string, entry map[string]any, command, matcher s
 	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
 		return fmt.Errorf("guard install-hook: writing %s: %w", path, err)
 	}
-	_, _ = fmt.Fprintf(out, "Wrote PreToolUse hook (matcher %q) to %s\n", matcher, path)
+	_, _ = fmt.Fprintf(out, "Wrote guard hooks %v (matcher %q) to %s\n", added, matcher, path)
 	return nil
+}
+
+// hookEntryPresent reports whether the event list already contains an entry
+// with the given matcher and command.
+func hookEntryPresent(entries []any, matcher, command string) bool {
+	for _, e := range entries {
+		if em, ok := e.(map[string]any); ok {
+			if em["matcher"] == matcher && hookHasCommand(em, command) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func hookHasCommand(entry map[string]any, command string) bool {

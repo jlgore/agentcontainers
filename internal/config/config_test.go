@@ -1816,3 +1816,170 @@ func TestParseFile_StringShorthand(t *testing.T) {
 		t.Errorf("Commands[3].Subcommands = %v, want [status diff]", cmds[3].Subcommands)
 	}
 }
+
+func TestValidate_UnknownField(t *testing.T) {
+	cfg, err := parseBytes([]byte(`{
+		"image": "ubuntu",
+		"agent": {
+			"capabilities": { "network": { "egress": [{ "host": "api.github.com", "port": 443 }] } },
+			"bogusTopLevel": true,
+			"secrets": { "TOKEN": { "provider": "env", "typoField": "x" } }
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("parse unexpected error: %v", err)
+	}
+	err = cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() = nil, want unknown-field errors")
+	}
+	msg := err.Error()
+	for _, want := range []string{`agent.bogusTopLevel`, `agent.secrets.TOKEN.typoField`} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("Validate() error %q does not mention %q", msg, want)
+		}
+	}
+}
+
+func TestParseFile_ScopeAndOrgPolicy(t *testing.T) {
+	cfg, err := parseBytes([]byte(`{
+		"image": "ubuntu",
+		"agent": {
+			"orgPolicy": "ghcr.io/org/policy:latest",
+			"secrets": { "TOKEN": { "provider": "oidc", "audience": "x", "scope": ["repo:read", "issues:write"] } }
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("parse unexpected error: %v", err)
+	}
+	if cfg.Agent.OrgPolicy != "ghcr.io/org/policy:latest" {
+		t.Errorf("OrgPolicy = %q, want %q", cfg.Agent.OrgPolicy, "ghcr.io/org/policy:latest")
+	}
+	sc := cfg.Agent.Secrets["TOKEN"]
+	if len(sc.Scope) != 2 || sc.Scope[0] != "repo:read" || sc.Scope[1] != "issues:write" {
+		t.Errorf("Scope = %v, want [repo:read issues:write]", sc.Scope)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil (scope/orgPolicy are known fields)", err)
+	}
+}
+
+func TestValidateSecret_ProviderRules(t *testing.T) {
+	cases := []struct {
+		name    string
+		secret  string
+		wantErr string // substring; "" means must validate cleanly
+	}{
+		{"env shorthand ok", `{"provider": "env://MY_VAR"}`, ""},
+		{"canonical env ok", `{"provider": "env", "key": "MY_VAR"}`, ""},
+		{"vault structured ok", `{"provider": "vault", "path": "myapp/config", "mount": "secret"}`, ""},
+		{"1password structured ok", `{"provider": "1password", "vault": "Dev", "item": "GitHub PAT", "field": "credential"}`, ""},
+		{"op uri rejected", `{"provider": "op://Dev/GitHub PAT/credential"}`, "URI shorthand"},
+		{"vault uri rejected", `{"provider": "vault://myapp/config"}`, "URI shorthand"},
+		{"unknown provider rejected", `{"provider": "credential-helper"}`, "unknown provider"},
+		{"missing provider rejected", `{"ttl": "1h"}`, "provider is required"},
+		{"1password missing vault rejected", `{"provider": "1password", "item": "GitHub PAT"}`, "vault is required"},
+		{"1password missing item rejected", `{"provider": "1password", "vault": "Dev"}`, "item is required"},
+		{"bad rotation rejected", `{"provider": "env", "key": "X", "rotation": "soon"}`, "invalid duration"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := parseBytes([]byte(`{"image": "ubuntu", "agent": {"secrets": {"S": ` + tc.secret + `}}}`))
+			if err != nil {
+				t.Fatalf("parse error: %v", err)
+			}
+			err = cfg.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Validate() = %v, want error containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestExtends_Merge(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "base.json")
+	child := filepath.Join(dir, "agentcontainer.json")
+	if err := os.WriteFile(base, []byte(`{
+		"image": "ubuntu",
+		"agent": {
+			"capabilities": {
+				"network": { "egress": [{ "host": "api.github.com", "port": 443 }] },
+				"filesystem": { "read": ["/workspace/**"] }
+			},
+			"policy": { "escalation": "prompt", "auditLog": true }
+		}
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(child, []byte(`{
+		"extends": "base.json",
+		"name": "child",
+		"agent": {
+			"capabilities": { "filesystem": { "read": ["/data/**"] } },
+			"secrets": { "TOKEN": { "provider": "env" } }
+		}
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := parseFile(child)
+	if err != nil {
+		t.Fatalf("parseFile: %v", err)
+	}
+	if cfg.Name != "child" {
+		t.Errorf("Name = %q, want child", cfg.Name)
+	}
+	if cfg.Image != "ubuntu" {
+		t.Errorf("Image = %q, want ubuntu (inherited)", cfg.Image)
+	}
+	// Object merge: policy inherited from base.
+	if cfg.Agent.Policy == nil || cfg.Agent.Policy.Escalation != "prompt" {
+		t.Errorf("Policy not inherited from base: %+v", cfg.Agent.Policy)
+	}
+	// Object merge: network inherited, filesystem.read replaced (slice replace).
+	if cfg.Agent.Capabilities.Network == nil || len(cfg.Agent.Capabilities.Network.Egress) != 1 {
+		t.Errorf("network egress not inherited: %+v", cfg.Agent.Capabilities.Network)
+	}
+	if got := cfg.Agent.Capabilities.Filesystem.Read; len(got) != 1 || got[0] != "/data/**" {
+		t.Errorf("filesystem.read = %v, want [/data/**] (child replaces)", got)
+	}
+	// Child-only field present.
+	if _, ok := cfg.Agent.Secrets["TOKEN"]; !ok {
+		t.Error("child secret TOKEN missing")
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil", err)
+	}
+}
+
+func TestExtends_MissingBase(t *testing.T) {
+	dir := t.TempDir()
+	child := filepath.Join(dir, "agentcontainer.json")
+	if err := os.WriteFile(child, []byte(`{"extends":"nope.json","image":"ubuntu"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseFile(child); err == nil {
+		t.Fatal("parseFile() = nil error, want missing-base error")
+	}
+}
+
+func TestExtends_Cycle(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a.json")
+	b := filepath.Join(dir, "b.json")
+	if err := os.WriteFile(a, []byte(`{"extends":"b.json","image":"ubuntu"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(b, []byte(`{"extends":"a.json","image":"ubuntu"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseFile(a); err == nil {
+		t.Fatal("parseFile() = nil error, want cycle/depth error")
+	}
+}

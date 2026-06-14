@@ -1,6 +1,6 @@
 # 1Password Secrets Provider
 
-Demonstrates secret injection using 1Password via the `credential-helper` provider. Secrets are read from 1Password vaults using `op://` URIs and injected into the container at `/run/secrets/`.
+Demonstrates secret injection using 1Password via the `1password` provider. Secrets are referenced with structured `vault` / `item` / `field` fields, read from 1Password vaults on the host, and injected into the container at `/run/secrets/`.
 
 ## Prerequisites
 
@@ -23,11 +23,11 @@ ac run --config agentcontainer.json .
 
 ## Secrets in This Example
 
-| Secret | 1Password URI | TTL | Description |
-|--------|---------------|-----|-------------|
-| `GITHUB_TOKEN` | `op://Development/GitHub PAT/credential` | 1h | GitHub personal access token |
-| `NPM_TOKEN` | `op://Development/npm Registry/token` | 4h | npm publish token |
-| `DATABASE_URL` | `op://Development/Staging DB/connection-string` | 1h | Database connection string |
+| Secret | Vault | Item | Field | TTL | Description |
+|--------|-------|------|-------|-----|-------------|
+| `GITHUB_TOKEN` | `Development` | `GitHub PAT` | `credential` | 1h | GitHub personal access token |
+| `NPM_TOKEN` | `Development` | `npm Registry` | `token` | 4h | npm publish token |
+| `DATABASE_URL` | `Development` | `Staging DB` | `connection-string` | 1h | Database connection string |
 
 ## Setting Up Vault Items
 
@@ -62,7 +62,7 @@ op item create \
 ## How It Works
 
 1. `agentcontainer run` reads the `secrets` block from `agentcontainer.json`
-2. The Secrets Manager invokes `op read <uri>` on the **host** for each secret
+2. The Secrets Manager invokes `op read` on the **host** for each secret, using the configured `vault`/`item`/`field`
 3. 1Password desktop app prompts for biometric/2FA approval
 4. Resolved values are written to `/run/secrets/<NAME>` (tmpfs, mode 0400)
 5. The `op` CLI never runs inside the container

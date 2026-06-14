@@ -214,11 +214,20 @@ func (b *Backend) freezeEnforceResume(ctx context.Context, deps Deps, tool confi
 
 // newBackend connects a single backend per its declared type and transport.
 // The mcp.Client is supplied by the proxy with relay handlers already wired.
+//
+// The tool's hosting model is resolved up front via tool.Resolve, which
+// yields a typed view exposing only the fields legal for the kind; the
+// switch below dispatches on the resolved discriminator rather than reading
+// raw config fields. Field-level validation is config.Validate's job (run
+// before a proxy is ever constructed), so resolution errors other than an
+// unknown type are not fatal here — the typed view is still populated and
+// the proxy proceeds on the resolved kind.
 func newBackend(ctx context.Context, deps Deps, mcpClient *mcp.Client, name string, tool config.MCPToolConfig, sessionID, networkName string, concurrency int) (*Backend, error) {
+	resolved, _ := tool.Resolve(name)
 	b := &Backend{Name: name, Policy: tool.Policy, concurrency: make(chan struct{}, concurrency)}
 
-	switch tool.Type {
-	case "component":
+	switch resolved.Kind {
+	case config.KindComponent:
 		if deps.Enforcer == nil {
 			return nil, fmt.Errorf("mcpproxy: backend %s: component type requires an enforcer connection", name)
 		}
@@ -234,23 +243,24 @@ func newBackend(ctx context.Context, deps Deps, mcpClient *mcp.Client, name stri
 		}
 		return b, nil
 
-	case "remote":
+	case config.KindRemote:
 		b.Kind = KindRemote
-		tr := &mcp.StreamableClientTransport{Endpoint: tool.URL}
+		tr := &mcp.StreamableClientTransport{Endpoint: resolved.Remote.URL}
 		session, err := mcpClient.Connect(ctx, tr, nil)
 		if err != nil {
-			return nil, fmt.Errorf("mcpproxy: backend %s: connecting to remote %s: %w", name, tool.URL, err)
+			return nil, fmt.Errorf("mcpproxy: backend %s: connecting to remote %s: %w", name, resolved.Remote.URL, err)
 		}
 		b.session = session
 		return b, nil
 
-	case "", "container":
+	case config.KindContainer:
+		ct := resolved.Container
 		if deps.Docker == nil {
 			return nil, fmt.Errorf("mcpproxy: backend %s: container type requires a Docker connection", name)
 		}
-		if tool.Transport == "http" {
+		if ct.Transport == "http" {
 			b.Kind = KindHTTP
-			hc, err := dialHTTPContainer(ctx, deps, name, tool, sessionID, networkName)
+			hc, err := dialHTTPContainer(ctx, deps, name, ct, sessionID, networkName)
 			if err != nil {
 				return nil, err
 			}
@@ -281,7 +291,7 @@ func newBackend(ctx context.Context, deps Deps, mcpClient *mcp.Client, name stri
 		}
 
 		b.Kind = KindStdio
-		sc, err := dialStdioContainer(ctx, deps, name, tool, sessionID, networkName)
+		sc, err := dialStdioContainer(ctx, deps, name, ct, sessionID, networkName)
 		if err != nil {
 			return nil, err
 		}
@@ -304,7 +314,7 @@ func newBackend(ctx context.Context, deps Deps, mcpClient *mcp.Client, name stri
 		return b, nil
 
 	default:
-		return nil, fmt.Errorf("mcpproxy: backend %s: unknown type %q", name, tool.Type)
+		return nil, fmt.Errorf("mcpproxy: backend %s: unknown kind %q", name, resolved.Kind)
 	}
 }
 
@@ -334,7 +344,7 @@ type stdioContainer struct {
 // startup, MCP handshake, and first tool call all ran unenforced). If the
 // freezer is unavailable (e.g. some rootless setups) the pause is skipped
 // with a warning and behaviour degrades to that prior window.
-func dialStdioContainer(ctx context.Context, deps Deps, name string, tool config.MCPToolConfig, sessionID, networkName string) (*stdioContainer, error) {
+func dialStdioContainer(ctx context.Context, deps Deps, name string, tool *config.ContainerTool, sessionID, networkName string) (*stdioContainer, error) {
 	dc := deps.Docker
 	log := deps.Logger
 
@@ -491,7 +501,7 @@ const (
 //
 // The proxy reaches the container by its address on the bridge (host-routable
 // for a standard Linux bridge network); no host port is published.
-func dialHTTPContainer(ctx context.Context, deps Deps, name string, tool config.MCPToolConfig, sessionID, networkName string) (*httpContainer, error) {
+func dialHTTPContainer(ctx context.Context, deps Deps, name string, tool *config.ContainerTool, sessionID, networkName string) (*httpContainer, error) {
 	dc := deps.Docker
 	log := deps.Logger
 
