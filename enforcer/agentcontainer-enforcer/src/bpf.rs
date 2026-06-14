@@ -1234,10 +1234,13 @@ mod linux {
                 Vec::new();
             for rule in &policy.egress_rules {
                 let proto = match rule.protocol.to_lowercase().as_str() {
-                    "tcp" => 6u8,
+                    // An omitted protocol defaults to tcp rather than being
+                    // dropped — a silently skipped allow rule is worse than a
+                    // sensible default for the common HTTP/S egress case.
+                    "tcp" | "" => 6u8,
                     "udp" => 17u8,
-                    _ => {
-                        warn!(protocol = %rule.protocol, "unknown protocol in egress rule, skipping");
+                    other => {
+                        warn!(protocol = %other, "unknown protocol in egress rule, skipping");
                         continue;
                     }
                 };

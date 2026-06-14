@@ -586,10 +586,17 @@ func translateNetworkPolicy(containerID string, p *policy.ContainerPolicy) *enfo
 	}
 
 	for _, rule := range p.AllowedEgressRules {
+		// Default an omitted protocol to tcp, matching the MCP-proxy egress
+		// path. Otherwise the enforcer logs "unknown protocol" and silently
+		// drops the rule, so the intended allow never takes effect.
+		proto := rule.Protocol
+		if proto == "" {
+			proto = "tcp"
+		}
 		req.EgressRules = append(req.EgressRules, &enforcerapi.EgressRule{
 			Host:     rule.Host,
 			Port:     uint32(rule.Port),
-			Protocol: rule.Protocol,
+			Protocol: proto,
 		})
 	}
 
