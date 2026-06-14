@@ -1,0 +1,64 @@
+{
+  // Proxy-path forensic E2E: the SIFT gateway runs as a kernel-enforced
+  // container backend BEHIND the MCP proxy (not as a standalone remote server),
+  // so every forensic tool call flows through policy evaluation, the approval
+  // broker, correlation IDs, and the proxy + enforcer audit chains.
+  //
+  // Evidence is mounted read-only; case outputs (findings, timeline, audit)
+  // are writable. The read-only evidence mount is nested under the case mount,
+  // so the examiner can write reports while the kernel blocks any write to the
+  // acquired image.
+  //
+  // Adjust the /cases/e2e-demo paths and VHIR_* values for your case; this
+  // mirrors the layout produced by the SIFT/Valhuntir tooling on the VM.
+  "name": "sift-forensic-agent",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "agent": {
+    "capabilities": {
+      "filesystem": {
+        "read": ["/workspace/**"],
+        "write": ["/workspace/**"]
+      },
+      "network": {
+        // Default-deny egress; allow only what the agent legitimately needs.
+        // (An omitted protocol now defaults to tcp instead of being dropped.)
+        "egress": [
+          { "host": "api.github.com", "port": 443 }
+        ]
+      }
+    },
+    "enforcer": {
+      // Development convenience for the demo VM. Remove for production, where
+      // the managed enforcer runs ephemeral mTLS on loopback by default.
+      "insecureDev": true
+    },
+    "tools": {
+      "mcp": {
+        "sift": {
+          "type": "container",
+          "image": "sift-gateway:e2e",
+          "transport": "http",
+          "port": 4508,
+          "path": "/mcp",
+          "mounts": [
+            // Case directory read-write (findings, timeline, extractions, audit)…
+            "/cases/e2e-demo:/cases/e2e-demo",
+            // …with the acquired evidence pinned read-only.
+            "/cases/e2e-demo/evidence:/cases/e2e-demo/evidence:ro"
+          ],
+          "env": {
+            "VHIR_CASE_DIR": "/cases/e2e-demo",
+            "VHIR_CASES_DIR": "/cases",
+            "VHIR_ACTIVE_CASE": "e2e-demo",
+            "VHIR_EXAMINER": "jgore"
+          }
+        }
+      }
+    },
+    "policy": {
+      "escalation": "prompt",
+      "auditLog": true,
+      "onCapabilityViolation": "deny"
+    }
+  }
+}
