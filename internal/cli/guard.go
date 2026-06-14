@@ -30,6 +30,7 @@ func newGuardCmd() *cobra.Command {
 OPA policy that gates the MCP forensic tools, escalating denials to a human.
 
   guard serve         run the host-side decision service (the authority)
+  guard monitor       review pending approvals in a TUI
   guard hook          PreToolUse hook handler the agent runs in its container
   guard install-hook  emit the Claude Code settings that wire the hook
 
@@ -37,8 +38,18 @@ The agent runs the thin 'hook' client inside its container; the decision is
 made by 'serve', a process the agent cannot reach. The eBPF enforcer remains
 the hard floor underneath.`,
 	}
-	cmd.AddCommand(newGuardServeCmd(), newGuardHookCmd(), newGuardInstallHookCmd())
+	cmd.AddCommand(newGuardServeCmd(), newGuardMonitorCmd(), newGuardHookCmd(), newGuardInstallHookCmd())
 	return cmd
+}
+
+func resolveGuardApprovalSocket(flag string) string {
+	if flag != "" {
+		return flag
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".ac", "guard-approve.sock")
+	}
+	return ""
 }
 
 // resolveGuardSocket picks the socket path: explicit flag, then
@@ -70,6 +81,7 @@ func newGuardServeCmd() *cobra.Command {
 		socket        string
 		securityYAML  string
 		noApproval    bool
+		escalation    string
 		timeout       time.Duration
 		approveSocket string
 		auditDir      string
@@ -82,7 +94,7 @@ func newGuardServeCmd() *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runGuardServe(cmd, guardServeOpts{
-				socket: socket, securityYAML: securityYAML, noApproval: noApproval,
+				socket: socket, securityYAML: securityYAML, noApproval: noApproval, escalation: escalation,
 				timeout: timeout, approveSocket: approveSocket, auditDir: auditDir, sessionID: sessionID,
 			})
 		},
@@ -90,8 +102,9 @@ func newGuardServeCmd() *cobra.Command {
 
 	cmd.Flags().StringVar(&socket, "socket", "", "Guard socket path (default: $AC_GUARD_SOCKET or ~/.ac/guard.sock)")
 	cmd.Flags().StringVar(&securityYAML, "security-yaml", "", "Policy file (default: sift-mcp built-in defaults)")
-	cmd.Flags().BoolVar(&noApproval, "no-approval", false, "Policy-only: a denial is final, never escalated to a human")
-	cmd.Flags().DurationVar(&timeout, "approval-timeout", approval.DefaultToolCallTimeout, "How long a denial waits for a human decision")
+	cmd.Flags().BoolVar(&noApproval, "no-approval", false, "Policy-only: a denial is final, never escalated to a human (alias for --escalation deny)")
+	cmd.Flags().StringVar(&escalation, "escalation", "prompt", "Escalation mode: 'prompt' (block for a human via the broker), 'inline' (return Claude Code 'ask' so it prompts in the agent's own TUI; host audits via a ledger), or 'deny' (policy-only)")
+	cmd.Flags().DurationVar(&timeout, "approval-timeout", approval.DefaultToolCallTimeout, "prompt mode: how long a denial waits for a human; inline mode: ledger grace before an unconfirmed escalation is reaped as denied-inferred")
 	cmd.Flags().StringVar(&approveSocket, "approval-socket", "", "Socket for 'agentcontainer approve' (default: ~/.ac/guard-approve.sock)")
 	cmd.Flags().StringVar(&auditDir, "audit-dir", "", "Audit log directory (default: $AC_AUDIT_DIR or ~/.ac/audit)")
 	cmd.Flags().StringVar(&sessionID, "session", "", "Session ID (default: random)")
@@ -101,6 +114,7 @@ func newGuardServeCmd() *cobra.Command {
 
 type guardServeOpts struct {
 	socket, securityYAML, approveSocket, auditDir, sessionID string
+	escalation                                               string
 	noApproval                                               bool
 	timeout                                                  time.Duration
 }
@@ -151,7 +165,18 @@ func runGuardServe(cmd *cobra.Command, o guardServeOpts) error {
 	}
 	defer func() { _ = alog.Close() }()
 
-	// Human-in-the-loop approval, unless policy-only.
+	// Resolve the escalation mode. --no-approval is the legacy alias for "deny".
+	mode := o.escalation
+	if o.noApproval {
+		mode = "deny"
+	}
+	switch mode {
+	case "prompt", "inline", "deny":
+	default:
+		return fmt.Errorf("guard serve: invalid --escalation %q (want prompt, inline, or deny)", mode)
+	}
+
+	// Human-in-the-loop approval channels (prompt mode only).
 	var (
 		broker   *approval.ToolCallBroker
 		chanDesc string
@@ -162,7 +187,7 @@ func runGuardServe(cmd *cobra.Command, o guardServeOpts) error {
 			c()
 		}
 	}()
-	if !o.noApproval {
+	if mode == "prompt" {
 		broker = approval.NewToolCallBroker(o.timeout)
 		var channels []string
 		if tty, terr := approval.OpenTTYChannel(broker); terr == nil {
@@ -170,17 +195,12 @@ func runGuardServe(cmd *cobra.Command, o guardServeOpts) error {
 			cleanups = append(cleanups, func() { _ = tty.Close() })
 			channels = append(channels, "interactive (this terminal)")
 		}
-		approveSock := o.approveSocket
-		if approveSock == "" {
-			if home, herr := os.UserHomeDir(); herr == nil {
-				approveSock = filepath.Join(home, ".ac", "guard-approve.sock")
-			}
-		}
+		approveSock := resolveGuardApprovalSocket(o.approveSocket)
 		if sock, serr := approval.ListenSocket(approveSock, broker); serr == nil {
 			cleanups = append(cleanups, func() { _ = sock.Close() })
 			channels = append(channels, "agentcontainer approve ("+sock.Path()+")")
 		} else if len(channels) == 0 {
-			return fmt.Errorf("guard serve: no approval channel available (no TTY, and %v); use --no-approval to run policy-only", serr)
+			return fmt.Errorf("guard serve: no approval channel available (no TTY, and %v); use --escalation deny to run policy-only", serr)
 		}
 		chanDesc = strings.Join(channels, ", ")
 	}
@@ -192,6 +212,8 @@ func runGuardServe(cmd *cobra.Command, o guardServeOpts) error {
 		Audit:       alog,
 		Logger:      log,
 		Examiner:    examinerIdentity(),
+		Inline:      mode == "inline",
+		LedgerGrace: o.timeout,
 	})
 
 	l, err := guard.Listen(resolveGuardSocket(o.socket), svc, log)
@@ -204,15 +226,22 @@ func runGuardServe(cmd *cobra.Command, o guardServeOpts) error {
 	_, _ = fmt.Fprintf(out, "Session:  %s\n", o.sessionID)
 	_, _ = fmt.Fprintf(out, "Policy:   %s\n", policyDesc)
 	_, _ = fmt.Fprintf(out, "Audit:    %s\n", alog.Path())
-	if broker != nil {
+	switch mode {
+	case "prompt":
 		_, _ = fmt.Fprintf(out, "Approval: %s\n", chanDesc)
-	} else {
+	case "inline":
+		_, _ = fmt.Fprintf(out, "Approval: inline (Claude Code prompts in the agent's TUI; host audits via ledger, grace %s)\n", o.timeout)
+	default:
 		_, _ = fmt.Fprintln(out, "Approval: disabled (policy-only — denials are final)")
 	}
 	_, _ = fmt.Fprintln(out, "Press Ctrl-C to stop.")
 
 	sigCtx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Inline mode: reap unconfirmed escalations on a ticker, and drain on
+	// shutdown, recording them as denied-inferred.
+	go svc.StartReconciler(sigCtx)
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- l.Serve(sigCtx) }()
@@ -270,6 +299,22 @@ func runGuardHook(cmd *cobra.Command, socket string, timeout time.Duration) erro
 	payload, err := io.ReadAll(cmd.InOrStdin())
 	if err != nil {
 		return emitDecision(out, guard.DecisionDeny, "guard: reading hook input failed (fail-closed): "+err.Error())
+	}
+
+	// PostToolUse reports an executed tool (inline mode resolves its ledger).
+	// It carries no permission decision — it cannot block a tool that already
+	// ran — so it fails OPEN: a lost report just leaves the escalation to be
+	// reaped as denied-inferred. PreToolUse (or an older hook sending no event
+	// name) is a policy decision and fails CLOSED.
+	var probe struct {
+		HookEventName string `json:"hook_event_name"`
+	}
+	_ = json.Unmarshal(payload, &probe)
+	if probe.HookEventName == "PostToolUse" {
+		if err := guard.Report(resolveGuardSocket(socket), payload, 5*time.Second, 5*time.Second); err != nil {
+			_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "guard: PostToolUse report failed (ignored):", err)
+		}
+		return nil
 	}
 
 	v, err := guard.Ask(resolveGuardSocket(socket), payload, 5*time.Second, timeout)

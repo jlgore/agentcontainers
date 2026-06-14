@@ -44,6 +44,12 @@ type Request struct {
 	ToolInput json.RawMessage `json:"tool_input"`
 	Cwd       string          `json:"cwd"`
 	SessionID string          `json:"session_id"`
+	// ToolUseID is Claude Code's stable per-call id, present on both the
+	// PreToolUse and PostToolUse payloads — the inline ledger's join key.
+	ToolUseID string `json:"tool_use_id"`
+	// HookEventName routes the socket dispatch: "PreToolUse" (or "" for older
+	// hooks) → Decide; "PostToolUse" → Report.
+	HookEventName string `json:"hook_event_name"`
 }
 
 // Verdict is the guard's answer, which the hook maps onto permissionDecision.
@@ -63,6 +69,8 @@ type Service struct {
 	audit       *audit.Logger            // nil → no audit
 	log         *zap.Logger
 	examiner    string
+	inline      bool    // inline mode: escalations return "ask", host audits via ledger
+	ledger      *ledger // non-nil iff inline
 }
 
 // Options configure a Service.
@@ -73,6 +81,13 @@ type Options struct {
 	Audit       *audit.Logger
 	Logger      *zap.Logger
 	Examiner    string
+	// Inline turns on inline-approval mode: a policy denial returns DecisionAsk
+	// (Claude Code renders its native prompt) instead of blocking on Broker,
+	// and the host tracks the outcome in a ledger. Mutually exclusive with
+	// Broker. LedgerGrace bounds how long an escalation waits for a PostToolUse
+	// execution report before being reaped as denied-inferred (default 5m).
+	Inline      bool
+	LedgerGrace time.Duration
 }
 
 // New builds a Service. Evaluator is required; Broker, Audit, and Logger are
@@ -83,13 +98,27 @@ func New(opts Options) *Service {
 	if log == nil {
 		log = zap.NewNop()
 	}
-	return &Service{
+	s := &Service{
 		eval:        opts.Evaluator,
 		outputFlags: opts.OutputFlags,
 		broker:      opts.Broker,
 		audit:       opts.Audit,
 		log:         log,
 		examiner:    opts.Examiner,
+		inline:      opts.Inline,
+	}
+	if opts.Inline {
+		s.ledger = newLedger(opts.LedgerGrace, log, s.recordDeniedInferred)
+	}
+	return s
+}
+
+// StartReconciler runs the inline ledger's reconcile loop until ctx is
+// canceled (it then drains remaining escalations as denied-inferred). It is a
+// no-op when not in inline mode. Call it in a goroutine.
+func (s *Service) StartReconciler(ctx context.Context) {
+	if s.ledger != nil {
+		s.ledger.reconcileLoop(ctx)
 	}
 }
 
@@ -126,6 +155,26 @@ func (s *Service) Decide(ctx context.Context, req Request) Verdict {
 	// Policy denied. Escalate to a human when a broker is configured;
 	// otherwise the denial is final.
 	reason := strings.Join(reasons, "; ")
+
+	// Inline mode: don't block on the broker — hand the decision to Claude
+	// Code's own permission prompt by returning DecisionAsk, and track the
+	// escalation in the ledger. The agent's PostToolUse hook reports execution
+	// (= the human approved), resolving the entry; unresolved entries are
+	// reaped as denied-inferred by the reconciler.
+	if s.inline {
+		escID := newID()
+		s.ledger.add(&pendingEscalation{
+			escalationID: escID,
+			toolUseID:    req.ToolUseID,
+			tool:         req.ToolName,
+			subject:      line,
+			sessionID:    req.SessionID,
+			askedAt:      time.Now().UTC(),
+		})
+		s.recordAsked(req, line, reason, escID)
+		return Verdict{Decision: DecisionAsk, Reason: reason}
+	}
+
 	if s.broker == nil {
 		v := Verdict{Decision: DecisionDeny, Reason: reason}
 		s.record(req, line, v, false)
@@ -222,6 +271,78 @@ func (s *Service) record(req Request, line string, v Verdict, escalated bool) {
 		audit.WithMetadataAny("escalated", escalated),
 	); err != nil {
 		s.log.Error("guard audit write failed", zap.Error(err))
+	}
+}
+
+// Report handles a PostToolUse hook payload in inline mode: the tool ran,
+// which means the human approved the inline prompt, so resolve the pending
+// escalation to "executed". A report for a tool that was never escalated (a
+// policy-allowed tool) is a no-op, as is any report reaching a non-inline
+// guard. The returned verdict is trivial — PostToolUse cannot deny a tool that
+// already ran — but it must be written so the client's read completes.
+func (s *Service) Report(_ context.Context, req Request) Verdict {
+	if s.ledger == nil {
+		return Verdict{Decision: DecisionAllow}
+	}
+	if p, ok := s.ledger.resolve(req.ToolUseID); ok {
+		s.recordExecuted(p)
+	}
+	return Verdict{Decision: DecisionAllow}
+}
+
+// recordAsked logs an inline escalation at the moment it is handed to Claude
+// Code's prompt (verdict "prompt", status pending).
+func (s *Service) recordAsked(req Request, line, reason, escID string) {
+	s.auditInline(audit.EventEscalation, audit.Actor{Type: "agent", Name: "claude"},
+		audit.VerdictPrompt, line, req.ToolName, req.SessionID, escID, req.ToolUseID,
+		audit.WithMetadataAny("reason", reason),
+		audit.WithMetadataAny("status", "pending"),
+		audit.WithMetadataAny("inline", true),
+	)
+}
+
+// recordExecuted logs that an inline escalation's tool ran — i.e. the human
+// approved it. The decider is inferred from execution, not reported by the
+// harness, so it is labeled as such.
+func (s *Service) recordExecuted(p *pendingEscalation) {
+	s.auditInline(audit.EventApprovalDecision, audit.Actor{Type: "user", Name: "inline-operator"},
+		audit.VerdictAllow, p.subject, p.tool, p.sessionID, p.escalationID, p.toolUseID,
+		audit.WithMetadataAny("status", "executed"),
+		audit.WithMetadataAny("decider", "inline (inferred from execution)"),
+	)
+}
+
+// recordDeniedInferred logs an inline escalation reaped without an execution
+// report. This conflates a genuine human denial with an approved-but-failed
+// tool (PostToolUse fires only on success), so it is explicitly soft-labeled
+// inferred and must not be treated as an authoritative denial.
+func (s *Service) recordDeniedInferred(p *pendingEscalation) {
+	s.auditInline(audit.EventApprovalDecision, audit.Actor{Type: "system", Name: "reconciler"},
+		audit.VerdictDeny, p.subject, p.tool, p.sessionID, p.escalationID, p.toolUseID,
+		audit.WithMetadataAny("status", "denied-inferred"),
+		audit.WithMetadataAny("inferred", true),
+		audit.WithMetadataAny("grace_seconds", int(s.ledger.grace.Seconds())),
+	)
+}
+
+// auditInline appends an inline-mode audit entry, threading the escalation_id
+// and tool_use_id so the asked/executed/denied records for one escalation
+// join. It is a no-op when no audit logger is configured.
+func (s *Service) auditInline(ev audit.EventType, actor audit.Actor, verdict audit.Verdict, line, tool, sessionID, escID, toolUseID string, extra ...audit.LogEntryOption) {
+	if s.audit == nil {
+		return
+	}
+	opts := []audit.LogEntryOption{
+		audit.WithVerdict(verdict),
+		audit.WithCommand(line),
+		audit.WithMetadataAny("tool", tool),
+		audit.WithMetadataAny("sessionId", sessionID),
+		audit.WithMetadataAny("escalation_id", escID),
+		audit.WithMetadataAny("tool_use_id", toolUseID),
+	}
+	opts = append(opts, extra...)
+	if err := s.audit.Log(ev, actor, opts...); err != nil {
+		s.log.Error("guard inline audit write failed", zap.Error(err))
 	}
 }
 

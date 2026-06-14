@@ -87,7 +87,16 @@ func (l *Listener) handle(ctx context.Context, conn net.Conn) {
 	}
 	_ = conn.SetReadDeadline(time.Time{})
 
-	v := l.svc.Decide(ctx, req)
+	// Dispatch on the hook event. PostToolUse reports execution (inline mode
+	// resolves its ledger); everything else ("PreToolUse", or "" from older
+	// hooks that sent no event name) is a policy decision.
+	var v Verdict
+	switch req.HookEventName {
+	case "PostToolUse":
+		v = l.svc.Report(ctx, req)
+	default:
+		v = l.svc.Decide(ctx, req)
+	}
 	l.write(conn, v)
 }
 

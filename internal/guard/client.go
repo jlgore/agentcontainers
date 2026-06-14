@@ -45,3 +45,13 @@ func Ask(socket string, payload []byte, dialTimeout, readTimeout time.Duration) 
 	}
 	return v, nil
 }
+
+// Report sends a PostToolUse payload to the guard (inline mode resolves its
+// pending-escalation ledger) and discards the trivial verdict. It reuses Ask,
+// which reads the server's response — a plain dial-and-close would leave the
+// server writing into a broken pipe. readTimeout can be short: a PostToolUse
+// report never waits on a human.
+func Report(socket string, payload []byte, dialTimeout, readTimeout time.Duration) error {
+	_, err := Ask(socket, payload, dialTimeout, readTimeout)
+	return err
+}
