@@ -234,10 +234,16 @@ mod linux {
     };
     use agentcontainer_common::events as bpf_events;
     use agentcontainer_common::maps::{
-        tool_identity, CgroupStats, FsInodeKey, LpmDataV4, LpmDataV6, PortKeyV4, SecretAclKey,
-        SecretAclValue, SecretToolKey, FS_PERM_READ, FS_PERM_WRITE, LPM_CGROUP_PREFIX,
+        tool_identity, ActiveTool, CgroupStats, FsInodeKey, LpmDataV4, LpmDataV6, PortKeyV4,
+        SecretAclKey, SecretAclValue, SecretToolKey, FS_PERM_READ, FS_PERM_WRITE,
+        LPM_CGROUP_PREFIX,
     };
     use anyhow::Context as _;
+
+    /// TTL applied to an ACTIVE_TOOL entry so a lost CompleteToolCall cannot
+    /// leave a restricted secret readable indefinitely. Generous enough for long
+    /// forensic tool runs; matched against `bpf_ktime_get_ns` (CLOCK_MONOTONIC).
+    const ACTIVE_TOOL_TTL_NS: u64 = 60 * 60 * 1_000_000_000; // 1 hour
     use aya::maps::lpm_trie::Key as LpmKey;
     use aya::maps::{HashMap as AyaHashMap, LpmTrie, PerCpuHashMap, RingBuf};
     use aya::programs::{CgroupAttachMode, CgroupSkb, CgroupSkbAttachType, CgroupSockAddr, Lsm};
@@ -1069,7 +1075,7 @@ mod linux {
             );
             // ACTIVE_TOOL is keyed by cgroup_id directly.
             if let Some(map_data) = bpf.map_mut("ACTIVE_TOOL") {
-                if let Ok(mut map) = AyaHashMap::<_, u64, u64>::try_from(map_data) {
+                if let Ok(mut map) = AyaHashMap::<_, u64, ActiveTool>::try_from(map_data) {
                     let _ = map.remove(&cgroup_id);
                 }
             }
@@ -1509,6 +1515,15 @@ mod linux {
             }
 
             let mut bpf = self.programs.lock().unwrap();
+            // Clear this cgroup's existing entries first, so a tightened
+            // allowlist (Update with fewer binaries) actually revokes the
+            // removed executables rather than leaving them authorized.
+            Self::cleanup_hash_entries::<FsInodeKey, u8>(
+                &mut bpf,
+                "ALLOWED_EXECS",
+                cgroup_id,
+                |k| k.cgroup_id,
+            );
             let map_data = bpf
                 .map_mut("ALLOWED_EXECS")
                 .ok_or_else(|| anyhow::anyhow!("BPF map ALLOWED_EXECS not found"))?;
@@ -1707,17 +1722,24 @@ mod linux {
                 let map_data = bpf
                     .map_mut("ACTIVE_TOOL")
                     .ok_or_else(|| anyhow::anyhow!("BPF map ACTIVE_TOOL not found"))?;
-                let mut map: AyaHashMap<_, u64, u64> = AyaHashMap::try_from(map_data)?;
+                let mut map: AyaHashMap<_, u64, ActiveTool> = AyaHashMap::try_from(map_data)?;
                 // Reject overlapping calls on a restricted container: an active
                 // tool window must close before the next opens. Holding the
                 // programs lock makes this check-and-set atomic against a
-                // concurrent prepare/complete.
-                if map.get(&cgroup_id, 0).is_ok() {
-                    return Err(anyhow::anyhow!(
-                        "overlapping tool call on restricted container {container_id}: a tool call is already active"
-                    ));
+                // concurrent prepare/complete. An expired entry (a lost
+                // CompleteToolCall) is treated as closed and may be replaced.
+                if let Ok(existing) = map.get(&cgroup_id, 0) {
+                    if existing.expires_at_ns == 0 || monotonic_ns() <= existing.expires_at_ns {
+                        return Err(anyhow::anyhow!(
+                            "overlapping tool call on restricted container {container_id}: a tool call is already active"
+                        ));
+                    }
                 }
-                map.insert(cgroup_id, tool_identity(tool_name), 0)?;
+                let active = ActiveTool {
+                    tool_id: tool_identity(tool_name),
+                    expires_at_ns: monotonic_ns() + ACTIVE_TOOL_TTL_NS,
+                };
+                map.insert(cgroup_id, active, 0)?;
             }
             Ok(())
         }
@@ -1740,7 +1762,7 @@ mod linux {
             {
                 let mut bpf = self.programs.lock().unwrap();
                 if let Some(map_data) = bpf.map_mut("ACTIVE_TOOL") {
-                    let mut map: AyaHashMap<_, u64, u64> = AyaHashMap::try_from(map_data)?;
+                    let mut map: AyaHashMap<_, u64, ActiveTool> = AyaHashMap::try_from(map_data)?;
                     let _ = map.remove(&cgroup_id);
                 }
             }

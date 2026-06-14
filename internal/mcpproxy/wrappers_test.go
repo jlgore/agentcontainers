@@ -106,6 +106,34 @@ func TestWrapperBypassesAreDecomposed(t *testing.T) {
 	}
 }
 
+// TestWrapperBypassRegressions covers the specific bypasses found in review:
+// env -S swallowing the command, and attached interpreter eval flags.
+func TestWrapperBypassRegressions(t *testing.T) {
+	cases := []struct {
+		name       string
+		line       string
+		wantBinary string
+	}{
+		{"env -S split string", `env -S 'python3 -c "import os"'`, "python3"},
+		{"env -S attached", `env -S'python3 -c x'`, "python3"},
+		{"env --split-string=", `env --split-string='python3 -c x'`, "python3"},
+		{"python -c attached", "python3 -c'print(1)'", "python3"},
+		{"perl -e attached", "perl -e'system(1)'", "perl"},
+		{"node --eval=", "node --eval='process.exit()'", "node"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ps := DecomposeShellLine(tc.line, nil)
+			if !contains(binariesOf(ps), tc.wantBinary) {
+				t.Errorf("line %q: effective binary %q not surfaced; got %v", tc.line, tc.wantBinary, binariesOf(ps))
+			}
+			if !anyDenied(ps) {
+				t.Errorf("line %q: should be denied; segments %v", tc.line, binariesOf(ps))
+			}
+		})
+	}
+}
+
 // TestShellDashCRecursion confirms bash -c payloads are parsed recursively, so
 // a blocked command inside the payload is surfaced.
 func TestShellDashCRecursion(t *testing.T) {

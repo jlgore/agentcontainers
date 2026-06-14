@@ -73,6 +73,27 @@ func TestOptionsFromProfile_TLSPolicy(t *testing.T) {
 		}
 	})
 
+	t.Run("ServerName overrides the verified hostname", func(t *testing.T) {
+		p := ConnectionProfile{
+			Addr:           "10.0.0.5:50051", // VM IP, not in cert SANs
+			CACertPath:     caFile,
+			ClientCertPath: certFile,
+			ClientKeyPath:  keyFile,
+			ServerName:     "localhost",
+		}
+		opts, err := optionsFromProfile(p, nil)
+		if err != nil {
+			t.Fatalf("optionsFromProfile: %v", err)
+		}
+		cfg := defaultGRPCConfig()
+		for _, opt := range opts {
+			opt(cfg)
+		}
+		if cfg.tlsConfig == nil || cfg.tlsConfig.ServerName != "localhost" {
+			t.Fatalf("expected tls ServerName=localhost, got %+v", cfg.tlsConfig)
+		}
+	})
+
 	t.Run("bad cert path errors, never silently plaintext", func(t *testing.T) {
 		p := ConnectionProfile{
 			Addr:           "10.0.0.5:50051",

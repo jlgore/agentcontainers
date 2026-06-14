@@ -401,13 +401,21 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
                     emit_cred_block_event(ino, cgid, CRED_REASON_NO_ACTIVE_TOOL);
                     return Ok(LSM_DENY);
                 }
-                Some(&active_tool) => {
+                Some(active_tool) => {
+                    // Expired window (a lost CompleteToolCall): treat as closed
+                    // and deny, so access cannot stay open indefinitely.
+                    if active_tool.expires_at_ns != 0 && now_ns > active_tool.expires_at_ns {
+                        bump_cred_stat(agentcontainer_common::events::STAT_CRED_BLOCKED);
+                        bump_cgroup_stat(cgid, CGROUP_STAT_CRED_BLOCKED);
+                        emit_cred_block_event(ino, cgid, CRED_REASON_NO_ACTIVE_TOOL);
+                        return Ok(LSM_DENY);
+                    }
                     let tool_key = SecretToolKey {
                         inode: ino,
                         dev_major: (s_dev >> 20) & 0xfff,
                         dev_minor: s_dev & 0xfffff,
                         cgroup_id: cgid,
-                        tool_id: active_tool,
+                        tool_id: active_tool.tool_id,
                     };
                     if unsafe { SECRET_TOOL_ACLS.get(&tool_key) }.is_none() {
                         // The active tool is not allowed this secret — deny.

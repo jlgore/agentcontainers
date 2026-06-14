@@ -10,8 +10,8 @@ use aya_ebpf::macros::map;
 use aya_ebpf::maps::{HashMap, LpmTrie, PerCpuArray, PerCpuHashMap, RingBuf};
 
 use agentcontainer_common::maps::{
-    CgroupStats, FsInodeKey, LpmDataV4, LpmDataV6, PortKeyV4, SecretAclKey, SecretAclValue,
-    SecretToolKey,
+    ActiveTool, CgroupStats, FsInodeKey, LpmDataV4, LpmDataV6, PortKeyV4, SecretAclKey,
+    SecretAclValue, SecretToolKey,
 };
 
 // --- Cgroup scoping ---
@@ -131,7 +131,7 @@ pub static SECRET_TOOL_ACLS: HashMap<SecretToolKey, u8> = HashMap::with_max_entr
 /// and removed by CompleteToolCall. Absent means no tool-call window is open, so
 /// a restricted secret in that cgroup is denied.
 #[map]
-pub static ACTIVE_TOOL: HashMap<u64, u64> = HashMap::with_max_entries(256, 0);
+pub static ACTIVE_TOOL: HashMap<u64, ActiveTool> = HashMap::with_max_entries(256, 0);
 
 /// Ring buffer for credential enforcement events.
 #[map]

@@ -46,6 +46,12 @@ const (
 	// ephemeral mTLS material to (passed via --creds-dir).
 	credsContainerDir = "/creds"
 
+	// EnforcerCertServerName is a SAN the enforcer's ephemeral server cert
+	// always carries (see the enforcer's generate_session_certs). Use it as the
+	// TLS ServerName when dialing the enforcer at an address not in the SAN list
+	// (e.g. a sandbox VM IP).
+	EnforcerCertServerName = "localhost"
+
 	// Client-side credential filenames written by the enforcer into credsContainerDir.
 	clientCertFile = "client.crt"
 	clientKeyFile  = "client.key"
@@ -79,6 +85,11 @@ type SidecarHandle struct {
 	// without mTLS via an explicit development-only opt-in.
 	InsecureDev bool
 
+	// ServerName overrides the TLS hostname verified against the enforcer
+	// certificate when Addr is not in the cert's SANs (e.g. an in-VM enforcer
+	// reached at the VM IP, presenting a cert for localhost).
+	ServerName string
+
 	// credsDir is the host temp directory holding the retrieved credentials.
 	// It is removed when a managed sidecar is stopped.
 	credsDir string
@@ -92,6 +103,7 @@ func (h *SidecarHandle) Profile() enforcement.ConnectionProfile {
 		CACertPath:     h.CACertPath,
 		ClientCertPath: h.ClientCertPath,
 		ClientKeyPath:  h.ClientKeyPath,
+		ServerName:     h.ServerName,
 		InsecureDev:    h.InsecureDev,
 	}
 }
@@ -138,6 +150,11 @@ type StartOptions struct {
 	// It is propagated to the returned handle's connection profile so a
 	// non-loopback plaintext endpoint is permitted rather than rejected.
 	InsecureDev bool
+
+	// ServerName overrides the TLS hostname verified against the enforcer
+	// certificate. Set it for an in-VM sidecar reached at the VM IP (the cert
+	// covers localhost/127.0.0.1, not the VM IP). Empty for host-local sidecars.
+	ServerName string
 }
 
 func (o *StartOptions) applyDefaults() {
@@ -355,6 +372,7 @@ func StartSidecar(ctx context.Context, dockerClient client.APIClient, opts Start
 		Addr:        addr,
 		Managed:     true,
 		InsecureDev: opts.InsecureDev,
+		ServerName:  opts.ServerName,
 	}
 
 	// 4. Retrieve ephemeral mTLS credentials before the health gate. The

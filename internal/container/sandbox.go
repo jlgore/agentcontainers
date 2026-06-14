@@ -412,9 +412,12 @@ func (s *SandboxRuntime) Start(ctx context.Context, cfg *config.AgentContainer, 
 				HealthCheckAddr: enforcerAddr,
 				// In-VM enforcer: reachable from the host at the VM IP (no
 				// HostBindIP), authenticated with ephemeral mTLS unless the
-				// operator opted into plaintext development mode.
+				// operator opted into plaintext development mode. The enforcer
+				// cert covers localhost/127.0.0.1, not the VM IP, so verify the
+				// TLS hostname against "localhost".
 				MTLS:        !s.insecureDev,
 				InsecureDev: s.insecureDev,
+				ServerName:  sidecar.EnforcerCertServerName,
 			})
 			if startErr != nil {
 				s.logger.Warn("failed to start enforcer in VM",

@@ -17,6 +17,10 @@ const (
 type wrapperSpec struct {
 	// argFlags consume the following token as their value (e.g. env -u NAME).
 	argFlags map[string]bool
+	// splitFlags carry a whole command as their value, which env splits on
+	// whitespace and executes (env -S 'python3 -c ...'). The value is the
+	// effective command, not an ignored option argument.
+	splitFlags map[string]bool
 	// allowAssignments permits leading VAR=val assignments (env).
 	allowAssignments bool
 	// numericPositional consumes one leading numeric/duration positional as a
@@ -37,7 +41,7 @@ func flagSet(flags ...string) map[string]bool {
 // transparentWrappers run another command with the same effect as running it
 // directly; the effective executable must be evaluated, not just the wrapper.
 var transparentWrappers = map[string]*wrapperSpec{
-	"env":     {allowAssignments: true, argFlags: flagSet("-u", "--unset", "-C", "--chdir", "-S", "--split-string")},
+	"env":     {allowAssignments: true, argFlags: flagSet("-u", "--unset", "-C", "--chdir"), splitFlags: flagSet("-S", "--split-string")},
 	"nohup":   {},
 	"setsid":  {}, // -w/-f/-c are no-arg flags
 	"command": {}, // -p/-v/-V are no-arg flags
@@ -218,6 +222,58 @@ func unquoteCArg(s string) string {
 	return s
 }
 
+// blockedEvalFlag reports whether any raw argument is a blocked interpreter
+// eval flag, matching exact (`-c`, `--eval`), attached short (`-c'print(1)'` →
+// token `-cprint(1)`), and attached long (`--eval=...`) forms. Operating on the
+// raw args (not normalized Parsed.Flags) is what catches the attached forms.
+func blockedEvalFlag(args []string, blocked map[string]bool) (string, bool) {
+	for _, a := range args {
+		if blocked[a] {
+			return a, true
+		}
+		if strings.HasPrefix(a, "--") {
+			if name, _, found := strings.Cut(a, "="); found && blocked[name] {
+				return name, true
+			}
+			continue
+		}
+		// Attached short form: "-c<payload>" → blocked if "-c" is blocked.
+		if len(a) > 2 && a[0] == '-' {
+			if short := a[:2]; blocked[short] {
+				return short, true
+			}
+		}
+	}
+	return "", false
+}
+
+// extractSplitString finds a split-string flag (env -S / --split-string) and
+// returns its still-quoted value, which is a whole command. ok is false when
+// the wrapper declares no split flags or none is present.
+func extractSplitString(bin string, args []string) (value string, ok bool) {
+	spec := transparentWrappers[bin]
+	if spec == nil || len(spec.splitFlags) == 0 {
+		return "", false
+	}
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case strings.HasPrefix(a, "--") && strings.Contains(a, "="):
+			if name, val, _ := strings.Cut(a, "="); spec.splitFlags[name] {
+				return val, true
+			}
+		case spec.splitFlags[a]: // "-S value" (separate token)
+			if i+1 < len(args) {
+				return args[i+1], true
+			}
+			return "", false
+		case len(a) > 2 && strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && spec.splitFlags[a[:2]]:
+			return a[2:], true // attached "-Svalue"
+		}
+	}
+	return "", false
+}
+
 // denyParsed builds a decomposition-level structural deny for a command segment
 // that cannot be safely evaluated (malformed/over-nested wrapper chain, blocked
 // interpreter eval flag, unmodeled exec mechanism).
@@ -256,6 +312,17 @@ func decomposeWrapped(command []string, outputFlags []string, rawLine string, de
 
 	switch {
 	case transparentWrappers[bin] != nil:
+		// env -S 'cmd ...' carries the command in the split-string value; parse
+		// it as a shell program so the effective executable is evaluated.
+		if val, ok := extractSplitString(bin, command[1:]); ok {
+			payload := unquoteCArg(val)
+			if len(payload) > maxPayloadBytes {
+				out = append(out, denyParsed(bin, "split-string payload exceeds size limit", rawLine))
+			} else {
+				out = append(out, decomposeShellLineDepth(payload, outputFlags, depth+1)...)
+			}
+			return out
+		}
 		effective, ok := unwrapTransparent(bin, command[1:])
 		if !ok {
 			out[0].Deny = true
@@ -275,13 +342,10 @@ func decomposeWrapped(command []string, outputFlags []string, rawLine string, de
 			}
 		}
 	case interpreterEvalFlags[bin] != nil:
-		blocked := interpreterEvalFlags[bin]
-		for _, f := range p.Flags {
-			if blocked[f] {
-				out[0].Deny = true
-				out[0].DenyReasons = append(out[0].DenyReasons,
-					"blocked eval flag "+f+" on interpreter "+bin)
-			}
+		if f, ok := blockedEvalFlag(command[1:], interpreterEvalFlags[bin]); ok {
+			out[0].Deny = true
+			out[0].DenyReasons = append(out[0].DenyReasons,
+				"blocked eval flag "+f+" on interpreter "+bin)
 		}
 	case unmodeledExecMechanisms[bin]:
 		out[0].Deny = true

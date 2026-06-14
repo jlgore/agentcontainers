@@ -79,28 +79,36 @@ func WithInsecure() GRPCOption {
 // Returns an error if any file cannot be read or the certificate pool cannot
 // be built.
 func WithMTLSConfig(certFile, keyFile, caFile string) (GRPCOption, error) {
+	tlsConf, err := buildMTLSConfig(certFile, keyFile, caFile, "")
+	if err != nil {
+		return nil, err
+	}
+	return WithTLSConfig(tlsConf), nil
+}
+
+// buildMTLSConfig builds a client mTLS config. serverName, when non-empty,
+// overrides the hostname verified against the server certificate's SANs — needed
+// when dialing an address (e.g. a sandbox VM IP) that is not itself in the
+// cert's SAN list but which presents a cert for a known name (localhost).
+func buildMTLSConfig(certFile, keyFile, caFile, serverName string) (*tls.Config, error) {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		return nil, fmt.Errorf("mtls: load client cert/key: %w", err)
 	}
-
 	caPEM, err := os.ReadFile(caFile)
 	if err != nil {
 		return nil, fmt.Errorf("mtls: read CA cert: %w", err)
 	}
-
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(caPEM) {
 		return nil, fmt.Errorf("mtls: failed to parse CA cert from %s", caFile)
 	}
-
-	tlsConf := &tls.Config{
+	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		RootCAs:      pool,
 		MinVersion:   tls.VersionTLS13,
-	}
-
-	return WithTLSConfig(tlsConf), nil
+		ServerName:   serverName,
+	}, nil
 }
 
 // tlsPoolFromPEM parses a PEM-encoded CA certificate into a cert pool.
@@ -167,6 +175,12 @@ type ConnectionProfile struct {
 	ClientCertPath string
 	ClientKeyPath  string
 
+	// ServerName overrides the hostname verified against the enforcer
+	// certificate's SANs. It is required when Addr is not itself in the cert's
+	// SAN list — e.g. a sandbox VM IP, where the enforcer presents a cert for
+	// "localhost"/"127.0.0.1". Empty means verify against Addr's host.
+	ServerName string
+
 	// InsecureDev permits a plaintext connection to a non-loopback endpoint.
 	// It is an explicit development-only opt-in; a prominent warning is logged
 	// whenever it takes effect. Without it, a non-loopback endpoint with no
@@ -206,11 +220,11 @@ func isLoopbackEndpoint(addr string) bool {
 // It never silently downgrades a TLS-credentialed profile to plaintext.
 func optionsFromProfile(p ConnectionProfile, warn func(string)) ([]GRPCOption, error) {
 	if p.HasMTLS() {
-		opt, err := WithMTLSConfig(p.ClientCertPath, p.ClientKeyPath, p.CACertPath)
+		tlsConf, err := buildMTLSConfig(p.ClientCertPath, p.ClientKeyPath, p.CACertPath, p.ServerName)
 		if err != nil {
 			return nil, err
 		}
-		return []GRPCOption{opt}, nil
+		return []GRPCOption{WithTLSConfig(tlsConf)}, nil
 	}
 	if isLoopbackEndpoint(p.Addr) {
 		return []GRPCOption{WithInsecure()}, nil

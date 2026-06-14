@@ -34,24 +34,28 @@ and process enforcement for agent containers.`,
 
 func newEnforcerStartCmd() *cobra.Command {
 	var (
-		image string
-		port  int
+		image       string
+		port        int
+		insecureDev bool
 	)
 
 	cmd := &cobra.Command{
 		Use:   "start",
 		Short: "Start the agentcontainer-enforcer sidecar container",
 		Long: `Pull and start the agentcontainer-enforcer container with the required capabilities
-and mounts for BPF enforcement. After starting, the command probes the
-gRPC health endpoint to verify the enforcer is ready.`,
+and mounts for BPF enforcement. The control plane is published on 127.0.0.1
+only and secured with ephemeral mutual TLS; the command prints the
+AC_ENFORCER_* exports a subsequent 'agentcontainer run' needs to connect.
+After starting, it probes the gRPC health endpoint to verify readiness.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runEnforcerStart(cmd, image, port)
+			return runEnforcerStart(cmd, image, port, insecureDev)
 		},
 	}
 
 	cmd.Flags().StringVar(&image, "image", sidecar.DefaultEnforcerImage, "agentcontainer-enforcer OCI image reference")
 	cmd.Flags().IntVar(&port, "port", sidecar.DefaultPort, "gRPC listen port")
+	cmd.Flags().BoolVar(&insecureDev, "insecure-dev", false, "Run the control plane in plaintext without mTLS (development only)")
 
 	return cmd
 }
@@ -94,7 +98,7 @@ var newDockerClient = func() (client.APIClient, error) {
 	return client.New(client.FromEnv)
 }
 
-func runEnforcerStart(cmd *cobra.Command, image string, port int) error {
+func runEnforcerStart(cmd *cobra.Command, image string, port int, insecureDev bool) error {
 	ctx := cmd.Context()
 	out := cmd.OutOrStdout()
 
@@ -109,6 +113,11 @@ func runEnforcerStart(cmd *cobra.Command, image string, port int) error {
 		Image:    image,
 		Port:     port,
 		Required: true,
+		// Publish on loopback only and require ephemeral mTLS by default, so the
+		// control plane is never exposed plaintext on all interfaces.
+		HostBindIP:  "127.0.0.1",
+		MTLS:        !insecureDev,
+		InsecureDev: insecureDev,
 	})
 	if err != nil {
 		return fmt.Errorf("enforcer start: %w", err)
@@ -118,6 +127,20 @@ func runEnforcerStart(cmd *cobra.Command, image string, port int) error {
 	}
 
 	_, _ = fmt.Fprintf(out, "Enforcer started\n  Address: 127.0.0.1:%d\n  Container: %s\n", port, shortID(handle.ContainerID))
+	if insecureDev {
+		_, _ = fmt.Fprintf(out, "  WARNING: --insecure-dev set; control plane is PLAINTEXT (development only)\n")
+		_, _ = fmt.Fprintf(out, "\nExport before 'agentcontainer run':\n  export AC_ENFORCER_ADDR=127.0.0.1:%d\n", port)
+		return nil
+	}
+	// The retrieved client credentials persist on the host (the enforcer keeps
+	// running). Print the exports a later 'agentcontainer run' uses to connect
+	// over mTLS as an external sidecar.
+	_, _ = fmt.Fprintf(out, "  mTLS: enabled (ephemeral)\n\nExport before 'agentcontainer run':\n"+
+		"  export AC_ENFORCER_ADDR=127.0.0.1:%d\n"+
+		"  export AC_ENFORCER_TLS_CA=%s\n"+
+		"  export AC_ENFORCER_TLS_CERT=%s\n"+
+		"  export AC_ENFORCER_TLS_KEY=%s\n",
+		port, handle.CACertPath, handle.ClientCertPath, handle.ClientKeyPath)
 	return nil
 }
 

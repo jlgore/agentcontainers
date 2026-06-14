@@ -113,6 +113,18 @@ pub struct SecretToolKey {
     pub tool_id: u64,
 }
 
+/// Value for the `ACTIVE_TOOL` map: the tool identity currently executing in a
+/// cgroup, plus a monotonic-clock (`CLOCK_MONOTONIC` / `bpf_ktime_get_ns`)
+/// expiry. The expiry bounds the blast radius of a lost CompleteToolCall — past
+/// it, file_open treats the tool-call window as closed and denies the secret.
+/// `expires_at_ns == 0` means no expiry.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActiveTool {
+    pub tool_id: u64,
+    pub expires_at_ns: u64,
+}
+
 /// A stable 64-bit identity for an MCP tool name. The enforcer derives both the
 /// allowed-tool entries (from a secret's allowed-tools list) and the active-tool
 /// value (from PrepareToolCall's tool name) with [`tool_identity`], so equal
@@ -183,6 +195,7 @@ mod pod_impls {
     unsafe impl aya::Pod for super::SecretAclKey {}
     unsafe impl aya::Pod for super::SecretAclValue {}
     unsafe impl aya::Pod for super::SecretToolKey {}
+    unsafe impl aya::Pod for super::ActiveTool {}
     unsafe impl aya::Pod for super::LpmDataV4 {}
     unsafe impl aya::Pod for super::LpmDataV6 {}
     unsafe impl aya::Pod for super::DomainKey {}

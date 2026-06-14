@@ -173,19 +173,23 @@ running.
 
 #### Per-tool secret restrictions
 
-A secret may be scoped to specific MCP tools via `allowedTools`:
+A secret may be scoped to specific MCP servers via `allowedTools`:
 
 - **Empty `allowedTools`** — container-wide: any code in the cgroup may read the
   secret (subject to TTL and write rules).
 - **Non-empty `allowedTools`** — restricted: the secret is readable **only while
-  one of its allowed tools has an active tool-call window**.
+  one of its allowed servers has an active tool-call window**. `allowedTools`
+  entries are MCP **server** identities (the `tools.MCP` entry name, e.g.
+  `github-mcp`), which is what the proxy names in `PrepareToolCall`.
 
-The kernel enforces this through two maps: `SECRET_TOOL_ACLS` records which tool
-identities may read each restricted secret, and `ACTIVE_TOOL` records the tool
-identity currently executing in each cgroup. `PrepareToolCall` writes the active
-tool and `CompleteToolCall` clears it (including on tool error or cancellation).
-The `file_open` hook denies a restricted secret when there is no active window,
-or when the active tool is not in the secret's allow-set.
+The kernel enforces this through two maps: `SECRET_TOOL_ACLS` records which
+identities may read each restricted secret, and `ACTIVE_TOOL` records the
+identity currently executing in each cgroup together with an expiry.
+`PrepareToolCall` writes the active identity and `CompleteToolCall` clears it
+(including on tool error or cancellation). The `file_open` hook denies a
+restricted secret when there is no active window, when the window has **expired**
+(a lost `CompleteToolCall` cannot leave access open indefinitely), or when the
+active identity is not in the secret's allow-set.
 
 Restricted MCP servers are **serialized**: only one tool call may be active at a
 time, so the active-tool identity is unambiguous. `PrepareToolCall` rejects an

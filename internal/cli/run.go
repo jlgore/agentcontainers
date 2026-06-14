@@ -567,21 +567,34 @@ func resolveSidecar(cmd *cobra.Command, cfg *config.AgentContainer, insecureDev 
 	// 1. Check for pre-existing sidecar. Its mTLS material, if any, is supplied
 	// out of band through AC_ENFORCER_TLS_* in the environment this process was
 	// launched with (reading explicit external config is not the in-process
-	// global-mutation pattern the control-plane finding targets).
-	result := sidecar.DiscoverExternalSidecar(sidecar.DiscoverOptions{
-		ConfigAddr: configAddr,
-	})
+	// global-mutation pattern the control-plane finding targets). Probe each
+	// candidate with that profile — a plaintext probe would classify a correctly
+	// configured mTLS-only external enforcer as unreachable.
+	externalProfile := func(addr string) enforcement.ConnectionProfile {
+		return enforcement.ConnectionProfile{
+			Addr:           addr,
+			CACertPath:     os.Getenv("AC_ENFORCER_TLS_CA"),
+			ClientCertPath: os.Getenv("AC_ENFORCER_TLS_CERT"),
+			ClientKeyPath:  os.Getenv("AC_ENFORCER_TLS_KEY"),
+			InsecureDev:    insecureDev,
+		}
+	}
+	result := sidecar.DiscoverExternalSidecarWithProber(
+		sidecar.DiscoverOptions{ConfigAddr: configAddr},
+		func(addr string) bool { return enforcement.ProbeEnforcerHealthProfile(externalProfile(addr)) },
+	)
 	if result.Addr != "" {
 		logger.Info("using pre-existing agentcontainer-enforcer",
 			zap.String("addr", result.Addr),
 			zap.String("source", result.Source),
 		)
+		p := externalProfile(result.Addr)
 		return &sidecar.SidecarHandle{
 			Addr:           result.Addr,
 			Managed:        false,
-			CACertPath:     os.Getenv("AC_ENFORCER_TLS_CA"),
-			ClientCertPath: os.Getenv("AC_ENFORCER_TLS_CERT"),
-			ClientKeyPath:  os.Getenv("AC_ENFORCER_TLS_KEY"),
+			CACertPath:     p.CACertPath,
+			ClientCertPath: p.ClientCertPath,
+			ClientKeyPath:  p.ClientKeyPath,
 			InsecureDev:    insecureDev,
 		}, nil
 	}

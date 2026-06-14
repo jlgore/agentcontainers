@@ -189,6 +189,10 @@ func secretContainerPath(name string) string {
 // collects all MCP tools that reference it (via the tool's Secrets field) and
 // merges any AllowedTools declared on the SecretConfig itself.
 //
+// AllowedTools entries are MCP *server* identities (the tools.MCP entry name,
+// e.g. "github-mcp"), not individual method names — the kernel restriction is
+// keyed on the server the proxy names in PrepareToolCall.
+//
 // The TTL string from SecretConfig (e.g. "1h", "30m") is parsed via
 // time.ParseDuration and converted to seconds. Unparseable TTLs are treated
 // as zero (no expiry).

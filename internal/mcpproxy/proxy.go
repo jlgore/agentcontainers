@@ -538,7 +538,7 @@ func (p *Proxy) handleToolCall(b *Backend, toolName string) mcp.ToolHandler {
 		}
 		defer b.releaseToolSlot()
 
-		if err := p.prepareToolCall(ctx, b, corrID, toolName); err != nil {
+		if err := p.prepareToolCall(ctx, b, corrID); err != nil {
 			return nil, err
 		}
 		if shouldCorrelate(b) {
@@ -654,14 +654,18 @@ func shouldCorrelate(b *Backend) bool {
 	return b != nil && b.ContainerID != ""
 }
 
-func (p *Proxy) prepareToolCall(ctx context.Context, b *Backend, corrID, toolName string) error {
+func (p *Proxy) prepareToolCall(ctx context.Context, b *Backend, corrID string) error {
 	if !shouldCorrelate(b) || p.deps.Enforcer == nil {
 		return nil
 	}
+	// The per-tool secret restriction is keyed on the MCP *server* identity
+	// (the tools.MCP entry name, b.Name), which is what policy resolution puts
+	// in a secret's allowedTools. Sending the individual method name here would
+	// never match the resolved ACL, so restricted secrets would be unreadable.
 	_, err := p.deps.Enforcer.PrepareToolCall(ctx, &enforcerapi.PrepareToolCallRequest{
 		CorrelationId: corrID,
 		ContainerId:   b.ContainerID,
-		ToolName:      toolName,
+		ToolName:      b.Name,
 	})
 	if err != nil {
 		return fmt.Errorf("mcpproxy: preparing tool-call correlation for %s: %w", b.Name, err)

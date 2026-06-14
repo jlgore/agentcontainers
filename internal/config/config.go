@@ -727,11 +727,31 @@ func (c *AgentContainer) validateRestrictedSecretConcurrency() []error {
 	if c.Agent == nil {
 		return nil
 	}
+	// A secret is restricted if it declares allowedTools explicitly OR is
+	// referenced by an MCP server's secrets list — policy resolution restricts
+	// both. Check the effective set, not just the explicit field, so an
+	// implicitly-restricted secret cannot slip past with concurrency > 1.
 	hasRestricted := false
 	for _, sc := range c.Agent.Secrets {
 		if len(sc.AllowedTools) > 0 {
 			hasRestricted = true
 			break
+		}
+	}
+	if !hasRestricted && c.Agent.Tools != nil {
+		for _, tool := range c.Agent.Tools.MCP {
+			if len(tool.Secrets) > 0 {
+				// Only counts if it references a declared secret.
+				for _, key := range tool.Secrets {
+					if _, ok := c.Agent.Secrets[key]; ok {
+						hasRestricted = true
+						break
+					}
+				}
+			}
+			if hasRestricted {
+				break
+			}
 		}
 	}
 	if !hasRestricted {

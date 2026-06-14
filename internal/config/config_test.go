@@ -839,6 +839,18 @@ func TestValidate_RestrictedSecretConcurrency(t *testing.T) {
 			wantErr: "maxConcurrentTools must be <= 1",
 		},
 		{
+			name: "secret restricted implicitly via MCP secrets ref + concurrency > 1 is rejected",
+			agent: &AgentConfig{
+				Secrets: unrestrictedSecret, // no explicit allowedTools
+				Tools: &ToolsConfig{
+					MCP: map[string]MCPToolConfig{
+						"github-mcp": {Type: "container", Image: "x:latest", Secrets: []string{"API_KEY"}, Policy: &MCPServerPolicy{MaxConcurrentTools: 3}},
+					},
+				},
+			},
+			wantErr: "maxConcurrentTools must be <= 1",
+		},
+		{
 			name: "restricted secret with concurrency 1 is allowed",
 			agent: &AgentConfig{
 				Secrets: restrictedSecret,
