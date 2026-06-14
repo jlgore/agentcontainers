@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/jlgore/agentcontainers/compare/ac-v0.1.1...ac-v0.1.2) (2026-06-14)
+
+
+### Bug Fixes
+
+* **ci:** set goreleaser monorepo tag_prefix for ac- component tags ([f9c4cf1](https://github.com/jlgore/agentcontainers/commit/f9c4cf16d615237ab8f12acaf27607e1fd231973))
+
 ## [0.1.1](https://github.com/jlgore/agentcontainers/compare/ac-v0.1.0...ac-v0.1.1) (2026-06-14)
 
 
