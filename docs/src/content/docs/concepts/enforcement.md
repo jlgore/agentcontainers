@@ -111,6 +111,31 @@ not inspect command arguments; argument-level policy (e.g. blocking
 `python3 -c '...'` interpreter injection) is the [guard layer's](/concepts/architecture/)
 responsibility.
 
+#### Command normalization (for policy authors)
+
+Before a shell command reaches the policy, the guard **normalizes transparent
+wrappers** so a rule cannot be evaded by hiding the real executable behind a
+benign-looking one. Policy authors write rules against the *effective* command:
+
+- **Transparent wrappers** — `env`, `command`, `builtin`, `exec`, `nohup`,
+  `timeout`, `nice`, `setsid`, `stdbuf` — are unwrapped (including their options
+  and `VAR=value` assignments). Both the wrapper and the effective executable
+  are evaluated, so `timeout 5 python3 -c '...'` is judged as `python3 -c`, not
+  `timeout`.
+- **Shell `-c` payloads** for `sh`/`bash`/`dash`/… are parsed recursively, so a
+  command hidden inside `bash -c '...'` is evaluated on its own.
+- **Language evaluators** (`python`, `node`, `perl`, `ruby`, `php`) have their
+  inline-eval flags (`-c`, `-e`, `-r`, …) **denied** outright — the source is
+  not parsed, the eval is refused.
+- **Unmodeled exec mechanisms** (`xargs`, `parallel`) are **denied by default**
+  until explicitly modeled, so they cannot launder a blocked command.
+- **Malformed or excessively nested** wrapper/interpreter chains are denied, and
+  decomposition is bounded by explicit recursion, token-count, and payload-size
+  limits.
+
+Pipelines, subshells, command substitutions, and redirects are each decomposed
+into their own segments; a command is denied if **any** segment is denied.
+
 ### Layer 5: Credential enforcement (CREDLSM)
 
 The BPF LSM `file_open` hook includes a `SECRET_ACLS` map that gates per-cgroup access to secret files:

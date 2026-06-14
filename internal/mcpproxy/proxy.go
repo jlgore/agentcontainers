@@ -809,7 +809,14 @@ func decomposeStructuredArgs(argMap map[string]any, binaryArg, argsArg string, o
 			}
 		}
 	}
-	return []Parsed{DecomposeCommand(command, outputFlags)}
+	// Normalize transparent wrappers / interpreters so a structured
+	// run_command cannot launder a blocked effective executable behind e.g.
+	// `timeout python3 -c ...`, matching the shell-line path.
+	ps := decomposeWrapped(command, outputFlags, strings.Join(command, " "), 0)
+	for i := range ps {
+		ps[i].Via = "structured"
+	}
+	return ps
 }
 
 // policyContext builds the runtime context for the policy input document

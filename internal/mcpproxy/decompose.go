@@ -32,6 +32,14 @@ type Parsed struct {
 	DevicePaths []string `json:"device_paths"` // /dev/* for devPathTools
 	Args        []string `json:"args"`         // raw args (scanned by shell_metacharacters)
 	Via         string   `json:"via"`          // "structured" | "shell" | "fallback"
+
+	// Deny marks a decomposition-level structural denial that the Rego policies
+	// cannot express: a malformed or excessively nested wrapper chain, a blocked
+	// interpreter eval flag (python -c, perl -e), or an unmodeled exec mechanism
+	// (xargs). EvaluateParsed denies any Parsed with Deny set, regardless of the
+	// Rego decision. Not serialized into the policy input.
+	Deny        bool     `json:"-"`
+	DenyReasons []string `json:"-"`
 }
 
 func (p Parsed) toInput() map[string]any {
@@ -165,10 +173,25 @@ func DecomposeCommand(command []string, outputFlags []string) Parsed {
 // to a literal operator split; the raw-line metachar scan means the
 // fallback never weakens the deny, only path/flag extraction precision.
 func DecomposeShellLine(line string, outputFlags []string) []Parsed {
+	return decomposeShellLineDepth(line, outputFlags, 0)
+}
+
+// decomposeShellLineDepth is the depth-bounded core of DecomposeShellLine.
+// depth increases through interpreter `-c` payloads and nested
+// substitutions/subshells, so a pathological or hostile nesting is denied
+// rather than parsed without limit.
+func decomposeShellLineDepth(line string, outputFlags []string, depth int) []Parsed {
+	if depth > maxWrapperDepth {
+		return []Parsed{denyParsed("", "shell nesting exceeds limit", line)}
+	}
+	if len(line) > maxPayloadBytes {
+		return []Parsed{denyParsed("", "shell line exceeds size limit", line)}
+	}
+
 	parser := syntax.NewParser()
 	file, err := parser.Parse(strings.NewReader(line), "command")
 	if err != nil {
-		return fallbackSplit(line, outputFlags)
+		return fallbackSplit(line, outputFlags, depth)
 	}
 
 	printer := syntax.NewPrinter()
@@ -179,8 +202,13 @@ func DecomposeShellLine(line string, outputFlags []string) []Parsed {
 	}
 
 	var out []Parsed
-	var walkStmt func(stmt *syntax.Stmt)
-	walkStmt = func(stmt *syntax.Stmt) {
+	substitutions := 0
+	var walkStmt func(stmt *syntax.Stmt, depth int)
+	walkStmt = func(stmt *syntax.Stmt, depth int) {
+		if depth > maxWrapperDepth {
+			out = append(out, denyParsed("", "shell nesting exceeds limit", line))
+			return
+		}
 		// Redirect targets: > and >> are output paths attached to the
 		// segment produced by this statement's command.
 		var redirOutputs []string
@@ -203,36 +231,43 @@ func DecomposeShellLine(line string, outputFlags []string) []Parsed {
 				// and evaluate the inner command too.
 				for _, part := range w.Parts {
 					if cs, ok := part.(*syntax.CmdSubst); ok {
+						substitutions++
+						if substitutions > maxSubstitutions {
+							out = append(out, denyParsed("", "too many command substitutions", line))
+							return
+						}
 						for _, inner := range cs.Stmts {
-							walkStmt(inner)
+							walkStmt(inner, depth+1)
 						}
 					}
 				}
 			}
-			p := DecomposeCommand(tokens, outputFlags)
-			p.Via = "shell"
-			p.OutputPaths = append(p.OutputPaths, redirOutputs...)
-			p.Args = append(p.Args, line)
-			out = append(out, p)
+			// Normalize transparent wrappers / interpreter -c payloads, then
+			// attach this statement's redirect outputs to the leading segment.
+			ps := decomposeWrapped(tokens, outputFlags, line, depth)
+			if len(ps) > 0 {
+				ps[0].OutputPaths = append(ps[0].OutputPaths, redirOutputs...)
+			}
+			out = append(out, ps...)
 		case *syntax.BinaryCmd: // |, &&, ||
-			walkStmt(cmd.X)
-			walkStmt(cmd.Y)
+			walkStmt(cmd.X, depth)
+			walkStmt(cmd.Y, depth)
 		case *syntax.Subshell:
 			for _, inner := range cmd.Stmts {
-				walkStmt(inner)
+				walkStmt(inner, depth+1)
 			}
 		case *syntax.Block:
 			for _, inner := range cmd.Stmts {
-				walkStmt(inner)
+				walkStmt(inner, depth+1)
 			}
 		}
 	}
 	for _, stmt := range file.Stmts {
-		walkStmt(stmt)
+		walkStmt(stmt, depth)
 	}
 
 	if len(out) == 0 {
-		return fallbackSplit(line, outputFlags)
+		return fallbackSplit(line, outputFlags, depth)
 	}
 	return out
 }
@@ -242,7 +277,9 @@ var shellOperators = []string{"&&", "||", ";", "|", "\n", "&"}
 
 // fallbackSplit is the sift-mcp-style degradation: split on shell
 // operators literally (not quote-aware), tokenize each segment by fields.
-func fallbackSplit(line string, outputFlags []string) []Parsed {
+// Transparent wrappers are still normalized so the fallback never weakens the
+// deny relative to the AST path.
+func fallbackSplit(line string, outputFlags []string, depth int) []Parsed {
 	segments := []string{line}
 	for _, op := range shellOperators {
 		var next []string
@@ -258,10 +295,11 @@ func fallbackSplit(line string, outputFlags []string) []Parsed {
 		if len(tokens) == 0 {
 			continue
 		}
-		p := DecomposeCommand(tokens, outputFlags)
-		p.Via = "fallback"
-		p.Args = append(p.Args, line)
-		out = append(out, p)
+		ps := decomposeWrapped(tokens, outputFlags, line, depth)
+		for i := range ps {
+			ps[i].Via = "fallback"
+		}
+		out = append(out, ps...)
 	}
 	return out
 }

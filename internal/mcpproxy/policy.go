@@ -58,6 +58,17 @@ func (e *Evaluator) PoliciesEvaluated() []string {
 // envelope in one place. Fail-closed handling (an error means deny) is the
 // caller's responsibility.
 func (e *Evaluator) EvaluateParsed(ctx context.Context, server, tool string, args any, parsed Parsed, pctx map[string]any) (Decision, error) {
+	// A decomposition-level structural deny (malformed/over-nested wrapper
+	// chain, blocked interpreter eval flag, unmodeled exec mechanism) short-
+	// circuits the Rego evaluation — these are denials the policies cannot
+	// express, and they must hold regardless of the configured rule set.
+	if parsed.Deny {
+		reasons := parsed.DenyReasons
+		if len(reasons) == 0 {
+			reasons = []string{"command decomposition denied"}
+		}
+		return Decision{Allowed: false, Reasons: reasons, PoliciesEvaluated: e.pkgs}, nil
+	}
 	return e.Evaluate(ctx, map[string]any{
 		"server":  server,
 		"tool":    tool,
