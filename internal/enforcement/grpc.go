@@ -301,8 +301,20 @@ func NewGRPCStrategy(target string, opts ...GRPCOption) (*GRPCStrategy, error) {
 	}, nil
 }
 
-// Apply registers the container with the enforcer sidecar and applies all policies.
+// Apply registers the container and applies base policy followed by credential
+// ACLs. Used by runtimes that do not inject secrets through the enforcer; the
+// Docker path uses the split ApplyBasePolicy / InjectSecrets / ApplyCredentialACLs
+// instead so ACLs are installed after the secret files exist.
 func (s *GRPCStrategy) Apply(ctx context.Context, containerID string, initPID uint32, p *policy.ContainerPolicy) error {
+	if err := s.ApplyBasePolicy(ctx, containerID, initPID, p); err != nil {
+		return err
+	}
+	return s.ApplyCredentialACLs(ctx, containerID, p)
+}
+
+// ApplyBasePolicy registers the container and applies network, filesystem, and
+// process policy — everything except credential ACLs.
+func (s *GRPCStrategy) ApplyBasePolicy(ctx context.Context, containerID string, initPID uint32, p *policy.ContainerPolicy) error {
 	// Resolve the cgroup path for this container.
 	cgroupPath, err := ResolveCgroupPath(containerID)
 	if err != nil {
@@ -350,18 +362,6 @@ func (s *GRPCStrategy) Apply(ctx context.Context, containerID string, initPID ui
 		return fmt.Errorf("grpc strategy: process policy failed: %s", procResp.GetError())
 	}
 
-	// Apply credential policy (Phase 6).
-	if len(p.SecretACLs) > 0 {
-		credReq := translateCredentialPolicy(containerID, p)
-		credResp, err := s.client.ApplyCredentialPolicy(ctx, credReq)
-		if err != nil {
-			return fmt.Errorf("grpc strategy: apply credential policy: %w", err)
-		}
-		if !credResp.GetSuccess() {
-			return fmt.Errorf("grpc strategy: credential policy failed: %s", credResp.GetError())
-		}
-	}
-
 	// Start event streaming for this container.
 	// Non-fatal: a missing event stream degrades observability but does not
 	// compromise enforcement. Log the error so operators can diagnose it.
@@ -369,6 +369,24 @@ func (s *GRPCStrategy) Apply(ctx context.Context, containerID string, initPID ui
 		fmt.Printf("enforcement: event stream for container %s failed to start: %v\n", containerID, err)
 	}
 
+	return nil
+}
+
+// ApplyCredentialACLs installs the secret credential ACLs. Must be called after
+// the secret files have been injected. A no-op when the policy declares no
+// secret ACLs.
+func (s *GRPCStrategy) ApplyCredentialACLs(ctx context.Context, containerID string, p *policy.ContainerPolicy) error {
+	if len(p.SecretACLs) == 0 {
+		return nil
+	}
+	credReq := translateCredentialPolicy(containerID, p)
+	credResp, err := s.client.ApplyCredentialPolicy(ctx, credReq)
+	if err != nil {
+		return fmt.Errorf("grpc strategy: apply credential policy: %w", err)
+	}
+	if !credResp.GetSuccess() {
+		return fmt.Errorf("grpc strategy: credential policy failed: %s", credResp.GetError())
+	}
 	return nil
 }
 

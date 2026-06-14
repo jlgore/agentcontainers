@@ -174,6 +174,16 @@ func resolveGit(p *ContainerPolicy, git *config.GitCaps) {
 	}
 }
 
+// SecretsBasePath is the in-container directory secrets are injected into. It
+// must match the enforcer's InjectSecrets default base path.
+const SecretsBasePath = "/run/secrets"
+
+// secretContainerPath returns the in-container path a named secret is injected
+// to, which is also the path its credential ACL keys off.
+func secretContainerPath(name string) string {
+	return SecretsBasePath + "/" + name
+}
+
 // ResolveSecrets builds SecretACL entries by cross-referencing the declared
 // secrets with MCP tool configurations. For each unique secret path, it
 // collects all MCP tools that reference it (via the tool's Secrets field) and
@@ -215,13 +225,14 @@ func ResolveSecrets(secrets map[string]config.SecretConfig, tools *config.ToolsC
 		}
 	}
 
-	// Build SecretACL entries for each secret that has a path.
+	// Build a SecretACL entry for every declared secret. Each secret is injected
+	// to /run/secrets/<name> (the InjectSecrets base path), so the ACL must key
+	// off that container path — never the provider lookup path (sc.Path holds a
+	// Vault/file-provider path, which the container never sees). Building an ACL
+	// for every secret also closes the gap where a secret with no provider path
+	// was injected but left ungated (file_open default-allow).
 	var acls []SecretACL
 	for secretKey, sc := range secrets {
-		if sc.Path == "" {
-			continue
-		}
-
 		var ttlSec uint64
 		if sc.TTL != "" {
 			if d, err := time.ParseDuration(sc.TTL); err == nil && d > 0 {
@@ -239,7 +250,7 @@ func ResolveSecrets(secrets map[string]config.SecretConfig, tools *config.ToolsC
 		}
 
 		acls = append(acls, SecretACL{
-			Path:         sc.Path,
+			Path:         secretContainerPath(secretKey),
 			AllowedTools: allowed,
 			TTLSeconds:   ttlSec,
 		})

@@ -391,6 +391,15 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
         return Ok(LSM_ALLOW);
     }
     // No ACL entry — fall through to general FS enforcement.
+    //
+    // A secret file is identified here only by the presence of its SECRET_ACLS
+    // entry (keyed by inode); the kernel cannot tell from the inode alone that
+    // an un-ACL'd file is a secret. The fail-closed guarantee therefore lives in
+    // userspace: the runtime injects every secret and installs its ACL while the
+    // container is paused, and aborts (tearing the container down) if any ACL
+    // cannot be resolved. By the time the container runs, every injected secret
+    // has an ACL entry above — so there is no "registered secret without an ACL"
+    // case that could reach this default-allow path.
 
     // 2. Check denied inodes (deny list takes priority).
     let denied = unsafe { DENIED_INODES.get(&key) };

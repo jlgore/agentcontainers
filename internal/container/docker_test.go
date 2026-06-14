@@ -808,6 +808,12 @@ var _ enforcement.Strategy = (*mockStrategy)(nil)
 func (m *mockStrategy) Apply(_ context.Context, _ string, _ uint32, _ *policy.ContainerPolicy) error {
 	return nil
 }
+func (m *mockStrategy) ApplyBasePolicy(_ context.Context, _ string, _ uint32, _ *policy.ContainerPolicy) error {
+	return nil
+}
+func (m *mockStrategy) ApplyCredentialACLs(_ context.Context, _ string, _ *policy.ContainerPolicy) error {
+	return nil
+}
 func (m *mockStrategy) Update(_ context.Context, _ string, _ *policy.ContainerPolicy) error {
 	return nil
 }

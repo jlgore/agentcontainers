@@ -26,16 +26,17 @@ import (
 type mockDockerAPIClient struct {
 	client.APIClient // embed for interface satisfaction
 
-	containerListFn   func(ctx context.Context, opts client.ContainerListOptions) (client.ContainerListResult, error)
-	containerLogsFn   func(ctx context.Context, ctr string, opts client.ContainerLogsOptions) (client.ContainerLogsResult, error)
-	containerCreateFn func(ctx context.Context, opts client.ContainerCreateOptions) (client.ContainerCreateResult, error)
-	containerStartFn  func(ctx context.Context, ctr string, opts client.ContainerStartOptions) (client.ContainerStartResult, error)
-	copyToContainerFn func(ctx context.Context, ctr string, opts client.CopyToContainerOptions) (client.CopyToContainerResult, error)
-	imageInspectFn    func(ctx context.Context, ref string) (client.ImageInspectResult, error)
-	imagePullFn       func(ctx context.Context, ref string, opts client.ImagePullOptions) (client.ImagePullResponse, error)
-	execCreateFn      func(ctx context.Context, ctr string, opts client.ExecCreateOptions) (client.ExecCreateResult, error)
-	execAttachFn      func(ctx context.Context, execID string, opts client.ExecAttachOptions) (client.ExecAttachResult, error)
-	execInspectFn     func(ctx context.Context, execID string, opts client.ExecInspectOptions) (client.ExecInspectResult, error)
+	containerListFn    func(ctx context.Context, opts client.ContainerListOptions) (client.ContainerListResult, error)
+	containerLogsFn    func(ctx context.Context, ctr string, opts client.ContainerLogsOptions) (client.ContainerLogsResult, error)
+	containerCreateFn  func(ctx context.Context, opts client.ContainerCreateOptions) (client.ContainerCreateResult, error)
+	containerStartFn   func(ctx context.Context, ctr string, opts client.ContainerStartOptions) (client.ContainerStartResult, error)
+	containerInspectFn func(ctx context.Context, ctr string, opts client.ContainerInspectOptions) (client.ContainerInspectResult, error)
+	copyToContainerFn  func(ctx context.Context, ctr string, opts client.CopyToContainerOptions) (client.CopyToContainerResult, error)
+	imageInspectFn     func(ctx context.Context, ref string) (client.ImageInspectResult, error)
+	imagePullFn        func(ctx context.Context, ref string, opts client.ImagePullOptions) (client.ImagePullResponse, error)
+	execCreateFn       func(ctx context.Context, ctr string, opts client.ExecCreateOptions) (client.ExecCreateResult, error)
+	execAttachFn       func(ctx context.Context, execID string, opts client.ExecAttachOptions) (client.ExecAttachResult, error)
+	execInspectFn      func(ctx context.Context, execID string, opts client.ExecInspectOptions) (client.ExecInspectResult, error)
 }
 
 func (m *mockDockerAPIClient) Close() error { return nil }
@@ -60,6 +61,17 @@ func (m *mockDockerAPIClient) ContainerCreate(ctx context.Context, opts client.C
 		return m.containerCreateFn(ctx, opts)
 	}
 	return client.ContainerCreateResult{ID: "mock-container-id"}, nil
+}
+
+func (m *mockDockerAPIClient) ContainerInspect(ctx context.Context, ctr string, opts client.ContainerInspectOptions) (client.ContainerInspectResult, error) {
+	if m.containerInspectFn != nil {
+		return m.containerInspectFn(ctx, ctr, opts)
+	}
+	// Default: a running container with a plausible init PID, so enforcement
+	// credential-ACL resolution has a PID to work with.
+	return client.ContainerInspectResult{
+		Container: container.InspectResponse{State: &container.State{Pid: 4321}},
+	}, nil
 }
 
 func (m *mockDockerAPIClient) ContainerStart(ctx context.Context, ctr string, opts client.ContainerStartOptions) (client.ContainerStartResult, error) {

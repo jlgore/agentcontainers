@@ -105,6 +105,24 @@ Block reasons are tracked:
 
 Credential events are emitted to a dedicated `CRED_EVENTS` ring buffer for audit logging.
 
+#### Atomic, fail-closed secret bootstrap
+
+Secrets are injected and gated while the container is **paused**, so it never
+runs for a single instruction with an injected-but-ungated secret. The Docker
+runtime bootstraps in strict order:
+
+```
+start → pause → register + base policy → inject secrets → install credential ACLs → unpause
+```
+
+Each secret is injected to `/run/secrets/<name>` and its ACL keys off that
+container path (never the provider lookup path). Because the ACL is installed
+only after the file exists, the enforcer can resolve the secret's inode; a path
+that cannot be resolved is a **fatal** error, never a silent skip. Any
+failure — pause, inject, ACL install, or unpause — tears the container down
+without ever unpausing it, so a partially-enforced container is never left
+running.
+
 ### Layer 6: Approval broker
 
 The approval broker wraps the container runtime (decorator pattern) and intercepts capability changes. When an agent requests a capability not declared in the original config, the broker:

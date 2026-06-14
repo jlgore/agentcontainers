@@ -1424,11 +1424,15 @@ mod linux {
                         );
                     }
                     Err(e) => {
-                        warn!(
-                            path = %acl.path,
-                            error = %e,
-                            "failed to resolve secret path inode, skipping"
-                        );
+                        // Fail closed: a secret whose inode cannot be resolved
+                        // would be left ungated (file_open default-allow). The
+                        // caller injects secrets before installing ACLs, so the
+                        // file must exist by now; an unresolvable path is a real
+                        // error and must abort the bootstrap, never be skipped.
+                        return Err(e.context(format!(
+                            "resolve secret path inode for ACL {} (container {})",
+                            acl.path, container_id
+                        )));
                     }
                 }
             }

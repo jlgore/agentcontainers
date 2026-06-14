@@ -415,6 +415,15 @@ func (s *composeTestStrategy) Apply(_ context.Context, containerID string, _ uin
 	s.applied = append(s.applied, containerID)
 	return s.applyErr
 }
+func (s *composeTestStrategy) ApplyBasePolicy(_ context.Context, containerID string, _ uint32, _ *policy.ContainerPolicy) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.applied = append(s.applied, containerID)
+	return s.applyErr
+}
+func (s *composeTestStrategy) ApplyCredentialACLs(_ context.Context, _ string, _ *policy.ContainerPolicy) error {
+	return nil
+}
 func (s *composeTestStrategy) Update(_ context.Context, _ string, _ *policy.ContainerPolicy) error {
 	return nil
 }

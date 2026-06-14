@@ -227,47 +227,75 @@ func (d *DockerRuntime) Start(ctx context.Context, cfg *config.AgentContainer, o
 
 	d.logger.Info("container started", zap.String("id", resp.ID))
 
-	// Inspect the container to get the init PID for enforcer access to
-	// /proc/<pid>/root/ (used by InjectSecrets). Treat inspect failure as
-	// fatal: without the PID the enforcer cannot inject secrets, and silently
-	// proceeding with initPID=0 would cause injection to target /proc/0/root
-	// which is either wrong or a security issue.
-	inspectResult, err := d.client.ContainerInspect(ctx, resp.ID, client.ContainerInspectOptions{})
-	if err != nil {
-		_, _ = d.client.ContainerStop(ctx, resp.ID, client.ContainerStopOptions{})
-		_, _ = d.client.ContainerRemove(ctx, resp.ID, client.ContainerRemoveOptions{Force: true})
-		return nil, fmt.Errorf("docker runtime: inspecting container for init PID: %w", err)
-	}
-	initPID := uint32(inspectResult.Container.State.Pid)
-
-	// Post-start enforcement: register the container and apply policy via the
-	// enforcer sidecar. Must happen after ContainerStart because the cgroup is
-	// created by the container runtime when the process starts.
-	if d.strategy != nil {
-		if err := d.strategy.Apply(ctx, resp.ID, initPID, p); err != nil {
-			// Enforcement failed — stop and remove the container (fail-closed).
-			_, _ = d.client.ContainerStop(ctx, resp.ID, client.ContainerStopOptions{})
-			_, _ = d.client.ContainerRemove(ctx, resp.ID, client.ContainerRemoveOptions{Force: true})
-			return nil, fmt.Errorf("docker runtime: post-start enforcement: %w", err)
+	// teardownUnenforced force-removes the container without unpausing it, so a
+	// container can never be left running with incomplete enforcement. Best-effort
+	// enforcement removal first cleans up any partially-installed BPF state.
+	teardownUnenforced := func() {
+		if d.strategy != nil {
+			_ = d.strategy.Remove(ctx, resp.ID)
 		}
+		_, _ = d.client.ContainerRemove(ctx, resp.ID, client.ContainerRemoveOptions{Force: true})
+	}
+
+	// When enforcement is active, bootstrap atomically: pause the container
+	// immediately so it cannot execute a single instruction before policy and
+	// secrets are fully installed, then apply enforcement in a strict order:
+	//
+	//   pause → base policy → inject secrets → credential ACLs → unpause
+	//
+	// Credential ACLs are installed only after the secret files exist, so the
+	// enforcer can resolve each secret's inode. Any failure tears the container
+	// down without ever unpausing it.
+	if d.strategy != nil {
+		if _, err := d.client.ContainerPause(ctx, resp.ID, client.ContainerPauseOptions{}); err != nil {
+			teardownUnenforced()
+			return nil, fmt.Errorf("docker runtime: pausing container for enforcement bootstrap: %w", err)
+		}
+
+		// Inspect (while paused) to get the init PID for enforcer access to
+		// /proc/<pid>/root/. Fatal on failure: without the PID the enforcer
+		// cannot inject secrets, and initPID=0 would target /proc/0/root.
+		inspectResult, err := d.client.ContainerInspect(ctx, resp.ID, client.ContainerInspectOptions{})
+		if err != nil {
+			teardownUnenforced()
+			return nil, fmt.Errorf("docker runtime: inspecting container for init PID: %w", err)
+		}
+		initPID := uint32(inspectResult.Container.State.Pid)
+
+		// 1. Base policy: register + network/filesystem/process (no ACLs yet).
+		if err := d.strategy.ApplyBasePolicy(ctx, resp.ID, initPID, p); err != nil {
+			teardownUnenforced()
+			return nil, fmt.Errorf("docker runtime: applying base policy: %w", err)
+		}
+
+		// 2. Inject secrets while paused, so the files exist before their ACLs.
+		if len(opts.ResolvedSecrets) > 0 {
+			if err := d.strategy.InjectSecrets(ctx, resp.ID, opts.ResolvedSecrets); err != nil {
+				teardownUnenforced()
+				return nil, fmt.Errorf("docker runtime: injecting secrets: %w", err)
+			}
+			d.logger.Info("secrets injected via enforcer",
+				zap.String("id", resp.ID),
+				zap.Int("count", len(opts.ResolvedSecrets)),
+			)
+		}
+
+		// 3. Credential ACLs, now that the secret files exist. A path that
+		// cannot be resolved is fatal in the enforcer (no silent skip).
+		if err := d.strategy.ApplyCredentialACLs(ctx, resp.ID, p); err != nil {
+			teardownUnenforced()
+			return nil, fmt.Errorf("docker runtime: installing credential ACLs: %w", err)
+		}
+
+		// 4. Resume only after every step succeeded.
+		if _, err := d.client.ContainerUnpause(ctx, resp.ID, client.ContainerUnpauseOptions{}); err != nil {
+			teardownUnenforced()
+			return nil, fmt.Errorf("docker runtime: unpausing container after enforcement bootstrap: %w", err)
+		}
+
 		d.logger.Info("enforcement applied",
 			zap.String("id", resp.ID),
 			zap.String("level", d.strategy.Level().String()),
-		)
-	}
-
-	// Inject secrets via the enforcer sidecar (post-enforcement).
-	// Credential ACLs are active before secrets are written, so the enforcer
-	// can gate access correctly from the first instruction onward.
-	if d.strategy != nil && len(opts.ResolvedSecrets) > 0 {
-		if err := d.strategy.InjectSecrets(ctx, resp.ID, opts.ResolvedSecrets); err != nil {
-			_, _ = d.client.ContainerStop(ctx, resp.ID, client.ContainerStopOptions{})
-			_, _ = d.client.ContainerRemove(ctx, resp.ID, client.ContainerRemoveOptions{Force: true})
-			return nil, fmt.Errorf("docker runtime: injecting secrets: %w", err)
-		}
-		d.logger.Info("secrets injected via enforcer",
-			zap.String("id", resp.ID),
-			zap.Int("count", len(opts.ResolvedSecrets)),
 		)
 	}
 

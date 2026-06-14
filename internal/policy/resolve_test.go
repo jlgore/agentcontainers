@@ -511,15 +511,40 @@ func TestResolveSecrets(t *testing.T) {
 			},
 		},
 		{
-			name: "secret with no path is skipped",
+			// A secret with no provider path is still injected to
+			// /run/secrets/<name>, so it must get an ACL keyed off that
+			// container path — otherwise it would be ungated (default-allow).
+			name: "secret with no provider path gets a container-path ACL",
 			secrets: map[string]config.SecretConfig{
 				"NO_PATH": {Provider: "vault", TTL: "1h"},
 			},
 			tools: nil,
 			want: func(t *testing.T, acls []SecretACL) {
 				t.Helper()
-				if len(acls) != 0 {
-					t.Errorf("len(acls) = %d, want 0", len(acls))
+				if len(acls) != 1 {
+					t.Fatalf("len(acls) = %d, want 1", len(acls))
+				}
+				if acls[0].Path != "/run/secrets/NO_PATH" {
+					t.Errorf("Path = %q, want %q", acls[0].Path, "/run/secrets/NO_PATH")
+				}
+			},
+		},
+		{
+			// The ACL path is always derived from the secret name, never the
+			// provider lookup path (here a Vault path that the container never
+			// sees).
+			name: "provider lookup path is not used as the ACL path",
+			secrets: map[string]config.SecretConfig{
+				"VAULT_SECRET": {Provider: "vault", Path: "secret/data/myapp/config", TTL: "1h"},
+			},
+			tools: nil,
+			want: func(t *testing.T, acls []SecretACL) {
+				t.Helper()
+				if len(acls) != 1 {
+					t.Fatalf("len(acls) = %d, want 1", len(acls))
+				}
+				if acls[0].Path != "/run/secrets/VAULT_SECRET" {
+					t.Errorf("Path = %q, want %q", acls[0].Path, "/run/secrets/VAULT_SECRET")
 				}
 			},
 		},

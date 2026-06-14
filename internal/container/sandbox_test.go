@@ -1199,6 +1199,17 @@ func (m *mockSandboxStrategy) Apply(ctx context.Context, containerID string, _ u
 	return nil
 }
 
+func (m *mockSandboxStrategy) ApplyBasePolicy(ctx context.Context, containerID string, _ uint32, p *policy.ContainerPolicy) error {
+	if m.applyFn != nil {
+		return m.applyFn(ctx, containerID, p)
+	}
+	return nil
+}
+
+func (m *mockSandboxStrategy) ApplyCredentialACLs(_ context.Context, _ string, _ *policy.ContainerPolicy) error {
+	return nil
+}
+
 func (m *mockSandboxStrategy) Update(ctx context.Context, containerID string, p *policy.ContainerPolicy) error {
 	if m.updateFn != nil {
 		return m.updateFn(ctx, containerID, p)

@@ -448,7 +448,22 @@ func (s *SandboxRuntime) Start(ctx context.Context, cfg *config.AgentContainer, 
 							zap.Error(findErr),
 						)
 					} else {
-						if applyErr := strategy.Apply(ctx, agentContainerID, 0, opts.Policy); applyErr != nil {
+						// Resolve the agent container's init PID inside the VM so
+						// the in-VM enforcer can resolve container-namespace policy
+						// paths (incl. /run/secrets/<name>) via /proc/<pid>/root.
+						// sandboxd has already injected the secret files at VM
+						// creation, so credential ACLs resolve here.
+						var agentPID uint32
+						if insp, inspErr := dockerCli.ContainerInspect(ctx, agentContainerID, client.ContainerInspectOptions{}); inspErr != nil {
+							s.logger.Warn("failed to inspect agent container for init PID; credential ACLs may not resolve",
+								zap.String("vm_name", vmName),
+								zap.String("container_id", agentContainerID),
+								zap.Error(inspErr),
+							)
+						} else if insp.Container.State != nil {
+							agentPID = uint32(insp.Container.State.Pid)
+						}
+						if applyErr := strategy.Apply(ctx, agentContainerID, agentPID, opts.Policy); applyErr != nil {
 							s.logger.Warn("failed to apply enforcement policy",
 								zap.String("vm_name", vmName),
 								zap.String("container_id", agentContainerID),
