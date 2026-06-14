@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  issues: write
   pull-requests: write
   packages: write
 
@@ -19,8 +20,8 @@ jobs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
       # Enforcer component (Rust)
-      enforcer--release_created: ${{ steps.release.outputs['enforcer--release_created'] }}
-      enforcer--tag_name: ${{ steps.release.outputs['enforcer--tag_name'] }}
+      enforcer_release_created: ${{ steps.release.outputs['enforcer/agentcontainer-enforcer--release_created'] }}
+      enforcer_tag_name: ${{ steps.release.outputs['enforcer/agentcontainer-enforcer--tag_name'] }}
     steps:
       - uses: googleapis/release-please-action@v4
         id: release
@@ -61,7 +62,7 @@ jobs:
   enforcer-image:
     name: Release enforcer image
     needs: release-please
-    if: ${{ needs.release-please.outputs['enforcer--release_created'] == 'true' }}
+    if: ${{ needs.release-please.outputs.enforcer_release_created == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -79,10 +80,10 @@ jobs:
       - uses: docker/metadata-action@v6
         id: meta
         with:
-          images: ghcr.io/kubedoll-heavy-industries/agentcontainer-enforcer
+          images: ghcr.io/${{ github.repository_owner }}/agentcontainer-enforcer
           tags: |
-            type=semver,pattern={{version}},value=${{ needs.release-please.outputs['enforcer--tag_name'] }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release-please.outputs['enforcer--tag_name'] }}
+            type=semver,pattern={{version}},value=${{ needs.release-please.outputs.enforcer_tag_name }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release-please.outputs.enforcer_tag_name }}
             type=raw,value=latest
 
       - uses: docker/build-push-action@v6
