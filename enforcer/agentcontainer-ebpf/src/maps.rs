@@ -11,6 +11,7 @@ use aya_ebpf::maps::{HashMap, LpmTrie, PerCpuArray, PerCpuHashMap, RingBuf};
 
 use agentcontainer_common::maps::{
     CgroupStats, FsInodeKey, LpmDataV4, LpmDataV6, PortKeyV4, SecretAclKey, SecretAclValue,
+    SecretToolKey,
 };
 
 // --- Cgroup scoping ---
@@ -118,6 +119,19 @@ pub static PROC_STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(16, 0);
 /// Key includes (inode, dev, cgroup_id) so ACLs are scoped per-container.
 #[map]
 pub static SECRET_ACLS: HashMap<SecretAclKey, SecretAclValue> = HashMap::with_max_entries(1024, 0);
+
+/// Allowed tool identities for restricted secrets. An entry keyed by
+/// (secret inode/dev/cgroup ++ tool_id) means that tool may read the secret
+/// while its tool-call window is active. Only consulted for secrets whose
+/// `SecretAclValue.restricted` is set.
+#[map]
+pub static SECRET_TOOL_ACLS: HashMap<SecretToolKey, u8> = HashMap::with_max_entries(4096, 0);
+
+/// The tool identity currently active for a cgroup, written by PrepareToolCall
+/// and removed by CompleteToolCall. Absent means no tool-call window is open, so
+/// a restricted secret in that cgroup is denied.
+#[map]
+pub static ACTIVE_TOOL: HashMap<u64, u64> = HashMap::with_max_entries(256, 0);
 
 /// Ring buffer for credential enforcement events.
 #[map]

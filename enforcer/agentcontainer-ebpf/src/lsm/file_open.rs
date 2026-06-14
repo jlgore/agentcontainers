@@ -19,17 +19,20 @@ use aya_ebpf::macros::lsm;
 use aya_ebpf::programs::LsmContext;
 
 use agentcontainer_common::events::{
-    CredEvent, EventType, FsEvent, Verdict, COMM_MAX, CRED_REASON_TTL_EXPIRED,
-    CRED_REASON_WRITE_DENIED, EVENT_CRED_OPEN,
+    CredEvent, EventType, FsEvent, Verdict, COMM_MAX, CRED_REASON_NO_ACTIVE_TOOL,
+    CRED_REASON_TOOL_NOT_ALLOWED, CRED_REASON_TTL_EXPIRED, CRED_REASON_WRITE_DENIED,
+    EVENT_CRED_OPEN,
 };
 use agentcontainer_common::maps::{
-    FsInodeKey, SecretAclKey, DENTRY_NAME_LEN, FS_PERM_WRITE, LSM_ALLOW, LSM_DENY, PROC_SUPER_MAGIC,
+    FsInodeKey, SecretAclKey, SecretToolKey, DENTRY_NAME_LEN, FS_PERM_WRITE, LSM_ALLOW, LSM_DENY,
+    PROC_SUPER_MAGIC,
 };
 
 use crate::maps::{
-    bump_cgroup_stat, ALLOWED_INODES, CGROUP_STAT_CRED_ALLOWED, CGROUP_STAT_CRED_BLOCKED,
-    CGROUP_STAT_FS_ALLOWED, CGROUP_STAT_FS_BLOCKED, CRED_EVENTS, CRED_STATS, DENIED_INODES,
-    ENFORCED_CGROUPS, FS_EVENTS, FS_STATS, SECRET_ACLS,
+    bump_cgroup_stat, ACTIVE_TOOL, ALLOWED_INODES, CGROUP_STAT_CRED_ALLOWED,
+    CGROUP_STAT_CRED_BLOCKED, CGROUP_STAT_FS_ALLOWED, CGROUP_STAT_FS_BLOCKED, CRED_EVENTS,
+    CRED_STATS, DENIED_INODES, ENFORCED_CGROUPS, FS_EVENTS, FS_STATS, SECRET_ACLS,
+    SECRET_TOOL_ACLS,
 };
 
 // ---------------------------------------------------------------------------
@@ -383,6 +386,38 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
             bump_cgroup_stat(cgid, CGROUP_STAT_CRED_BLOCKED);
             emit_cred_block_event(ino, cgid, CRED_REASON_WRITE_DENIED);
             return Ok(LSM_DENY);
+        }
+
+        // Per-tool restriction: a restricted secret (non-empty allowed-tools)
+        // may be read only while one of its allowed tools has an active
+        // tool-call window for this cgroup. An empty allowed-tools list leaves
+        // restricted == 0 and keeps container-wide access.
+        if acl.restricted != 0 {
+            match unsafe { ACTIVE_TOOL.get(&cgid) } {
+                None => {
+                    // No tool-call window open — deny.
+                    bump_cred_stat(agentcontainer_common::events::STAT_CRED_BLOCKED);
+                    bump_cgroup_stat(cgid, CGROUP_STAT_CRED_BLOCKED);
+                    emit_cred_block_event(ino, cgid, CRED_REASON_NO_ACTIVE_TOOL);
+                    return Ok(LSM_DENY);
+                }
+                Some(&active_tool) => {
+                    let tool_key = SecretToolKey {
+                        inode: ino,
+                        dev_major: (s_dev >> 20) & 0xfff,
+                        dev_minor: s_dev & 0xfffff,
+                        cgroup_id: cgid,
+                        tool_id: active_tool,
+                    };
+                    if unsafe { SECRET_TOOL_ACLS.get(&tool_key) }.is_none() {
+                        // The active tool is not allowed this secret — deny.
+                        bump_cred_stat(agentcontainer_common::events::STAT_CRED_BLOCKED);
+                        bump_cgroup_stat(cgid, CGROUP_STAT_CRED_BLOCKED);
+                        emit_cred_block_event(ino, cgid, CRED_REASON_TOOL_NOT_ALLOWED);
+                        return Ok(LSM_DENY);
+                    }
+                }
+            }
         }
 
         // Allowed — this cgroup may read this secret.

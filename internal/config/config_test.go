@@ -805,6 +805,77 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+func TestValidate_RestrictedSecretConcurrency(t *testing.T) {
+	restrictedSecret := map[string]SecretConfig{
+		"API_KEY": {Provider: "env", AllowedTools: []string{"git-tool"}},
+	}
+	unrestrictedSecret := map[string]SecretConfig{
+		"API_KEY": {Provider: "env"},
+	}
+
+	tests := []struct {
+		name    string
+		agent   *AgentConfig
+		wantErr string
+	}{
+		{
+			name: "restricted secret with agent concurrency > 1 is rejected",
+			agent: &AgentConfig{
+				Secrets: restrictedSecret,
+				Policy:  &PolicyConfig{MaxConcurrentTools: 2},
+			},
+			wantErr: "agent.policy.maxConcurrentTools must be <= 1",
+		},
+		{
+			name: "restricted secret with server concurrency > 1 is rejected",
+			agent: &AgentConfig{
+				Secrets: restrictedSecret,
+				Tools: &ToolsConfig{
+					MCP: map[string]MCPToolConfig{
+						"sift": {Type: "container", Image: "x:latest", Policy: &MCPServerPolicy{MaxConcurrentTools: 4}},
+					},
+				},
+			},
+			wantErr: "maxConcurrentTools must be <= 1",
+		},
+		{
+			name: "restricted secret with concurrency 1 is allowed",
+			agent: &AgentConfig{
+				Secrets: restrictedSecret,
+				Policy:  &PolicyConfig{MaxConcurrentTools: 1},
+			},
+			wantErr: "",
+		},
+		{
+			name: "unrestricted secret with concurrency > 1 is allowed",
+			agent: &AgentConfig{
+				Secrets: unrestrictedSecret,
+				Policy:  &PolicyConfig{MaxConcurrentTools: 8},
+			},
+			wantErr: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := AgentContainer{Name: "t", Image: "alpine:3.19", Agent: tt.agent}
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Validate() expected error containing %q, got nil", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("Validate() error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestValidate_MultipleErrors(t *testing.T) {
 	cfg := AgentContainer{
 		Name: "test",

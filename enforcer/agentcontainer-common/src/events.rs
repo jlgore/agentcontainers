@@ -126,6 +126,10 @@ pub struct CredEvent {
 pub const CRED_REASON_NO_ACL: u32 = 0;
 pub const CRED_REASON_TTL_EXPIRED: u32 = 1;
 pub const CRED_REASON_WRITE_DENIED: u32 = 2;
+/// Restricted secret accessed with no active tool-call window.
+pub const CRED_REASON_NO_ACTIVE_TOOL: u32 = 3;
+/// Restricted secret accessed by a tool not in its allowed-tools list.
+pub const CRED_REASON_TOOL_NOT_ALLOWED: u32 = 4;
 
 // --- Stats keys (per-CPU array indices) ---
 

@@ -84,12 +84,52 @@ pub struct SecretAclKey {
 }
 
 /// Value for credential/secret ACL entries.
+///
+/// `restricted` is 1 when the secret declares a non-empty allowed-tools list:
+/// the file_open hook then additionally requires an active, allowed tool-call
+/// window (see `SecretToolKey` / the `ACTIVE_TOOL` map). When 0 the secret is
+/// container-wide (any code in the cgroup may read it, subject to TTL/write).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SecretAclValue {
     pub expires_at_ns: u64,
     pub allowed_ops: u8,
-    pub _pad: [u8; 7],
+    pub restricted: u8,
+    pub _pad: [u8; 6],
+}
+
+/// Key for the per-secret allowed-tool set (`SECRET_TOOL_ACLS`). Presence of an
+/// entry means the tool identified by `tool_id` may read the secret identified
+/// by the embedded `SecretAclKey` fields while that tool's call window is active.
+/// The leading fields mirror `SecretAclKey` exactly so a secret's tool entries
+/// share its `(inode, dev, cgroup)` identity.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SecretToolKey {
+    pub inode: u64,
+    pub dev_major: u32,
+    pub dev_minor: u32,
+    pub cgroup_id: u64,
+    pub tool_id: u64,
+}
+
+/// A stable 64-bit identity for an MCP tool name. The enforcer derives both the
+/// allowed-tool entries (from a secret's allowed-tools list) and the active-tool
+/// value (from PrepareToolCall's tool name) with [`tool_identity`], so equal
+/// names always yield equal identities within the process.
+pub type ToolId = u64;
+
+/// Fixed SipHash key for deriving tool identities. The value is irrelevant as
+/// long as it is constant: identities are only ever compared against other
+/// identities produced by the same call in the same enforcer process.
+const TOOL_ID_KEY: crate::siphash::SipHashKey = crate::siphash::SipHashKey {
+    k0: 0x7361_6665_5f74_6f6f, // "safe_too"
+    k1: 0x6c5f_6964_656e_7469, // "l_identi"
+};
+
+/// Derive the stable [`ToolId`] for an MCP tool name.
+pub fn tool_identity(name: &str) -> ToolId {
+    crate::siphash::siphash128(&TOOL_ID_KEY, name.as_bytes()) as u64
 }
 
 // --- Permission constants ---
@@ -142,9 +182,31 @@ mod pod_impls {
     unsafe impl aya::Pod for super::FsInodeKey {}
     unsafe impl aya::Pod for super::SecretAclKey {}
     unsafe impl aya::Pod for super::SecretAclValue {}
+    unsafe impl aya::Pod for super::SecretToolKey {}
     unsafe impl aya::Pod for super::LpmDataV4 {}
     unsafe impl aya::Pod for super::LpmDataV6 {}
     unsafe impl aya::Pod for super::DomainKey {}
     unsafe impl aya::Pod for super::CgroupStats {}
     unsafe impl aya::Pod for crate::siphash::SipHashKey {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tool_identity;
+
+    #[test]
+    fn tool_identity_is_deterministic() {
+        assert_eq!(tool_identity("run_command"), tool_identity("run_command"));
+        assert_eq!(
+            tool_identity("mcp__sift__run_command"),
+            tool_identity("mcp__sift__run_command")
+        );
+    }
+
+    #[test]
+    fn tool_identity_distinguishes_names() {
+        assert_ne!(tool_identity("read_file"), tool_identity("write_file"));
+        assert_ne!(tool_identity("run_command"), tool_identity("run_command "));
+        assert_ne!(tool_identity(""), tool_identity("x"));
+    }
 }

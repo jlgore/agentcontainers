@@ -123,6 +123,33 @@ failure — pause, inject, ACL install, or unpause — tears the container down
 without ever unpausing it, so a partially-enforced container is never left
 running.
 
+#### Per-tool secret restrictions
+
+A secret may be scoped to specific MCP tools via `allowedTools`:
+
+- **Empty `allowedTools`** — container-wide: any code in the cgroup may read the
+  secret (subject to TTL and write rules).
+- **Non-empty `allowedTools`** — restricted: the secret is readable **only while
+  one of its allowed tools has an active tool-call window**.
+
+The kernel enforces this through two maps: `SECRET_TOOL_ACLS` records which tool
+identities may read each restricted secret, and `ACTIVE_TOOL` records the tool
+identity currently executing in each cgroup. `PrepareToolCall` writes the active
+tool and `CompleteToolCall` clears it (including on tool error or cancellation).
+The `file_open` hook denies a restricted secret when there is no active window,
+or when the active tool is not in the secret's allow-set.
+
+Restricted MCP servers are **serialized**: only one tool call may be active at a
+time, so the active-tool identity is unambiguous. `PrepareToolCall` rejects an
+overlapping call, and a configuration that pairs a restricted secret with
+`maxConcurrentTools > 1` is rejected at startup.
+
+**Limitation — same-process attribution.** The active-tool window is per-cgroup,
+not per-thread. Any code running in the MCP server's container during an allowed
+tool's window can read the secret, including other code in the same server
+process. Restriction is at the granularity of the tool-call window, not the
+individual call stack.
+
 ### Layer 6: Approval broker
 
 The approval broker wraps the container runtime (decorator pattern) and intercepts capability changes. When an agent requests a capability not declared in the original config, the broker:

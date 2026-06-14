@@ -207,8 +207,8 @@ mod linux {
     };
     use agentcontainer_common::events as bpf_events;
     use agentcontainer_common::maps::{
-        CgroupStats, FsInodeKey, LpmDataV4, LpmDataV6, PortKeyV4, SecretAclKey, SecretAclValue,
-        FS_PERM_READ, FS_PERM_WRITE, LPM_CGROUP_PREFIX,
+        tool_identity, CgroupStats, FsInodeKey, LpmDataV4, LpmDataV6, PortKeyV4, SecretAclKey,
+        SecretAclValue, SecretToolKey, FS_PERM_READ, FS_PERM_WRITE, LPM_CGROUP_PREFIX,
     };
     use aya::maps::lpm_trie::Key as LpmKey;
     use aya::maps::{HashMap as AyaHashMap, LpmTrie, PerCpuHashMap, RingBuf};
@@ -301,6 +301,12 @@ mod linux {
         /// this set and drops everything else. Hashing moved out of the
         /// kernel (verifier limits), so identification lives here.
         tracked_domains: TrackedDomains,
+
+        /// cgroup IDs that have at least one restricted secret (a secret whose
+        /// allowed-tools list is non-empty). PrepareToolCall enforces
+        /// single-active-tool serialization and writes the ACTIVE_TOOL map only
+        /// for these cgroups; non-restricted cgroups keep container-wide access.
+        restricted_cgroups: RwLock<HashMap<u64, ()>>,
     }
 
     /// cgroup_id → (wire-format question name → readable hostname).
@@ -347,6 +353,7 @@ mod linux {
                 container_pids: RwLock::new(HashMap::new()),
                 correlations: std::sync::Arc::new(RwLock::new(HashMap::new())),
                 tracked_domains: std::sync::Arc::new(RwLock::new(HashMap::new())),
+                restricted_cgroups: RwLock::new(HashMap::new()),
             };
 
             // Spawn background ring buffer readers for all event sources.
@@ -923,6 +930,18 @@ mod linux {
                 cgroup_id,
                 |k| k.cgroup_id,
             );
+            Self::cleanup_hash_entries::<SecretToolKey, u8>(
+                bpf,
+                "SECRET_TOOL_ACLS",
+                cgroup_id,
+                |k| k.cgroup_id,
+            );
+            // ACTIVE_TOOL is keyed by cgroup_id directly.
+            if let Some(map_data) = bpf.map_mut("ACTIVE_TOOL") {
+                if let Ok(mut map) = AyaHashMap::<_, u64, u64>::try_from(map_data) {
+                    let _ = map.remove(&cgroup_id);
+                }
+            }
         }
     }
 
@@ -977,6 +996,7 @@ mod linux {
             let cgroup_id = self.container_cgroups.write().unwrap().remove(container_id);
 
             if let Some(cgroup_id) = cgroup_id {
+                self.restricted_cgroups.write().unwrap().remove(&cgroup_id);
                 info!(
                     container_id,
                     cgroup_id, "unregistering cgroup from BPF enforcement"
@@ -1404,10 +1424,18 @@ mod linux {
                             0 // No expiry.
                         };
 
+                        // A non-empty allowed-tools list makes the secret
+                        // restricted: readable only during an allowed tool's
+                        // active call window (enforced in file_open via
+                        // ACTIVE_TOOL + SECRET_TOOL_ACLS). An empty list keeps
+                        // container-wide access.
+                        let restricted = !acl.allowed_tools.is_empty();
+
                         let value = SecretAclValue {
                             expires_at_ns,
                             allowed_ops: FS_PERM_READ,
-                            _pad: [0; 7],
+                            restricted: u8::from(restricted),
+                            _pad: [0; 6],
                         };
 
                         let map_data = bpf
@@ -1416,10 +1444,37 @@ mod linux {
                         let mut map: AyaHashMap<_, SecretAclKey, SecretAclValue> =
                             AyaHashMap::try_from(map_data)?;
                         map.insert(key, value, 0)?;
+
+                        // Populate the per-tool allow-set for restricted secrets.
+                        if restricted {
+                            let tool_map_data =
+                                bpf.map_mut("SECRET_TOOL_ACLS").ok_or_else(|| {
+                                    anyhow::anyhow!("BPF map SECRET_TOOL_ACLS not found")
+                                })?;
+                            let mut tool_map: AyaHashMap<_, SecretToolKey, u8> =
+                                AyaHashMap::try_from(tool_map_data)?;
+                            for tool in &acl.allowed_tools {
+                                let tool_key = SecretToolKey {
+                                    inode,
+                                    dev_major,
+                                    dev_minor,
+                                    cgroup_id,
+                                    tool_id: tool_identity(tool),
+                                };
+                                tool_map.insert(tool_key, 1u8, 0)?;
+                            }
+                            self.restricted_cgroups
+                                .write()
+                                .unwrap()
+                                .insert(cgroup_id, ());
+                        }
+
                         info!(
                             path = %acl.path,
                             inode,
                             ttl = acl.ttl_seconds,
+                            restricted,
+                            allowed_tools = acl.allowed_tools.len(),
                             "added secret ACL to SECRET_ACLS"
                         );
                     }
@@ -1486,15 +1541,43 @@ mod linux {
             &self,
             container_id: &str,
             correlation_id: &str,
-            _tool_name: &str,
+            tool_name: &str,
         ) -> anyhow::Result<()> {
             let cgroup_id = self.lookup_cgroup(container_id)?;
+
+            // Correlation window (event attribution) — applies to every call.
             open_tool_window(
                 &self.correlations,
                 cgroup_id,
                 correlation_id,
                 monotonic_ns(),
             );
+
+            // Per-tool secret enforcement only applies to cgroups that hold a
+            // restricted secret. For those, serialize tool calls (one active
+            // tool at a time) and publish the active tool identity for file_open.
+            if self
+                .restricted_cgroups
+                .read()
+                .unwrap()
+                .contains_key(&cgroup_id)
+            {
+                let mut bpf = self.programs.lock().unwrap();
+                let map_data = bpf
+                    .map_mut("ACTIVE_TOOL")
+                    .ok_or_else(|| anyhow::anyhow!("BPF map ACTIVE_TOOL not found"))?;
+                let mut map: AyaHashMap<_, u64, u64> = AyaHashMap::try_from(map_data)?;
+                // Reject overlapping calls on a restricted container: an active
+                // tool window must close before the next opens. Holding the
+                // programs lock makes this check-and-set atomic against a
+                // concurrent prepare/complete.
+                if map.get(&cgroup_id, 0).is_ok() {
+                    return Err(anyhow::anyhow!(
+                        "overlapping tool call on restricted container {container_id}: a tool call is already active"
+                    ));
+                }
+                map.insert(cgroup_id, tool_identity(tool_name), 0)?;
+            }
             Ok(())
         }
 
@@ -1504,6 +1587,23 @@ mod linux {
             correlation_id: &str,
         ) -> anyhow::Result<()> {
             let cgroup_id = self.lookup_cgroup(container_id)?;
+
+            // Clear the active tool window first, so the secret becomes
+            // inaccessible again even if the correlation bookkeeping below logs
+            // a miss. Removing an absent key is not an error.
+            if self
+                .restricted_cgroups
+                .read()
+                .unwrap()
+                .contains_key(&cgroup_id)
+            {
+                let mut bpf = self.programs.lock().unwrap();
+                if let Some(map_data) = bpf.map_mut("ACTIVE_TOOL") {
+                    let mut map: AyaHashMap<_, u64, u64> = AyaHashMap::try_from(map_data)?;
+                    let _ = map.remove(&cgroup_id);
+                }
+            }
+
             if !close_tool_window(
                 &self.correlations,
                 cgroup_id,

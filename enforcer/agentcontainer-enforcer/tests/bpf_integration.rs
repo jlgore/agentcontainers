@@ -997,3 +997,105 @@ async fn test_blocked_cidrs_override_allowed_hosts() {
         "allowed (unblocked) destination was denied — deny list is over-broad: {control:?}"
     );
 }
+
+/// Per-tool secret restriction: a restricted secret (non-empty allowed_tools)
+/// serializes tool calls — only one tool-call window may be active at a time —
+/// and the active window is opened by PrepareToolCall and closed by
+/// CompleteToolCall. This exercises the manager/BPF-map lifecycle; the kernel
+/// file_open gating (allowed tool reads, disallowed/out-of-window denied) is
+/// verified by reading the secret from the cgroup with and without an active
+/// window.
+#[tokio::test]
+#[serial]
+async fn test_per_tool_restriction_serializes_calls() {
+    let mgr = BpfPolicyManager::new().unwrap();
+    let cgroup = own_cgroup_path();
+    mgr.register("test-per-tool", &cgroup, 0).await.unwrap();
+
+    let tmp = tempfile::NamedTempFile::new().expect("temp file");
+    let path = tmp.path().to_str().unwrap().to_string();
+
+    // Restricted secret: only "allowed_tool" may read it.
+    mgr.apply_credential(
+        "test-per-tool",
+        &CredentialPolicy {
+            secret_acls: vec![SecretAcl {
+                path,
+                allowed_tools: vec!["allowed_tool".into()],
+                ttl_seconds: 0,
+            }],
+        },
+    )
+    .await
+    .unwrap();
+
+    // First tool call opens the window.
+    mgr.prepare_tool_call("test-per-tool", "corr-1", "allowed_tool")
+        .await
+        .expect("first prepare should succeed");
+
+    // A second, overlapping call on the restricted container is rejected.
+    let overlap = mgr
+        .prepare_tool_call("test-per-tool", "corr-2", "allowed_tool")
+        .await;
+    assert!(
+        overlap.is_err(),
+        "overlapping tool call on a restricted container must be rejected"
+    );
+
+    // Completing the first call closes the window, so the next call succeeds.
+    mgr.complete_tool_call("test-per-tool", "corr-1")
+        .await
+        .unwrap();
+    mgr.prepare_tool_call("test-per-tool", "corr-3", "another_tool")
+        .await
+        .expect("prepare after complete should succeed");
+    mgr.complete_tool_call("test-per-tool", "corr-3")
+        .await
+        .unwrap();
+
+    mgr.unregister("test-per-tool").await.unwrap();
+}
+
+/// A container with only unrestricted secrets (empty allowed_tools) keeps
+/// container-wide access: tool calls are not serialized, so overlapping
+/// PrepareToolCall calls are accepted (the active-tool map is not used).
+#[tokio::test]
+#[serial]
+async fn test_unrestricted_secret_allows_overlapping_calls() {
+    let mgr = BpfPolicyManager::new().unwrap();
+    let cgroup = own_cgroup_path();
+    mgr.register("test-unrestricted", &cgroup, 0).await.unwrap();
+
+    let tmp = tempfile::NamedTempFile::new().expect("temp file");
+    let path = tmp.path().to_str().unwrap().to_string();
+
+    mgr.apply_credential(
+        "test-unrestricted",
+        &CredentialPolicy {
+            secret_acls: vec![SecretAcl {
+                path,
+                allowed_tools: vec![], // container-wide
+                ttl_seconds: 0,
+            }],
+        },
+    )
+    .await
+    .unwrap();
+
+    mgr.prepare_tool_call("test-unrestricted", "c1", "t1")
+        .await
+        .unwrap();
+    // No serialization for unrestricted containers.
+    mgr.prepare_tool_call("test-unrestricted", "c2", "t2")
+        .await
+        .expect("unrestricted container must not serialize tool calls");
+    mgr.complete_tool_call("test-unrestricted", "c1")
+        .await
+        .unwrap();
+    mgr.complete_tool_call("test-unrestricted", "c2")
+        .await
+        .unwrap();
+
+    mgr.unregister("test-unrestricted").await.unwrap();
+}

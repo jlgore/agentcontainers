@@ -713,7 +713,43 @@ func (c *AgentContainer) Validate() error {
 		}
 	}
 
+	errs = append(errs, c.validateRestrictedSecretConcurrency()...)
+
 	return errors.Join(errs...)
+}
+
+// validateRestrictedSecretConcurrency rejects a configuration that combines a
+// restricted secret (a secret with a non-empty allowedTools list) with MCP tool
+// concurrency greater than one. Per-tool secret enforcement serializes tool
+// calls per container — only one tool-call window may be active at a time — so a
+// server permitted to run tool calls in parallel could not be gated correctly.
+func (c *AgentContainer) validateRestrictedSecretConcurrency() []error {
+	if c.Agent == nil {
+		return nil
+	}
+	hasRestricted := false
+	for _, sc := range c.Agent.Secrets {
+		if len(sc.AllowedTools) > 0 {
+			hasRestricted = true
+			break
+		}
+	}
+	if !hasRestricted {
+		return nil
+	}
+
+	var errs []error
+	if c.Agent.Policy != nil && c.Agent.Policy.MaxConcurrentTools > 1 {
+		errs = append(errs, fmt.Errorf("agent.policy.maxConcurrentTools must be <= 1 when any secret declares allowedTools (per-tool secret enforcement serializes tool calls); got %d", c.Agent.Policy.MaxConcurrentTools))
+	}
+	if c.Agent.Tools != nil {
+		for name, tool := range c.Agent.Tools.MCP {
+			if tool.Policy != nil && tool.Policy.MaxConcurrentTools > 1 {
+				errs = append(errs, fmt.Errorf("agent.tools.mcp[%q].policy.maxConcurrentTools must be <= 1 when any secret declares allowedTools (per-tool secret enforcement serializes tool calls); got %d", name, tool.Policy.MaxConcurrentTools))
+			}
+		}
+	}
+	return errs
 }
 
 // knownSecretProviders is the set of canonical provider identifiers accepted
