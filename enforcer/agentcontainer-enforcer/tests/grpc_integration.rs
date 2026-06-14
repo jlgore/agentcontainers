@@ -110,7 +110,10 @@ async fn exec_stdout(
         .await
         .expect("exec failed");
     let out = res.stdout_to_vec().await.expect("read exec stdout failed");
-    String::from_utf8(out).expect("exec stdout not utf-8").trim().to_string()
+    String::from_utf8(out)
+        .expect("exec stdout not utf-8")
+        .trim()
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -650,12 +653,19 @@ async fn test_inject_secrets_chowns_to_agent_uid() {
     let init_pid: u32 = pid_str
         .parse()
         .unwrap_or_else(|_| panic!("expected a PID, got {pid_str:?}"));
-    assert!(init_pid > 1, "agent PID should be a real process: {init_pid}");
+    assert!(
+        init_pid > 1,
+        "agent PID should be a real process: {init_pid}"
+    );
 
     // Confirm the process really is uid 1000 before we rely on it.
     let proc_uid = exec_stdout(
         &container,
-        &["sh", "-c", &format!("awk '/^Uid:/{{print $2}}' /proc/{init_pid}/status")],
+        &[
+            "sh",
+            "-c",
+            &format!("awk '/^Uid:/{{print $2}}' /proc/{init_pid}/status"),
+        ],
     )
     .await;
     assert_eq!(proc_uid, "1000", "target process should run as uid 1000");
@@ -684,7 +694,11 @@ async fn test_inject_secrets_chowns_to_agent_uid() {
         .await
         .expect("inject_secrets RPC failed")
         .into_inner();
-    assert!(resp.success, "inject_secrets should succeed: {}", resp.error);
+    assert!(
+        resp.success,
+        "inject_secrets should succeed: {}",
+        resp.error
+    );
     assert_eq!(resp.injected_count, 1, "exactly one secret injected");
 
     // The agent shares the container's mount namespace, so /proc/<pid>/root/run
@@ -718,5 +732,8 @@ async fn test_inject_secrets_chowns_to_agent_uid() {
         ],
     )
     .await;
-    assert_eq!(content, "sk-ant-regression", "agent (uid 1000) should read its secret");
+    assert_eq!(
+        content, "sk-ant-regression",
+        "agent (uid 1000) should read its secret"
+    );
 }
