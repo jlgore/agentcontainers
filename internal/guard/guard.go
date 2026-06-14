@@ -373,8 +373,8 @@ var fileMutators = map[string]string{
 // the tool is not one the guard models, or it carries no command/path — the
 // caller treats that as allow (the eBPF floor still applies).
 func (s *Service) activity(req Request) (activity, bool) {
-	switch {
-	case req.ToolName == "Bash":
+	switch req.ToolName {
+	case "Bash":
 		var in struct {
 			Command string `json:"command"`
 		}

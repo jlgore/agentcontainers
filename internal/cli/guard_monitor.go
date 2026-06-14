@@ -131,8 +131,8 @@ func (m guardMonitorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m guardMonitorModel) View() tea.View {
 	var b strings.Builder
 	b.WriteString("Guard Monitor\n")
-	b.WriteString(fmt.Sprintf("Socket: %s\n", m.socketPath))
-	b.WriteString(fmt.Sprintf("Status: %s", m.status))
+	fmt.Fprintf(&b, "Socket: %s\n", m.socketPath)
+	fmt.Fprintf(&b, "Status: %s", m.status)
 	if m.lastErr != "" {
 		b.WriteString(" - ")
 		b.WriteString(m.lastErr)
@@ -141,9 +141,9 @@ func (m guardMonitorModel) View() tea.View {
 
 	if m.mode == monitorDenyReason && m.denying != nil {
 		b.WriteString("Deny request\n")
-		b.WriteString(fmt.Sprintf("Tool:    %s\n", m.denying.Tool))
-		b.WriteString(fmt.Sprintf("Command: %s\n", m.denying.ArgsSummary))
-		b.WriteString(fmt.Sprintf("Reason:  %s\n\n", m.reason))
+		fmt.Fprintf(&b, "Tool:    %s\n", m.denying.Tool)
+		fmt.Fprintf(&b, "Command: %s\n", m.denying.ArgsSummary)
+		fmt.Fprintf(&b, "Reason:  %s\n\n", m.reason)
 		b.WriteString("enter deny  esc cancel  ctrl+c quit\n")
 		return tea.NewView(b.String())
 	}
@@ -157,9 +157,9 @@ func (m guardMonitorModel) View() tea.View {
 			if i == m.selected {
 				cursor = ">"
 			}
-			b.WriteString(fmt.Sprintf("%s %s  %s/%s  waiting %s\n", cursor, req.ID, req.Server, req.Tool, time.Since(req.RequestedAt).Round(time.Second)))
+			fmt.Fprintf(&b, "%s %s  %s/%s  waiting %s\n", cursor, req.ID, req.Server, req.Tool, time.Since(req.RequestedAt).Round(time.Second))
 			if i == m.selected {
-				b.WriteString(fmt.Sprintf("    %s\n", req.ArgsSummary))
+				fmt.Fprintf(&b, "    %s\n", req.ArgsSummary)
 			}
 		}
 	}
@@ -176,12 +176,12 @@ func (m guardMonitorModel) View() tea.View {
 			if h.err != nil {
 				verdict = "failed"
 			}
-			b.WriteString(fmt.Sprintf("  %s  %s  %s  %s\n", h.decidedAt.Format("15:04:05"), verdict, h.req.ID, h.req.ArgsSummary))
+			fmt.Fprintf(&b, "  %s  %s  %s  %s\n", h.decidedAt.Format("15:04:05"), verdict, h.req.ID, h.req.ArgsSummary)
 			if h.reason != "" {
-				b.WriteString(fmt.Sprintf("    reason: %s\n", h.reason))
+				fmt.Fprintf(&b, "    reason: %s\n", h.reason)
 			}
 			if h.err != nil {
-				b.WriteString(fmt.Sprintf("    error: %v\n", h.err))
+				fmt.Fprintf(&b, "    error: %v\n", h.err)
 			}
 		}
 	}
