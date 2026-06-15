@@ -369,8 +369,19 @@ else
   smoke_fail=0
   /usr/local/bin/agentcontainer enforcer start  || smoke_fail=1
   /usr/local/bin/agentcontainer enforcer status || smoke_fail=1
-  /usr/local/bin/agentcontainer enforcer diagnose || true
+  diag_out="$(/usr/local/bin/agentcontainer enforcer diagnose 2>&1 || true)"
+  printf '%s\n' "$diag_out"
   /usr/local/bin/agentcontainer enforcer stop --force >/dev/null 2>&1 || true
+  # On Docker Engine the eBPF LSM is the only containment boundary, so a kernel
+  # missing "bpf" in its lsm= ordering means filesystem/exec enforcement is
+  # silently inactive — kernelPrimary runs refuse to start. Surface it here.
+  if printf '%s\n' "$diag_out" | grep -q 'BPF LSM .*\[PASS\]'; then
+    ok "BPF LSM active — kernel-primary (Docker Engine) enforcement available"
+  else
+    warn "BPF LSM is NOT active — 'kernelPrimary' runs will fail closed. \
+Ensure CONFIG_BPF_LSM=y and 'bpf' in the kernel lsm= ordering, then reboot \
+(this script configures GRUB for you; a reboot may be pending)."
+  fi
   if [ "$smoke_fail" -eq 0 ]; then
     ok "enforcer started, reported healthy, and stopped cleanly"
   else

@@ -34,6 +34,8 @@ type mockEnforcerServer struct {
 	lastCredentialRequest *enforcerapi.CredentialPolicyRequest
 	lastInjectRequest     *enforcerapi.InjectSecretsRequest
 	events                []*enforcerapi.EnforcementEvent
+	lsmActive             bool
+	lsmDetail             string
 }
 
 func (m *mockEnforcerServer) RegisterContainer(ctx context.Context, req *enforcerapi.RegisterContainerRequest) (*enforcerapi.RegisterContainerResponse, error) {
@@ -125,6 +127,8 @@ func (m *mockEnforcerServer) GetStats(ctx context.Context, req *enforcerapi.GetS
 		FilesystemBlocked: 10,
 		ProcessAllowed:    50,
 		ProcessBlocked:    2,
+		LsmActive:         m.lsmActive,
+		LsmDetail:         m.lsmDetail,
 	}, nil
 }
 
@@ -773,4 +777,47 @@ func TestGRPCStrategy_InjectSecrets_Empty(t *testing.T) {
 	if !mock.injectSecretsCalled {
 		t.Error("InjectSecrets should be called even with empty secrets")
 	}
+}
+
+// TestLsmStatusFromClient covers the kernel-primary LSM gate's decision logic:
+// the gate trusts the enforcer's reported lsm_active, surfaces its detail
+// string, and propagates RPC errors (which the caller treats as fail-closed).
+func TestLsmStatusFromClient(t *testing.T) {
+	t.Run("active", func(t *testing.T) {
+		mock := &mockEnforcerServer{lsmActive: true, lsmDetail: "file_open, bprm_check attached"}
+		server, listener := setupMockServer(mock)
+		defer server.Stop()
+		strategy := newTestGRPCStrategy(t, listener)
+		defer strategy.Close() //nolint:errcheck
+
+		active, detail, err := lsmStatusFromClient(context.Background(), strategy.client)
+		if err != nil {
+			t.Fatalf("lsmStatusFromClient() error = %v", err)
+		}
+		if !active {
+			t.Error("active = false, want true")
+		}
+		if detail != "file_open, bprm_check attached" {
+			t.Errorf("detail = %q, want the attached message", detail)
+		}
+	})
+
+	t.Run("inactive surfaces detail", func(t *testing.T) {
+		mock := &mockEnforcerServer{lsmActive: false, lsmDetail: "BTF unavailable"}
+		server, listener := setupMockServer(mock)
+		defer server.Stop()
+		strategy := newTestGRPCStrategy(t, listener)
+		defer strategy.Close() //nolint:errcheck
+
+		active, detail, err := lsmStatusFromClient(context.Background(), strategy.client)
+		if err != nil {
+			t.Fatalf("lsmStatusFromClient() error = %v", err)
+		}
+		if active {
+			t.Error("active = true, want false — gate must refuse to start")
+		}
+		if detail != "BTF unavailable" {
+			t.Errorf("detail = %q, want the enforcer's reason", detail)
+		}
+	})
 }

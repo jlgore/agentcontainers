@@ -281,6 +281,34 @@ func DialEnforcer(p ConnectionProfile, warn func(string)) (*grpc.ClientConn, err
 	return conn, nil
 }
 
+// CheckLSMActive asks the enforcer whether its kernel BPF LSM hooks (file_open,
+// bprm_check) are actually attached. Network/cgroup hooks can attach on kernels
+// without BPF LSM, so the enforcer can be SERVING while filesystem deny-list and
+// exec enforcement are silently inactive. Callers running kernel-primary (Docker
+// Engine, no sandboxd VM) use this to fail loudly rather than start unenforced
+// containers. It returns the active flag, the enforcer's detail string for the
+// negative case, and any RPC error (treated as fail-closed by the caller).
+func CheckLSMActive(ctx context.Context, p ConnectionProfile, warn func(string)) (active bool, detail string, err error) {
+	conn, err := DialEnforcer(p, warn)
+	if err != nil {
+		return false, "", err
+	}
+	defer conn.Close() //nolint:errcheck
+	return lsmStatusFromClient(ctx, enforcerapi.NewEnforcerClient(conn))
+}
+
+// lsmStatusFromClient queries an enforcer client for its BPF LSM status. It is
+// the testable core of CheckLSMActive, separated from connection setup so the
+// gate logic can be exercised against an in-process mock enforcer.
+func lsmStatusFromClient(ctx context.Context, client enforcerapi.EnforcerClient) (active bool, detail string, err error) {
+	// Empty container_id requests aggregate stats; lsm_active is manager-global.
+	resp, err := client.GetStats(ctx, &enforcerapi.GetStatsRequest{ContainerId: ""})
+	if err != nil {
+		return false, "", fmt.Errorf("querying enforcer LSM status: %w", err)
+	}
+	return resp.GetLsmActive(), resp.GetLsmDetail(), nil
+}
+
 // NewGRPCStrategy creates a gRPC-based enforcement strategy that connects
 // to an agentcontainer-enforcer sidecar at the given target address.
 func NewGRPCStrategy(target string, opts ...GRPCOption) (*GRPCStrategy, error) {
