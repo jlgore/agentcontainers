@@ -75,15 +75,22 @@
           "user": "1000:1000",
           "mounts": [
             // Cases ROOT read-write so the policy-gated, audited case lifecycle
-            // (case_init / case_activate / findings / timeline) can create and
-            // manage cases under VHIR_CASES_DIR. Every write still flows through
-            // the proxy's OPA evaluation + approval + audit chain; acquired
-            // evidence stays immutable via the nested read-only mounts below.
-            // (For multi-case production, kernel-protect each case's evidence
-            // with an enforcer filesystem deny policy rather than relying only
-            // on these per-case ro mounts.)
+            // (case_init creates a new case dir under VHIR_CASES_DIR) works.
+            //
+            // SECURITY NOTE — the gateway runs as the owner uid (1000), so on a
+            // read-write /cases it could in principle modify or DELETE acquired
+            // evidence (owner perms + directory-write allow unlink). Evidence
+            // immutability therefore does NOT rely on this mount or on DAC. It
+            // is enforced two ways: (1) the active case's evidence is re-pinned
+            // read-only below, and (2) up.sh runs `chattr +i` on every evidence
+            // file. The gateway is launched with CapDrop:["ALL"], so it lacks
+            // CAP_LINUX_IMMUTABLE and physically cannot modify, delete, rename,
+            // or clear the immutable bit on evidence — even as owner, even with
+            // /cases read-write. (Acquisition/registration must `chattr +i` new
+            // evidence; up.sh does it for this demo's images.)
             "/cases:/cases",
-            // The acquired evidence for the active case pinned read-only.
+            // The active case's acquired evidence pinned read-only (mount-level
+            // EROFS, on top of the chattr +i immutability above).
             "/cases/e2e-demo/evidence:/cases/e2e-demo/evidence:ro",
             // The acquired image is EWF/E01, but this gateway's bundled
             // sleuthkit (Debian TSK 4.12.1 + libewf2) SEGFAULTS on libewf
