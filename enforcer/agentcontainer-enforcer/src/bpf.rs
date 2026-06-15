@@ -1693,7 +1693,22 @@ mod linux {
         }
 
         async fn get_stats(&self, container_id: &str) -> anyhow::Result<EnforcementStats> {
-            let cgroup_id = self.lookup_cgroup(container_id)?;
+            // Resolve the target cgroups before locking the BPF programs (keeps
+            // the container_cgroups -> programs lock ordering). Per the
+            // PolicyManager::get_stats contract, an empty container_id means
+            // "aggregate across all registered containers" — this is the path
+            // the kernel-primary gate uses to read global LSM status before any
+            // container is registered, so it must NOT error like a lookup miss.
+            let cgroup_ids: Vec<u64> = if container_id.is_empty() {
+                self.container_cgroups
+                    .read()
+                    .unwrap()
+                    .values()
+                    .copied()
+                    .collect()
+            } else {
+                vec![self.lookup_cgroup(container_id)?]
+            };
 
             let bpf = self.programs.lock().unwrap();
             let map_data = bpf
@@ -1701,30 +1716,32 @@ mod linux {
                 .ok_or_else(|| anyhow::anyhow!("BPF map CGROUP_STATS not found"))?;
             let map: PerCpuHashMap<_, u64, CgroupStats> = PerCpuHashMap::try_from(map_data)?;
 
-            match map.get(&cgroup_id, 0) {
-                Ok(per_cpu_values) => {
-                    // Sum counters across all CPUs.
-                    let mut totals = EnforcementStats::default();
-                    for cpu_stats in per_cpu_values.iter() {
-                        totals.network_allowed += cpu_stats.network_allowed;
-                        totals.network_blocked += cpu_stats.network_blocked;
-                        totals.filesystem_allowed += cpu_stats.filesystem_allowed;
-                        totals.filesystem_blocked += cpu_stats.filesystem_blocked;
-                        totals.process_allowed += cpu_stats.process_allowed;
-                        totals.process_blocked += cpu_stats.process_blocked;
-                        totals.credential_allowed += cpu_stats.credential_allowed;
-                        totals.credential_blocked += cpu_stats.credential_blocked;
+            // Sum counters across the target cgroups and all CPUs.
+            let mut totals = EnforcementStats::default();
+            for cgroup_id in cgroup_ids {
+                match map.get(&cgroup_id, 0) {
+                    Ok(per_cpu_values) => {
+                        for cpu_stats in per_cpu_values.iter() {
+                            totals.network_allowed += cpu_stats.network_allowed;
+                            totals.network_blocked += cpu_stats.network_blocked;
+                            totals.filesystem_allowed += cpu_stats.filesystem_allowed;
+                            totals.filesystem_blocked += cpu_stats.filesystem_blocked;
+                            totals.process_allowed += cpu_stats.process_allowed;
+                            totals.process_blocked += cpu_stats.process_blocked;
+                            totals.credential_allowed += cpu_stats.credential_allowed;
+                            totals.credential_blocked += cpu_stats.credential_blocked;
+                        }
                     }
-                    Ok(totals)
-                }
-                Err(aya::maps::MapError::KeyNotFound) => {
                     // No stats yet for this cgroup (no enforcement decisions made).
-                    Ok(EnforcementStats::default())
+                    Err(aya::maps::MapError::KeyNotFound) => {}
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                            "failed to read CGROUP_STATS for cgroup {cgroup_id}: {e}"
+                        ))
+                    }
                 }
-                Err(e) => Err(anyhow::anyhow!(
-                    "failed to read CGROUP_STATS for cgroup {cgroup_id}: {e}"
-                )),
             }
+            Ok(totals)
         }
 
         fn lsm_status(&self) -> LsmStatus {

@@ -376,6 +376,38 @@ async fn test_get_stats() {
     assert_eq!(resp.process_blocked, 0);
 }
 
+/// Regression: the kernel-primary gate (`agentcontainer run` with
+/// `enforcer.kernelPrimary`) queries global LSM status via `GetStats` with an
+/// EMPTY container_id *before* any container is registered. Per the
+/// `PolicyManager::get_stats` contract ("empty string = aggregate"), that must
+/// return aggregate stats — not fail with "container  not registered — call
+/// register first", which previously aborted the run and cascaded into the MCP
+/// proxy's enforcer health check.
+#[tokio::test]
+#[serial]
+async fn test_get_stats_empty_container_id_aggregates() {
+    let (_container, uri) = start_enforcer().await;
+    let mut client = connect_with_retry(&uri).await;
+
+    // Nothing registered — exactly the pre-registration gate scenario.
+    let resp = client
+        .get_stats(GetStatsRequest {
+            container_id: String::new(),
+        })
+        .await
+        .expect("get_stats with empty container_id must aggregate, not error")
+        .into_inner();
+
+    // Aggregate over zero registered containers is all-zero; the call also
+    // surfaces global LSM status (lsm_active depends on the test host kernel).
+    assert_eq!(resp.network_allowed, 0);
+    assert_eq!(resp.network_blocked, 0);
+    assert_eq!(resp.filesystem_allowed, 0);
+    assert_eq!(resp.filesystem_blocked, 0);
+    assert_eq!(resp.process_allowed, 0);
+    assert_eq!(resp.process_blocked, 0);
+}
+
 #[tokio::test]
 #[serial]
 async fn test_stream_events_connects() {
