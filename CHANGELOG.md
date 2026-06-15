@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.6](https://github.com/jlgore/agentcontainers/compare/v0.1.5...v0.1.6) (2026-06-15)
+
+
+### Bug Fixes
+
+* **bootstrap:** verify CLI release under its real filename ([0b5602f](https://github.com/jlgore/agentcontainers/commit/0b5602f0cf32e4c7dbfcade54c2981b783da59d8))
+* **cli:** discover enforcer mTLS creds for mcp start / status / diagnose ([e763ea5](https://github.com/jlgore/agentcontainers/commit/e763ea5ec16eab9556dab79edb0b7b77df11b458))
+
 ## [0.1.5](https://github.com/jlgore/agentcontainers/compare/v0.1.4...v0.1.5) (2026-06-15)
 
 
