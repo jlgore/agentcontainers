@@ -235,8 +235,8 @@ mod linux {
     use agentcontainer_common::events as bpf_events;
     use agentcontainer_common::maps::{
         tool_identity, ActiveTool, CgroupStats, FsInodeKey, LpmDataV4, LpmDataV6, PortKeyV4,
-        SecretAclKey, SecretAclValue, SecretToolKey, FS_PERM_READ, FS_PERM_WRITE,
-        LPM_CGROUP_PREFIX,
+        SecretAclKey, SecretAclValue, SecretToolKey, CGROUP_FLAG_ENFORCED,
+        CGROUP_FLAG_EXEC_ENFORCED, FS_PERM_READ, FS_PERM_WRITE, LPM_CGROUP_PREFIX,
     };
     use anyhow::Context as _;
 
@@ -1141,7 +1141,10 @@ mod linux {
                     bpf.map_mut("ENFORCED_CGROUPS")
                         .ok_or_else(|| anyhow::anyhow!("BPF map ENFORCED_CGROUPS not found"))?,
                 )?;
-                map.insert(cgroup_id, 1, 0)?;
+                // Network + filesystem enforcement only at registration. Exec
+                // (bprm_check) is opt-in and gets its flag bit later, in
+                // apply_process, and only for a non-empty allowlist.
+                map.insert(cgroup_id, CGROUP_FLAG_ENFORCED, 0)?;
             }
 
             // Track in registry for event correlation.
@@ -1565,17 +1568,40 @@ mod linux {
                 cgroup_id,
                 |k| k.cgroup_id,
             );
-            let map_data = bpf
-                .map_mut("ALLOWED_EXECS")
-                .ok_or_else(|| anyhow::anyhow!("BPF map ALLOWED_EXECS not found"))?;
-            let mut map: AyaHashMap<_, FsInodeKey, u8> = AyaHashMap::try_from(map_data)?;
-            for (key, binary) in &keys {
-                map.insert(key, 1, 0)?;
-                info!(
-                    binary,
-                    inode = key.inode,
-                    "added binary inode to ALLOWED_EXECS"
-                );
+            {
+                let map_data = bpf
+                    .map_mut("ALLOWED_EXECS")
+                    .ok_or_else(|| anyhow::anyhow!("BPF map ALLOWED_EXECS not found"))?;
+                let mut map: AyaHashMap<_, FsInodeKey, u8> = AyaHashMap::try_from(map_data)?;
+                for (key, binary) in &keys {
+                    map.insert(key, 1, 0)?;
+                    info!(
+                        binary,
+                        inode = key.inode,
+                        "added binary inode to ALLOWED_EXECS"
+                    );
+                }
+            }
+
+            // Toggle the exec-enforcement flag on this cgroup. bprm_check is an
+            // allowlist: gating a cgroup with an EMPTY allowlist would deny ALL
+            // execs. So exec enforcement is opt-in — set the EXEC flag only when
+            // the allowlist is non-empty; clear it otherwise so a cgroup with no
+            // declared binaries (e.g. a proxy-launched tool-runner backend that
+            // must spawn its own processes) is not exec-gated. Network/filesystem
+            // enforcement is unaffected (the ENFORCED bit stays set).
+            {
+                let map_data = bpf
+                    .map_mut("ENFORCED_CGROUPS")
+                    .ok_or_else(|| anyhow::anyhow!("BPF map ENFORCED_CGROUPS not found"))?;
+                let mut emap: AyaHashMap<_, u64, u8> = AyaHashMap::try_from(map_data)?;
+                let cur = emap.get(&cgroup_id, 0).unwrap_or(CGROUP_FLAG_ENFORCED);
+                let new = if keys.is_empty() {
+                    cur & !CGROUP_FLAG_EXEC_ENFORCED
+                } else {
+                    cur | CGROUP_FLAG_EXEC_ENFORCED
+                };
+                emap.insert(cgroup_id, new, 0)?;
             }
 
             Ok(())
@@ -1856,6 +1882,22 @@ mod linux {
                 .ok_or_else(|| {
                     anyhow::anyhow!("container {container_id} not registered — call register first")
                 })
+        }
+
+        /// Test/diagnostic helper: report whether a cgroup has exec-allowlist
+        /// (bprm_check) enforcement active — the EXEC flag bit in
+        /// ENFORCED_CGROUPS. Set only after a non-empty exec allowlist is
+        /// applied; false for a registered cgroup with no/empty allowlist.
+        pub fn exec_enforced(&self, cgroup_id: u64) -> bool {
+            let bpf = self.programs.lock().unwrap();
+            if let Some(map) = bpf.map("ENFORCED_CGROUPS") {
+                if let Ok(map) = AyaHashMap::<_, u64, u8>::try_from(map) {
+                    if let Ok(flags) = map.get(&cgroup_id, 0) {
+                        return flags & CGROUP_FLAG_EXEC_ENFORCED != 0;
+                    }
+                }
+            }
+            false
         }
     }
 }

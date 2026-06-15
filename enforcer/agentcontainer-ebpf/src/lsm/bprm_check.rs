@@ -20,7 +20,7 @@ use aya_ebpf::macros::lsm;
 use aya_ebpf::programs::LsmContext;
 
 use agentcontainer_common::events::{ExecEvent, STAT_PROC_ALLOWED, STAT_PROC_BLOCKED};
-use agentcontainer_common::maps::{FsInodeKey, LSM_ALLOW, LSM_DENY};
+use agentcontainer_common::maps::{FsInodeKey, CGROUP_FLAG_EXEC_ENFORCED, LSM_ALLOW, LSM_DENY};
 
 use crate::maps::{
     bump_cgroup_stat, ALLOWED_EXECS, CGROUP_STAT_PROC_ALLOWED, CGROUP_STAT_PROC_BLOCKED,
@@ -75,17 +75,6 @@ fn bump_stat(idx: u32) {
         if let Some(val) = PROC_STATS.get_ptr_mut(idx) {
             *val += 1;
         }
-    }
-}
-
-/// Check if the current cgroup is enforced. Returns Some(cgroup_id) if enforcement applies.
-#[inline(always)]
-fn get_enforced_cgroup() -> Option<u64> {
-    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
-    if unsafe { ENFORCED_CGROUPS.get(&cgroup_id) }.is_some() {
-        Some(cgroup_id)
-    } else {
-        None
     }
 }
 
@@ -151,10 +140,20 @@ pub fn ac_bprm_check(ctx: LsmContext) -> i32 {
 fn try_bprm_check(ctx: &LsmContext) -> Result<i32, i64> {
     // 0. Cgroup scoping: only enforce for processes in target containers.
     //    LSM hooks are system-wide; skip all non-container processes.
-    let cgroup_id = match get_enforced_cgroup() {
-        Some(id) => id,
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let flags = match unsafe { ENFORCED_CGROUPS.get(&cgroup_id) } {
+        Some(&f) => f,
         None => return Ok(LSM_ALLOW),
     };
+
+    // Exec-allowlist enforcement is OPT-IN: only cgroups that had a non-empty
+    // exec allowlist applied (the EXEC_ENFORCED flag) are gated here. Tool-runner
+    // backends — e.g. the SIFT gateway, which must spawn its own MCP sub-servers
+    // and forensic binaries — receive no allowlist and run execs freely; their
+    // network/filesystem/readonly-rootfs/cap-drop confinement still applies.
+    if flags & CGROUP_FLAG_EXEC_ENFORCED == 0 {
+        return Ok(LSM_ALLOW);
+    }
 
     // Read the linux_binprm pointer from the LSM hook's first argument.
     let bprm_ptr: *const LinuxBinprm = unsafe { ctx.arg(0) };

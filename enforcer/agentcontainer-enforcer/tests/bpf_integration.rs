@@ -294,6 +294,76 @@ async fn test_process_apply_allowed_binary() {
     mgr.unregister("test-proc-bin").await.unwrap();
 }
 
+/// Exec-allowlist (bprm_check) enforcement is OPT-IN: it activates only when a
+/// NON-EMPTY allowlist is applied. Registration alone, or an empty allowlist,
+/// must leave the cgroup ungated — otherwise a proxy-launched tool-runner
+/// backend (which receives no exec allowlist) would have ALL execs denied and
+/// serve 0 tools, the bug this guards against.
+#[tokio::test]
+#[serial]
+async fn test_process_exec_enforcement_is_opt_in() {
+    let mgr = BpfPolicyManager::new().unwrap();
+    let cgroup = own_cgroup_path();
+
+    let handle = mgr.register("test-proc-optin", &cgroup, 0).await.unwrap();
+
+    // Registration (network + filesystem) must not exec-gate the cgroup.
+    assert!(
+        !mgr.exec_enforced(handle.cgroup_id),
+        "a freshly registered cgroup must not be exec-gated"
+    );
+
+    // An empty allowlist stays opt-out.
+    mgr.apply_process(
+        "test-proc-optin",
+        &ProcessPolicy {
+            allowed_binaries: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        !mgr.exec_enforced(handle.cgroup_id),
+        "an empty exec allowlist must not turn on exec enforcement"
+    );
+
+    // A non-empty allowlist opts the cgroup INTO exec enforcement.
+    let binary = if std::path::Path::new("/bin/true").exists() {
+        "/bin/true"
+    } else {
+        "/usr/bin/true"
+    };
+    mgr.apply_process(
+        "test-proc-optin",
+        &ProcessPolicy {
+            allowed_binaries: vec![binary.into()],
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        mgr.exec_enforced(handle.cgroup_id),
+        "a non-empty exec allowlist must turn on exec enforcement"
+    );
+
+    // Re-applying an empty allowlist must turn enforcement back OFF (a tightened
+    // policy that drops to zero binaries should not silently deny-all).
+    mgr.apply_process(
+        "test-proc-optin",
+        &ProcessPolicy {
+            allowed_binaries: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        !mgr.exec_enforced(handle.cgroup_id),
+        "clearing the allowlist must turn exec enforcement back off"
+    );
+
+    mgr.unregister("test-proc-optin").await.unwrap();
+}
+
 #[tokio::test]
 #[serial]
 async fn test_process_apply_multiple_binaries() {
