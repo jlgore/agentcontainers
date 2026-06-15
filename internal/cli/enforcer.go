@@ -240,11 +240,26 @@ func runEnforcerStatus(cmd *cobra.Command) error {
 		}
 	}
 
-	// Probe gRPC health if the container is running.
+	// Probe gRPC health if the container is running. A managed enforcer requires
+	// mTLS, so present the same client credentials a real client uses (from
+	// AC_ENFORCER_TLS_* or the stable host creds dir); otherwise a plaintext
+	// probe would always report UNHEALTHY against a perfectly healthy enforcer.
 	if state.Running {
 		port := enforcerPortFromInspect(info)
 		target := fmt.Sprintf("127.0.0.1:%d", port)
-		healthy := enforcement.ProbeEnforcerHealth(target)
+		ca, cert, key := resolveEnforcerClientCreds(false)
+		profile := enforcement.ConnectionProfile{
+			Addr:           target,
+			CACertPath:     ca,
+			ClientCertPath: cert,
+			ClientKeyPath:  key,
+		}
+		var healthy bool
+		if profile.HasMTLS() {
+			healthy = enforcement.ProbeEnforcerHealthProfile(profile)
+		} else {
+			healthy = enforcement.ProbeEnforcerHealth(target)
+		}
 		if healthy {
 			_, _ = fmt.Fprintln(out, "Health:     SERVING")
 		} else {

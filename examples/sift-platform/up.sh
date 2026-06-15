@@ -51,6 +51,19 @@ agentcontainer run -d 2>&1 | grep -avE 'lockfile not found' || true
 #    backend (type: container + http), registers its cgroup with the enforcer,
 #    and fronts the 49 SIFT tools. First start pulls/boots the gateway, so allow
 #    a longer settle than a remote backend.
+#
+# The proxy is a separate process and authenticates to the mTLS enforcer with
+# the client creds the managed enforcer wrote to ~/.ac/enforcer-creds. Recent
+# CLI versions discover that path automatically; export it explicitly too so the
+# demo also works with a CLI that predates the auto-discovery, and so it's
+# obvious where the creds come from.
+ENFORCER_CREDS="${ENFORCER_CREDS:-$HOME/.ac/enforcer-creds}"
+if [ -f "$ENFORCER_CREDS/client.crt" ]; then
+  export AC_ENFORCER_ADDR="${AC_ENFORCER_ADDR:-127.0.0.1:50051}"
+  export AC_ENFORCER_TLS_CA="$ENFORCER_CREDS/client-ca.crt"
+  export AC_ENFORCER_TLS_CERT="$ENFORCER_CREDS/client.crt"
+  export AC_ENFORCER_TLS_KEY="$ENFORCER_CREDS/client.key"
+fi
 log "Starting MCP proxy on :$PROXY_PORT (launches the gateway backend)"
 if [ -f "$RUN_DIR/proxy.pid" ] && kill -0 "$(cat "$RUN_DIR/proxy.pid")" 2>/dev/null; then
   ok "proxy already running (pid $(cat "$RUN_DIR/proxy.pid"))"

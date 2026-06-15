@@ -20,7 +20,17 @@ func TestMain(m *testing.M) {
 	// The package-level logger is nil until PersistentPreRunE runs. Set a nop
 	// logger so unit tests that call runEnforcerLiveness do not panic.
 	logger = zap.NewNop()
-	os.Exit(m.Run())
+	// Isolate enforcer-creds discovery to an empty temp dir so tests never read
+	// the developer's real ~/.ac/enforcer-creds (resolveEnforcerClientCreds falls
+	// back to it). Tests that exercise the fallback override this themselves.
+	credsDir, err := os.MkdirTemp("", "ac-cli-test-creds-")
+	if err != nil {
+		panic(err)
+	}
+	_ = os.Setenv("AC_ENFORCER_CREDS_HOST_DIR", credsDir)
+	code := m.Run()
+	_ = os.RemoveAll(credsDir)
+	os.Exit(code)
 }
 
 func TestRunCmd_DefaultFlags(t *testing.T) {

@@ -336,6 +336,27 @@ func pushServerCreds(ctx context.Context, cli client.APIClient, containerID stri
 	return nil
 }
 
+// DefaultClientCredsPaths returns the host paths to the client mTLS material in
+// the stable creds directory (see stableCredsDir) with ok=true when all three
+// client files are present. Callers that don't have AC_ENFORCER_TLS_* in their
+// environment — a separate `mcp start` process, `enforcer status` — use this to
+// discover and authenticate to a managed enforcer over its stable, reused
+// credentials. ok is false when the directory or any file is missing (e.g. a
+// plaintext/insecure-dev enforcer, or no enforcer ever started here).
+func DefaultClientCredsPaths() (ca, cert, key string, ok bool) {
+	dir, err := stableCredsDir()
+	if err != nil {
+		return "", "", "", false
+	}
+	p := credPathsIn(dir)
+	for _, f := range []string{p.clientCA, p.clientCert, p.clientKey} {
+		if _, statErr := os.Stat(f); statErr != nil {
+			return "", "", "", false
+		}
+	}
+	return p.clientCA, p.clientCert, p.clientKey, true
+}
+
 // PurgeCreds deletes the stable host credential directory, forcing fresh
 // material to be generated on the next enforcer start. Used by
 // `enforcer stop --purge` to rotate credentials.

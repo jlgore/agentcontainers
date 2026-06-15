@@ -102,6 +102,29 @@ func TestHostCreds_MTLSHandshake(t *testing.T) {
 	}
 }
 
+// TestDefaultClientCredsPaths covers the discovery primitive that lets a
+// credential-less caller (mcp start / enforcer status) find a managed enforcer's
+// client material: false before any enforcer ran, true (with real paths) after.
+func TestDefaultClientCredsPaths(t *testing.T) {
+	t.Setenv(credsHostDirEnv, t.TempDir())
+
+	if _, _, _, ok := DefaultClientCredsPaths(); ok {
+		t.Fatal("expected ok=false before any creds exist")
+	}
+	if _, err := ensureHostCreds(); err != nil {
+		t.Fatalf("ensureHostCreds: %v", err)
+	}
+	ca, cert, key, ok := DefaultClientCredsPaths()
+	if !ok {
+		t.Fatal("expected ok=true after creds generated")
+	}
+	for _, p := range []string{ca, cert, key} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("discovered path %s should exist: %v", p, err)
+		}
+	}
+}
+
 func mustPool(t *testing.T, caPath string) *x509.CertPool {
 	t.Helper()
 	pem, err := os.ReadFile(caPath)

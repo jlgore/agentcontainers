@@ -26,6 +26,7 @@ import (
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/enforcement"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/enforcerapi"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/mcpproxy"
+	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/sidecar"
 )
 
 const defaultMCPPort = 4508
@@ -248,12 +249,14 @@ func buildMCPDeps(cfg *config.AgentContainer, log *zap.Logger) (mcpproxy.Deps, f
 		if addr == "" {
 			addr = "127.0.0.1:50051"
 		}
+		insecureDev := mcpEnforcerInsecureDev(cfg)
+		ca, cert, key := resolveEnforcerClientCreds(insecureDev)
 		profile := enforcement.ConnectionProfile{
 			Addr:           addr,
-			CACertPath:     os.Getenv("AC_ENFORCER_TLS_CA"),
-			ClientCertPath: os.Getenv("AC_ENFORCER_TLS_CERT"),
-			ClientKeyPath:  os.Getenv("AC_ENFORCER_TLS_KEY"),
-			InsecureDev:    mcpEnforcerInsecureDev(cfg),
+			CACertPath:     ca,
+			ClientCertPath: cert,
+			ClientKeyPath:  key,
+			InsecureDev:    insecureDev,
 		}
 		// grpc.NewClient is lazy — it never dials. Without an eager probe,
 		// an unreachable enforcer surfaces only at the first backend
@@ -291,6 +294,28 @@ var enforcerProfileProbe = func(p enforcement.ConnectionProfile) bool {
 		return enforcement.ProbeEnforcerHealthProfile(p)
 	}
 	return enforcerHealthProbe(p.Addr)
+}
+
+// resolveEnforcerClientCreds returns the mTLS client material for talking to a
+// managed enforcer. It prefers explicit external configuration via
+// AC_ENFORCER_TLS_*, and otherwise falls back to the stable host creds
+// directory a managed enforcer writes (~/.ac/enforcer-creds), so a separate
+// process — `mcp start`, `enforcer status` — discovers the current enforcer's
+// credentials without manual exports. The fallback is skipped under insecureDev
+// (a plaintext enforcer wants no client cert) and when any env var is set (the
+// operator is configuring it explicitly). Returns empty strings when neither
+// source has credentials.
+func resolveEnforcerClientCreds(insecureDev bool) (ca, cert, key string) {
+	ca = os.Getenv("AC_ENFORCER_TLS_CA")
+	cert = os.Getenv("AC_ENFORCER_TLS_CERT")
+	key = os.Getenv("AC_ENFORCER_TLS_KEY")
+	if insecureDev || ca != "" || cert != "" || key != "" {
+		return ca, cert, key
+	}
+	if dca, dcert, dkey, ok := sidecar.DefaultClientCredsPaths(); ok {
+		return dca, dcert, dkey
+	}
+	return ca, cert, key
 }
 
 // mcpEnforcerInsecureDev reports whether the agent config opted into a plaintext

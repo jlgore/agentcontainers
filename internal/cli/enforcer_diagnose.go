@@ -229,7 +229,16 @@ func checkEnforcerHealth() diagCheck {
 	if addr := os.Getenv("AC_ENFORCER_ADDR"); addr != "" {
 		target = addr
 	}
-	if enforcement.ProbeEnforcerHealth(target) {
+	// Present the same mTLS client credentials a real client uses (env or the
+	// stable host creds dir), so a healthy mTLS enforcer isn't mis-reported as
+	// unreachable by a plaintext probe.
+	ca, cert, key := resolveEnforcerClientCreds(false)
+	profile := enforcement.ConnectionProfile{Addr: target, CACertPath: ca, ClientCertPath: cert, ClientKeyPath: key}
+	healthy := enforcement.ProbeEnforcerHealth(target)
+	if profile.HasMTLS() {
+		healthy = enforcement.ProbeEnforcerHealthProfile(profile)
+	}
+	if healthy {
 		return diagCheck{Name: "Enforcer Health", Status: "PASS", Detail: fmt.Sprintf("SERVING at %s", target)}
 	}
 	return diagCheck{
