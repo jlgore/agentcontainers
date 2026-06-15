@@ -225,13 +225,17 @@ install_cli_from_release() {
   [ -n "$tag" ] && [ "$tag" != "null" ] || die "no published CLI release found for $REPO_SLUG (use --from-source)"
   info "pulling CLI $tag ($asset) from GitHub Releases"
   local base="https://github.com/$REPO_SLUG/releases/download/$tag"
-  curl -fsSL -o /tmp/ac.tgz  "$base/$asset"        || die "download failed: $base/$asset"
-  curl -fsSL -o /tmp/ac.sums "$base/checksums.txt" || die "download failed: $base/checksums.txt"
-  ( cd /tmp && grep " $asset\$" ac.sums | sha256sum -c - ) >/dev/null 2>&1 \
+  # Download under the asset's real name so `sha256sum -c` (which reads the
+  # filename from checksums.txt) can find it on disk. A dedicated temp dir keeps
+  # the verification self-contained and avoids colliding with anything in /tmp.
+  local dl; dl="$(mktemp -d)"
+  curl -fsSL -o "$dl/$asset"        "$base/$asset"        || die "download failed: $base/$asset"
+  curl -fsSL -o "$dl/checksums.txt" "$base/checksums.txt" || die "download failed: $base/checksums.txt"
+  ( cd "$dl" && grep " $asset\$" checksums.txt | sha256sum -c - ) >/dev/null 2>&1 \
       || die "CLI checksum verification failed for $asset"
-  tar -C /tmp -xzf /tmp/ac.tgz agentcontainer
-  install -m 0755 /tmp/agentcontainer /usr/local/bin/agentcontainer
-  rm -f /tmp/ac.tgz /tmp/ac.sums /tmp/agentcontainer
+  tar -C "$dl" -xzf "$dl/$asset" agentcontainer
+  install -m 0755 "$dl/agentcontainer" /usr/local/bin/agentcontainer
+  rm -rf "$dl"
 }
 
 if [ "$FROM_SOURCE" = 1 ]; then
