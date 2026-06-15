@@ -13,8 +13,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -146,9 +148,34 @@ func (b *Backend) CallTool(ctx context.Context, name string, args json.RawMessag
 	}
 	params := &mcp.CallToolParams{Name: name, Arguments: args}
 	if progressToken != nil {
-		params.SetProgressToken(progressToken)
+		params.SetProgressToken(normalizeProgressToken(progressToken))
 	}
 	return b.session.CallTool(ctx, params)
+}
+
+// normalizeProgressToken coerces a client-supplied progress token into a type
+// the MCP SDK accepts (int/int32/int64/string). JSON numbers decode to float64,
+// which mcp.CallToolParams.SetProgressToken panics on — and that panic, raised
+// in the per-request goroutine, crashes the whole proxy (taking down every
+// session's audited channel) on the first real tool call. Claude Code sends a
+// numeric progressToken, so coerce an integral float to int64; stringify any
+// other float defensively. int/int32/int64/string pass through unchanged.
+func normalizeProgressToken(token any) any {
+	switch t := token.(type) {
+	case float64:
+		if !math.IsInf(t, 0) && !math.IsNaN(t) && t == math.Trunc(t) {
+			return int64(t)
+		}
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	case float32:
+		f := float64(t)
+		if !math.IsInf(f, 0) && !math.IsNaN(f) && f == math.Trunc(f) {
+			return int64(f)
+		}
+		return strconv.FormatFloat(f, 'f', -1, 32)
+	default:
+		return token
+	}
 }
 
 func (b *Backend) acquireToolSlot(ctx context.Context) error {

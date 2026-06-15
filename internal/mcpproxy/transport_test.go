@@ -399,3 +399,39 @@ func TestBackendEnforcementMarker(t *testing.T) {
 		})
 	}
 }
+
+// TestNormalizeProgressToken guards the proxy against the go-sdk panic
+// "progress token N is of type float64, not int or string". Claude Code sends a
+// numeric progressToken (decoded as float64); without coercion SetProgressToken
+// panics in the per-request goroutine and crashes the whole proxy on the first
+// real tool call. Every normalized value must be safe to hand to the SDK.
+func TestNormalizeProgressToken(t *testing.T) {
+	cases := []struct {
+		name string
+		in   any
+		want any
+	}{
+		{"integral float64 -> int64", float64(2), int64(2)},
+		{"zero float64 -> int64", float64(0), int64(0)},
+		{"fractional float64 -> string", float64(2.5), "2.5"},
+		{"int passthrough", 5, 5},
+		{"int64 passthrough", int64(9), int64(9)},
+		{"string passthrough", "tok-abc", "tok-abc"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := normalizeProgressToken(c.in)
+			if got != c.want {
+				t.Errorf("normalizeProgressToken(%v: %T) = %v: %T, want %v", c.in, c.in, got, got, c.want)
+			}
+			// The normalized token must never panic the SDK.
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("SetProgressToken panicked on normalized %v (%T): %v", got, got, r)
+				}
+			}()
+			p := &mcp.CallToolParams{Name: "x"}
+			p.SetProgressToken(got)
+		})
+	}
+}
