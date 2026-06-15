@@ -11,6 +11,7 @@
 # mutable path below is therefore funneled under /run/secrets, and bytecode
 # writes are disabled.
 FROM python:3.12-slim
+LABEL org.opencontainers.image.source=https://github.com/jlgore/agentcontainers
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates \

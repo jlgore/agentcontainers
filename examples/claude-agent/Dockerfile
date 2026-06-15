@@ -24,6 +24,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -o /out/agentcontainer ./cmd/age
 
 # ---- stage 2: Claude Code runtime ------------------------------------------
 FROM node:22-bookworm-slim
+LABEL org.opencontainers.image.source=https://github.com/jlgore/agentcontainers
 
 # Claude Code CLI plus the few tools its own operation needs. The forensic
 # tooling itself is not installed here — it lives behind the MCP proxy.
