@@ -54,6 +54,10 @@ harmless bonus; leaving it unset preserves the VM-primary behavior.
   findings/ timeline/ audit/ extractions/   # examiner outputs — writable
 ```
 
+> **Full operator runbook:** [`RUNBOOK.md`](RUNBOOK.md) — both harness modes (bare /
+> containerized), verify steps, and field gotchas. For a one-command bare bringup use
+> [`demo.sh`](demo.sh) (`./demo.sh up | status | down`).
+
 ## Run
 
 ```sh
@@ -76,8 +80,11 @@ The gateway image's bundled sleuthkit (Debian TSK + libewf2) **segfaults reading
 `.E01` directly** via libewf. So `up.sh` runs `ewfmount` on the **host** to decode
 the EWF and expose a flat raw image at `<case>/.ewfraw/ewf1`; the gateway binds
 that **read-only** (`…/.ewfraw:…/evidence-raw:ro`) and TSK reads it natively — no
-libewf in the container path. Analyze evidence at
-`/cases/<case>/evidence-raw/ewf1`. The original `.E01` stays mounted read-only at
+libewf in the container path. **Mind the path by harness:** the audited gateway tool
+(`run_command`) sees the raw image at **`/cases/<case>/evidence-raw/ewf1`** (the
+`…/.ewfraw:…/evidence-raw:ro` mount, which exists *only inside the gateway*); a **bare**
+host harness sees it at **`/cases/<case>/.ewfraw/ewf1`** (`evidence-raw/` is empty on the
+host). The original `.E01` stays mounted read-only at
 `/cases/<case>/evidence/` for integrity/registration. Requires `ewf-tools` on the
 host and `user_allow_other` in `/etc/fuse.conf` (so the Docker daemon can
 traverse the FUSE mount, via `ewfmount -X allow_root`); `up.sh` sets these up.
