@@ -64,7 +64,7 @@ It is **idempotent and reboot-aware**. Phases:
 | Preflight | asserts OS / arch / cgroup-v2 / connectivity |
 | Base utils | `curl`, `ca-certificates`, `jq`, `tar` |
 | Docker | installs Engine if absent; adds your user to the `docker` group |
-| Go + CLI | installs the Go version from `go.mod`, builds `agentcontainer` → `/usr/local/bin` |
+| CLI | installs the published `agentcontainer` release binary → `/usr/local/bin` (no Go needed); `--from-source` instead installs Go from `go.mod` and builds from this checkout |
 | Signing tools | `cosign` + `crane` (optional — for `sign`/`verify`/`attest`) |
 | BPF LSM | appends `bpf` to the kernel `lsm=` list via GRUB, then **stops for reboot** |
 | Enforcer image | pulls the enforcer image and re-tags it to the reference the CLI expects |
@@ -76,6 +76,7 @@ Useful flags:
 sudo ./scripts/bootstrap.sh \
   --enforcer-image ghcr.io/<you>/agentcontainer-enforcer:latest \  # override the image
   --with-sift-demo \        # also run examples/sift-platform/up.sh when ready
+  --from-source \           # build the CLI from this checkout (installs Go) instead of pulling the release binary
   --skip-lsm \              # network+DNS enforcement only; no GRUB change / reboot
   --skip-enforcer-image \   # don't pull/tag the enforcer (e.g. not published yet)
   --skip-signing-tools \    # don't install cosign/crane
@@ -108,12 +109,13 @@ cd examples/sift-platform
 ./down.sh      # tear it all down
 ```
 
-`up.sh` is idempotent. It builds `sift-gateway:demo` from mainline
-[`AppliedIR/sift-mcp`](https://github.com/AppliedIR/sift-mcp) (the first build
-clones upstream + `vhir-cli` and takes a few minutes), runs the agent under
-enforcement, and starts the MCP proxy. The proxy launches the gateway itself as
-a kernel-enforced `container` + `http` backend and aggregates the **49 SIFT
-tools** with policy / approval / audit — no standalone gateway to manage.
+`up.sh` is idempotent. It **pulls the pre-built `ghcr.io/jlgore/sift-gateway:demo`**
+image (public — no auth needed), falling back to a local build from mainline
+[`AppliedIR/sift-mcp`](https://github.com/AppliedIR/sift-mcp) only if the pull
+fails (that build clones upstream + `vhir-cli` and takes a few minutes). It then
+runs the agent under enforcement and starts the MCP proxy. The proxy launches the
+gateway itself as a kernel-enforced `container` + `http` backend and aggregates
+the **49 SIFT tools** with policy / approval / audit — no standalone gateway to manage.
 
 ---
 
