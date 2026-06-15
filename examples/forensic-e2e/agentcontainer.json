@@ -12,7 +12,14 @@
   // Adjust the /cases/e2e-demo paths and VHIR_* values for your case; this
   // mirrors the layout produced by the SIFT/Valhuntir tooling on the VM.
   "name": "sift-forensic-agent",
-  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  // The agent here is just the MCP-client placeholder — the forensic tooling
+  // lives in the sift gateway backend below. Any small base works. We use a
+  // Docker Hub image rather than mcr.microsoft.com/devcontainers/base:ubuntu
+  // because `agentcontainer run` re-fetches this image's manifest from its
+  // registry for org-policy extraction (fail-closed, no local-image fallback),
+  // and MCR intermittently returns 401/429 even when the image is already
+  // local — which aborts the whole bringup.
+  "image": "ubuntu:24.04",
   "agent": {
     "capabilities": {
       "filesystem": {
@@ -28,6 +35,13 @@
       }
     },
     "enforcer": {
+      // Pin the enforcer that carries the opt-in per-cgroup exec-enforcement
+      // fix. The default (kubedoll) image gates the gateway's sub-backend
+      // `python` exec under kernelPrimary with an empty allowlist → the gateway
+      // serves 0 tools ("Permission denied: /app/venv/bin/python"). The fix
+      // (EXEC flag bit, only set for a non-empty allowlist) ships in this image.
+      // Remove this override once the default image is rebuilt from that commit.
+      "image": "ghcr.io/jlgore/agentcontainer-enforcer:latest",
       // Development convenience for the demo VM. Remove for production, where
       // the managed enforcer runs ephemeral mTLS on loopback by default.
       "insecureDev": true,
