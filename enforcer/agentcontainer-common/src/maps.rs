@@ -149,6 +149,22 @@ pub fn tool_identity(name: &str) -> ToolId {
 pub const FS_PERM_READ: u8 = 0x01;
 pub const FS_PERM_WRITE: u8 = 0x02;
 
+// --- ENFORCED_CGROUPS flags ---
+//
+// The value of each `ENFORCED_CGROUPS` entry is a bitmask of which enforcement
+// domains apply to that cgroup. Mere presence in the map (the `ENFORCED` bit)
+// activates the always-on hooks (network egress, filesystem deny-list). The
+// `EXEC_ENFORCED` bit is OPT-IN: it is set only when a NON-EMPTY exec allowlist
+// is applied to the cgroup, so the bprm_check allowlist gates execs only for
+// cgroups that asked for it. Proxy-launched tool-runner backends (which never
+// receive an exec allowlist) are left ungated and can spawn their own
+// sub-processes; network/filesystem/readonly-rootfs/cap-drop still confine them.
+
+/// The cgroup is enforced (registered) — network + filesystem hooks apply.
+pub const CGROUP_FLAG_ENFORCED: u8 = 0x01;
+/// The cgroup has a non-empty exec allowlist; bprm_check authorizes its execs.
+pub const CGROUP_FLAG_EXEC_ENFORCED: u8 = 0x02;
+
 // --- Per-cgroup statistics ---
 
 /// Per-cgroup enforcement statistics tracked in BPF per-CPU hash maps.
