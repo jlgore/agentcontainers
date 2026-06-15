@@ -239,10 +239,13 @@ default.
 
 - **Loopback only.** A managed sidecar publishes its gRPC port on `127.0.0.1`,
   never on `0.0.0.0`, so it is not reachable from off-host.
-- **Ephemeral mutual TLS.** At startup the enforcer generates a self-signed CA
-  and a server/client certificate pair (`--creds-dir`). The runtime retrieves
-  the client certificate over the Docker API and presents it on every RPC,
-  including health probes. Credentials live only for the session.
+- **Mutual TLS with stable credentials.** The runtime generates a self-signed CA
+  and a server/client certificate pair host-side into a single stable directory
+  (`~/.ac/enforcer-creds`), then pushes the server material into the enforcer
+  container over the Docker API (consumed via `--tls-cert`/`--tls-key`/
+  `--tls-ca`). The matching client certificate is presented on every RPC,
+  including health probes. Credentials are reused across restarts and rotated
+  explicitly with `agentcontainer enforcer stop --purge`.
 - **Explicit profiles.** The endpoint and its certificates are threaded
   directly into each client (runtime, MCP proxy, health probe) rather than
   through `AC_ENFORCER_*` process-global environment variables.
@@ -253,8 +256,11 @@ default.
   plaintext.
 
 This applies to both the host Docker runtime and the per-VM enforcer in
-[Sandbox mode](#enforcement-in-sandbox-mode); the Sandbox retrieves the in-VM
-enforcer's credentials the same way, over its private Docker socket.
+[Sandbox mode](#enforcement-in-sandbox-mode); the Sandbox pushes the server
+credentials into the in-VM enforcer the same way, over its private Docker
+socket. (Pushing over the Docker API — rather than a host bind mount — is what
+lets the same code path serve the per-VM socket, where no host directory is
+shared with the container.)
 
 ## Stats and audit
 

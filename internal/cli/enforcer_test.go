@@ -120,6 +120,27 @@ func TestEnforcerStopForceFlag(t *testing.T) {
 	}
 }
 
+func TestEnforcerStopPurgeFlag(t *testing.T) {
+	cmd := newEnforcerStopCmd()
+
+	// Defaults to false.
+	if err := cmd.ParseFlags([]string{}); err != nil {
+		t.Fatalf("unexpected error parsing flags: %v", err)
+	}
+	if v, _ := cmd.Flags().GetBool("purge"); v {
+		t.Error("expected --purge to default to false")
+	}
+
+	// Settable.
+	cmd = newEnforcerStopCmd()
+	if err := cmd.ParseFlags([]string{"--purge"}); err != nil {
+		t.Fatalf("unexpected error parsing --purge flag: %v", err)
+	}
+	if v, _ := cmd.Flags().GetBool("purge"); !v {
+		t.Error("expected --purge to be true")
+	}
+}
+
 func TestEnforcerStatusNoArgs(t *testing.T) {
 	cmd := newEnforcerStatusCmd()
 	if cmd.Args != nil {

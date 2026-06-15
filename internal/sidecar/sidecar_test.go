@@ -25,6 +25,7 @@ type mockDockerClient struct {
 	containerStopFn     func(ctx context.Context, id string, opts client.ContainerStopOptions) (client.ContainerStopResult, error)
 	containerRemoveFn   func(ctx context.Context, id string, opts client.ContainerRemoveOptions) (client.ContainerRemoveResult, error)
 	copyFromContainerFn func(ctx context.Context, id string, opts client.CopyFromContainerOptions) (client.CopyFromContainerResult, error)
+	copyToContainerFn   func(ctx context.Context, id string, opts client.CopyToContainerOptions) (client.CopyToContainerResult, error)
 }
 
 func (m *mockDockerClient) CopyFromContainer(ctx context.Context, id string, opts client.CopyFromContainerOptions) (client.CopyFromContainerResult, error) {
@@ -32,6 +33,15 @@ func (m *mockDockerClient) CopyFromContainer(ctx context.Context, id string, opt
 		return m.copyFromContainerFn(ctx, id, opts)
 	}
 	return client.CopyFromContainerResult{}, errors.New("copy not implemented")
+}
+
+func (m *mockDockerClient) CopyToContainer(ctx context.Context, id string, opts client.CopyToContainerOptions) (client.CopyToContainerResult, error) {
+	if m.copyToContainerFn != nil {
+		return m.copyToContainerFn(ctx, id, opts)
+	}
+	// Pushing creds is infrastructure most tests don't assert on; succeed by
+	// default. Tests that inspect the pushed material set copyToContainerFn.
+	return client.CopyToContainerResult{}, nil
 }
 
 func (m *mockDockerClient) ImageInspect(ctx context.Context, ref string, opts ...client.ImageInspectOption) (client.ImageInspectResult, error) {

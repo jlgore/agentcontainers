@@ -194,10 +194,12 @@ Configure the BPF enforcer sidecar:
 Managed enforcer sidecars are hardened by default:
 
 - The gRPC port is published only on `127.0.0.1`, never on all host interfaces.
-- The enforcer generates **ephemeral mutual-TLS** credentials at startup
-  (`--creds-dir`). `agentcontainer` retrieves the client certificate over the
-  Docker API and presents it on every call, including health probes. No
-  long-lived keys are stored.
+- `agentcontainer` generates the **mutual-TLS** credentials host-side into a
+  single stable directory (`~/.ac/enforcer-creds`) and pushes the server
+  certificate into the enforcer container over the Docker API (`--tls-cert`/
+  `--tls-key`/`--tls-ca`). It presents the matching client certificate on every
+  call, including health probes. The credentials are reused across restarts;
+  rotate them with `agentcontainer enforcer stop --purge`.
 - The connection profile (address + certificates) is passed explicitly to each
   client; `agentcontainer` does not rely on `AC_ENFORCER_*` process-global
   environment variables for managed sidecars.
