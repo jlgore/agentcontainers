@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.9](https://github.com/jlgore/agentcontainers/compare/v0.1.8...v0.1.9) (2026-06-15)
+
+
+### Bug Fixes
+
+* **mcpproxy:** coerce numeric progress tokens so the proxy can't panic ([#13](https://github.com/jlgore/agentcontainers/issues/13)) ([5e4b89b](https://github.com/jlgore/agentcontainers/commit/5e4b89ba3a0910f3b4b58659a21da181073fd675))
+
 ## [0.1.8](https://github.com/jlgore/agentcontainers/compare/v0.1.7...v0.1.8) (2026-06-15)
 
 
