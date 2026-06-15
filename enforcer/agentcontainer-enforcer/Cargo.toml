@@ -1,6 +1,6 @@
 [package]
 name = "agentcontainer-enforcer"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "Userspace BPF enforcer for agentcontainers — loads BPF programs, manages maps, serves gRPC"
 

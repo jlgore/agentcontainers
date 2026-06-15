@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.5](https://github.com/jlgore/agentcontainers/compare/v0.1.4...v0.1.5) (2026-06-15)
+
+
+### Features
+
+* add kernel-primary Docker Engine containment posture ([3df200e](https://github.com/jlgore/agentcontainers/commit/3df200e8ba93a2b01fe6ba18e9134b83176b18fe))
+* kernel-primary Docker Engine containment posture ([1c37957](https://github.com/jlgore/agentcontainers/commit/1c3795761996c6f3d4901257e1e4df4cc457f7f4))
+
 ## [0.1.4](https://github.com/jlgore/agentcontainers/compare/v0.1.3...v0.1.4) (2026-06-15)
 
 
