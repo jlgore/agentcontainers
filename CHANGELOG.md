@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.4](https://github.com/jlgore/agentcontainers/compare/v0.1.3...v0.1.4) (2026-06-15)
+
+
+### Features
+
+* **sidecar:** generate enforcer mTLS creds host-side with a stable directory ([7f10be4](https://github.com/jlgore/agentcontainers/commit/7f10be474e5cafbe4b6cda1377546081e1620ac7))
+* **sidecar:** stable host-generated enforcer mTLS creds ([740024e](https://github.com/jlgore/agentcontainers/commit/740024e287b3f1c8a856a25959653940930542bf))
+
+
+### Bug Fixes
+
+* **enforcer:** document host-pushed --tls-* as the production mTLS path ([fb1e812](https://github.com/jlgore/agentcontainers/commit/fb1e81217086b4726fcba5625fbef823af18ed5b))
+* **forensic-e2e:** make the proxy-path investigation segment actually run ([35609b5](https://github.com/jlgore/agentcontainers/commit/35609b5aa244fbbda1b83f6c11b5399b5e8ba8a4))
+
 ## [0.1.3](https://github.com/jlgore/agentcontainers/compare/v0.1.2...v0.1.3) (2026-06-14)
 
 

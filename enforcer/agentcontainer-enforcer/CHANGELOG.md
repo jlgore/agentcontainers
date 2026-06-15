@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.3](https://github.com/jlgore/agentcontainers/compare/ac-enforcer-v0.1.2...ac-enforcer-v0.1.3) (2026-06-15)
+
+
+### Features
+
+* **sidecar:** stable host-generated enforcer mTLS creds ([740024e](https://github.com/jlgore/agentcontainers/commit/740024e287b3f1c8a856a25959653940930542bf))
+
+
+### Bug Fixes
+
+* **enforcer:** document host-pushed --tls-* as the production mTLS path ([fb1e812](https://github.com/jlgore/agentcontainers/commit/fb1e81217086b4726fcba5625fbef823af18ed5b))
+
 ## [0.1.2](https://github.com/jlgore/agentcontainers/compare/ac-enforcer-v0.1.1...ac-enforcer-v0.1.2) (2026-06-14)
 
 
