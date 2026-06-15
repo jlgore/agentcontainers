@@ -214,6 +214,15 @@ message StatsResponse {
   uint64 process_blocked = 6;
   uint64 credential_allowed = 7;
   uint64 credential_blocked = 8;
+
+  // lsm_active reports whether the kernel BPF LSM hooks (file_open,
+  // bprm_check) are attached. Network/cgroup hooks can attach on kernels
+  // without BPF LSM, so the enforcer can be SERVING while filesystem deny-list
+  // and exec enforcement are silently inactive. Clients running kernel-primary
+  // (Docker Engine, no sandboxd VM) refuse to start containers when this is
+  // false. lsm_detail carries the reason for the negative case.
+  bool lsm_active = 9;
+  string lsm_detail = 10;
 }
 
 // --- WASM Component lifecycle ---

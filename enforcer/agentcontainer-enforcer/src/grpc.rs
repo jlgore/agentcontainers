@@ -629,6 +629,8 @@ impl Enforcer for EnforcerService {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
+        let lsm = self.manager.lsm_status();
+
         Ok(Response::new(StatsResponse {
             network_allowed: stats.network_allowed,
             network_blocked: stats.network_blocked,
@@ -638,6 +640,8 @@ impl Enforcer for EnforcerService {
             process_blocked: stats.process_blocked,
             credential_allowed: stats.credential_allowed,
             credential_blocked: stats.credential_blocked,
+            lsm_active: lsm.active,
+            lsm_detail: lsm.detail,
         }))
     }
 

@@ -234,9 +234,19 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 	// insecureDev permits plaintext control-plane connections; it is an explicit
 	// development opt-in surfaced through agent.enforcer.insecureDev.
 	insecureDev := false
+	// kernelPrimary declares the host kernel's eBPF LSM as the primary
+	// containment boundary (Docker Engine, no sandboxd VM). When set, containers
+	// run with --cgroupns=host and the run refuses to start unless the enforcer's
+	// BPF LSM hooks are actually attached. See config.EnforcerConfig.KernelPrimary.
+	kernelPrimary := false
 	if cfg.Agent != nil && cfg.Agent.Enforcer != nil {
 		insecureDev = cfg.Agent.Enforcer.InsecureDev
+		kernelPrimary = cfg.Agent.Enforcer.KernelPrimary
 	}
+	// enfProfile carries the enforcer connection profile for the kernel-primary
+	// LSM gate below; populated on the host-sidecar path.
+	var enfProfile enforcement.ConnectionProfile
+	var haveProfile bool
 
 	if isSandbox {
 		// Sandbox manages its own in-VM enforcer. Set enforcement level to
@@ -262,6 +272,8 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 				enfSource = "external"
 			}
 			profile := sidecarHandle.Profile()
+			enfProfile = profile
+			haveProfile = true
 			enfStrategy, err = enforcement.NewStrategyFromProfile(profile, func(msg string) {
 				logger.Warn(msg)
 			})
@@ -276,7 +288,18 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 	}
 	logger.Info("enforcement level resolved", zap.String("level", enfLevel.String()), zap.String("source", enfSource))
 
-	rt, err := newEnforcingRuntime(runtimeFlag, logger, enfLevel, enfStrategy, insecureDev)
+	// Kernel-primary gate: when the eBPF LSM is the primary containment boundary
+	// (Docker Engine, no sandboxd VM), refuse to start anything unenforced. The
+	// Sandbox runtime is exempt — its VM is the boundary and eBPF is bonus
+	// defense-in-depth, validated in-VM rather than from this process.
+	if kernelPrimary && !isSandbox {
+		if err := enforceKernelPrimaryGate(cmd.Context(), enfStrategy, haveProfile, enfProfile); err != nil {
+			return fmt.Errorf("run: kernel-primary enforcement unavailable: %w", err)
+		}
+		logger.Info("kernel-primary enforcement verified: BPF LSM hooks active, cgroupns=host")
+	}
+
+	rt, err := newEnforcingRuntime(runtimeFlag, logger, enfLevel, enfStrategy, insecureDev, kernelPrimary && !isSandbox)
 	if err != nil {
 		return fmt.Errorf("run: %w", err)
 	}
@@ -646,6 +669,37 @@ func resolveSidecar(cmd *cobra.Command, cfg *config.AgentContainer, insecureDev 
 	}
 
 	return handle, nil
+}
+
+// enforceKernelPrimaryGate verifies the host kernel preconditions and the live
+// enforcer state required for kernel-primary containment, failing closed if
+// either is unmet. It runs two checks:
+//
+//   - the host precheck (cgroup v2 + "bpf" in the kernel lsm= ordering), a fast
+//     local read that gives a clear error before any container starts; and
+//   - the authoritative enforcer check (GetStats.lsm_active), confirming the
+//     file_open/bprm_check LSM hooks actually attached — network/cgroup hooks
+//     can attach without BPF LSM, so a SERVING enforcer is not proof of it.
+//
+// An absent enforcer (required:false → nil strategy / no profile) is itself a
+// failure here: kernel-primary explicitly demands kernel enforcement.
+func enforceKernelPrimaryGate(ctx context.Context, strategy enforcement.Strategy, haveProfile bool, profile enforcement.ConnectionProfile) error {
+	if err := enforcement.CheckKernelPrimaryHost(); err != nil {
+		return err
+	}
+	if strategy == nil || !haveProfile {
+		return fmt.Errorf("no enforcer is running, but kernel-primary requires kernel " +
+			"enforcement; start the enforcer or unset agent.enforcer.kernelPrimary")
+	}
+	active, detail, err := enforcement.CheckLSMActive(ctx, profile, func(msg string) { logger.Warn(msg) })
+	if err != nil {
+		return fmt.Errorf("could not confirm enforcer BPF LSM status: %w", err)
+	}
+	if !active {
+		return fmt.Errorf("enforcer is running but its BPF LSM hooks are NOT attached "+
+			"(filesystem deny-list and exec enforcement are inactive): %s", detail)
+	}
+	return nil
 }
 
 // buildSecretsManager creates a secrets.Manager from the agent configuration,

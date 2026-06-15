@@ -21,6 +21,31 @@ never exercised, and the gateway could write to the evidence. This example runs
 the gateway **through** the proxy with split mounts, and is checked into the repo
 so a fresh VM reproduces it from source — no VM-local script required.
 
+## Containment model (kernel-primary)
+
+The SIFT VM runs **Docker Engine directly** — there is no Docker Desktop
+`sandboxd` VM between the container and the host kernel. So the host kernel's
+**eBPF LSM is the containment boundary**, not defense-in-depth behind a VM:
+a container escape is a host escape, mitigated by the enforcer's LSM hooks
+(`file_open`, `bprm_check`) and cgroup network hooks rather than a VM.
+
+`agentcontainer.json` makes this explicit with `agent.enforcer.kernelPrimary:
+true`, which:
+
+- runs backend containers with `--cgroupns=host` so their cgroups are visible to
+  the host kernel's BPF maps; and
+- **fails closed** — `agentcontainer run` refuses to start anything unless the
+  enforcer's BPF LSM hooks are actually attached. Network/cgroup hooks can attach
+  on a kernel without BPF LSM, so a "healthy" enforcer is not proof; the run
+  queries the enforcer (`GetStats.lsm_active`) and checks the host
+  (`/sys/kernel/security/lsm` contains `bpf`) before any container unpauses.
+
+This depends on `CONFIG_BPF_LSM=y` and `bpf` in the kernel `lsm=` ordering, which
+`scripts/bootstrap.sh` configures (a reboot may be required). Verify with
+`agentcontainer enforcer diagnose` — the **BPF LSM** line must read `[PASS]`. On
+Docker Desktop the `sandboxd` VM remains the outer boundary and this flag is a
+harmless bonus; leaving it unset preserves the VM-primary behavior.
+
 ## Layout the case like this
 
 ```

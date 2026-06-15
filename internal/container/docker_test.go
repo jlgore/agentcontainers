@@ -103,6 +103,36 @@ func TestBuildContainerConfig_SecurityDefaults(t *testing.T) {
 	assert.NotNil(t, networkCfg)
 }
 
+// TestBuildContainerConfig_CgroupnsHost verifies that the host cgroup namespace
+// is set on the container only when the runtime is configured for the
+// kernel-primary posture (WithCgroupnsHost). Default keeps Docker's private
+// namespace so the Docker Desktop path is unchanged.
+func TestBuildContainerConfig_CgroupnsHost(t *testing.T) {
+	cfg := &config.AgentContainer{Name: "cgns-test", Image: "ubuntu:22.04"}
+	opts := StartOptions{}
+
+	// Default: cgroupns not set.
+	rtDefault := &DockerRuntime{logger: zap.NewNop()}
+	_, hostCfg, _ := rtDefault.buildContainerConfig(cfg, opts)
+	assert.Empty(t, string(hostCfg.CgroupnsMode),
+		"default runtime must not set cgroupns (preserves Docker Desktop path)")
+
+	// Kernel-primary: cgroupns=host.
+	rtHost := &DockerRuntime{logger: zap.NewNop(), cgroupnsHost: true}
+	_, hostCfgHost, _ := rtHost.buildContainerConfig(cfg, opts)
+	assert.Equal(t, "host", string(hostCfgHost.CgroupnsMode),
+		"kernel-primary runtime must set --cgroupns=host so the cgroup is visible to host BPF maps")
+}
+
+// TestWithCgroupnsHostOption verifies the option threads through to the runtime.
+func TestWithCgroupnsHostOption(t *testing.T) {
+	o := &dockerOptions{}
+	WithCgroupnsHost(true)(o)
+	assert.True(t, o.cgroupnsHost, "WithCgroupnsHost(true) must enable host cgroup namespace")
+	WithCgroupnsHost(false)(o)
+	assert.False(t, o.cgroupnsHost, "WithCgroupnsHost(false) must disable host cgroup namespace")
+}
+
 // TestBuildContainerConfig_PinnedImageRef verifies that when StartOptions
 // carries a PinnedImageRef, buildContainerConfig uses it instead of cfg.Image.
 // This is the F-4 dual-resolution fix: both policy extraction and Docker pull

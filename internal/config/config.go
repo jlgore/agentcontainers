@@ -91,6 +91,26 @@ type EnforcerConfig struct {
 	// endpoint is rejected without this flag. A prominent warning is logged
 	// whenever it takes effect. Default: false (mTLS required).
 	InsecureDev bool `json:"insecureDev,omitempty"`
+
+	// KernelPrimary declares that the host kernel's eBPF LSM is the primary
+	// containment boundary, not defense-in-depth behind a VM. It is the posture
+	// for running on Docker Engine directly (no Docker Desktop sandboxd VM),
+	// where there is nothing between the container's processes and the host
+	// kernel: container escape = host escape, mitigated by the enforcer's eBPF
+	// LSM hooks (file_open, bprm_check) and cgroup network hooks rather than a
+	// VM boundary.
+	//
+	// When true, agentcontainer run:
+	//   - starts agent/backend containers with --cgroupns=host so the
+	//     container's cgroup is visible to the host kernel's BPF maps; and
+	//   - hard-fails (refuses to start any unenforced container) unless the
+	//     enforcer reports that its BPF LSM hooks are actually attached, i.e.
+	//     CONFIG_BPF_LSM=y and "bpf" present in the kernel lsm= ordering.
+	//
+	// Default: false. On Docker Desktop the sandboxd VM remains the outer
+	// boundary and eBPF is defense-in-depth, so leaving this unset preserves the
+	// existing behavior; setting it there is harmless (the VM is a bonus layer).
+	KernelPrimary bool `json:"kernelPrimary,omitempty"`
 }
 
 // Capabilities declares what the agent is allowed to do.

@@ -30,7 +30,16 @@
     "enforcer": {
       // Development convenience for the demo VM. Remove for production, where
       // the managed enforcer runs ephemeral mTLS on loopback by default.
-      "insecureDev": true
+      "insecureDev": true,
+      // The SIFT VM runs Docker Engine directly — no Docker Desktop sandboxd
+      // VM — so the host kernel's eBPF LSM IS the containment boundary, not
+      // defense-in-depth behind a VM. kernelPrimary makes that explicit: backend
+      // containers run with --cgroupns=host, and `agentcontainer run` refuses to
+      // start unless the enforcer's BPF LSM hooks are actually attached
+      // (CONFIG_BPF_LSM=y + "bpf" in the kernel lsm= ordering; see bootstrap.sh).
+      // Container escape = host escape here, mitigated by eBPF LSM, so we fail
+      // loudly rather than run forensic tooling unenforced.
+      "kernelPrimary": true
     },
     "tools": {
       "mcp": {

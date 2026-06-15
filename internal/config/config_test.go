@@ -1676,6 +1676,42 @@ func TestRoundTrip_EnforcerConfig(t *testing.T) {
 	}
 }
 
+func TestParse_EnforcerKernelPrimary(t *testing.T) {
+	// Default: absent → false.
+	var base AgentContainer
+	if err := json.Unmarshal([]byte(`{"name":"t","image":"alpine:3","agent":{"enforcer":{}}}`), &base); err != nil {
+		t.Fatalf("Unmarshal() error: %v", err)
+	}
+	if base.Agent.Enforcer.KernelPrimary {
+		t.Error("KernelPrimary should default to false when absent")
+	}
+
+	// Explicit opt-in parses and round-trips.
+	raw := `{"name":"t","image":"alpine:3","agent":{"enforcer":{"kernelPrimary":true,"insecureDev":true}}}`
+	var cfg AgentContainer
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		t.Fatalf("Unmarshal() error: %v", err)
+	}
+	if !cfg.Agent.Enforcer.KernelPrimary {
+		t.Fatal("KernelPrimary = false, want true")
+	}
+
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("Marshal() error: %v", err)
+	}
+	var cfg2 AgentContainer
+	if err := json.Unmarshal(data, &cfg2); err != nil {
+		t.Fatalf("round-trip Unmarshal() error: %v", err)
+	}
+	if !cfg2.Agent.Enforcer.KernelPrimary {
+		t.Error("round-trip KernelPrimary = false, want true")
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate() unexpected error: %v", err)
+	}
+}
+
 func TestValidate_FromTestdata(t *testing.T) {
 	tests := []struct {
 		name    string

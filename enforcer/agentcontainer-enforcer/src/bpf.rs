@@ -19,7 +19,7 @@ use tracing::warn;
 use crate::events::{ContainerRegistry, EventBus};
 use crate::policy::{
     ContainerHandle, CredentialPolicy, EnforcementEvent, EnforcementStats, FilesystemPolicy,
-    NetworkPolicy, PolicyManager, ProcessPolicy,
+    LsmStatus, NetworkPolicy, PolicyManager, ProcessPolicy,
 };
 
 #[derive(Clone, Debug)]
@@ -346,6 +346,11 @@ mod linux {
         /// single-active-tool serialization and writes the ACTIVE_TOOL map only
         /// for these cgroups; non-restricted cgroups keep container-wide access.
         restricted_cgroups: RwLock<HashMap<u64, ()>>,
+
+        /// Whether the BPF LSM hooks (file_open, bprm_check) actually attached.
+        /// Captured once at program-attach time and reported via lsm_status();
+        /// the proxy gates kernel-primary startup on it.
+        lsm_status: LsmStatus,
     }
 
     /// cgroup_id → (wire-format question name → readable hostname).
@@ -376,8 +381,10 @@ mod linux {
             }
 
             // Attach the programs — Ebpf::load only places them in the
-            // kernel; nothing enforces until each program is attached.
-            Self::attach_programs(&mut bpf)?;
+            // kernel; nothing enforces until each program is attached. The
+            // returned status records whether the LSM hooks attached (network
+            // hooks are fatal on failure; LSM is tolerated but reported).
+            let lsm_status = Self::attach_programs(&mut bpf)?;
 
             info!("BPF programs loaded and attached successfully");
 
@@ -393,6 +400,7 @@ mod linux {
                 correlations: std::sync::Arc::new(RwLock::new(HashMap::new())),
                 tracked_domains: std::sync::Arc::new(RwLock::new(HashMap::new())),
                 restricted_cgroups: RwLock::new(HashMap::new()),
+                lsm_status,
             };
 
             // Spawn background ring buffer readers for all event sources.
@@ -413,7 +421,12 @@ mod linux {
         /// LSM attach failure is tolerated with a loud warning: kernels
         /// without CONFIG_BPF_LSM (or "bpf" missing from the lsm= cmdline)
         /// can still enforce the network boundary.
-        fn attach_programs(bpf: &mut Ebpf) -> anyhow::Result<()> {
+        ///
+        /// Returns the LSM-attach status. `active` is true only when every LSM
+        /// hook attached; otherwise `detail` carries the reason so callers
+        /// running kernel-primary (Docker Engine) can fail loudly rather than
+        /// run containers with filesystem/exec enforcement silently inactive.
+        fn attach_programs(bpf: &mut Ebpf) -> anyhow::Result<LsmStatus> {
             let cgroup = std::fs::File::open("/sys/fs/cgroup")
                 .map_err(|e| anyhow::anyhow!("opening cgroup2 root /sys/fs/cgroup: {e}"))?;
 
@@ -467,8 +480,9 @@ mod linux {
                 ),
             }
 
-            match Btf::from_sys_fs() {
+            let lsm_status = match Btf::from_sys_fs() {
                 Ok(btf) => {
+                    let mut failures: Vec<String> = Vec::new();
                     for (name, hook) in [
                         ("ac_file_open", "file_open"),
                         ("ac_bprm_check", "bprm_check_security"),
@@ -487,25 +501,49 @@ mod linux {
                         })();
                         match attach {
                             Ok(()) => info!(program = name, hook, "attached LSM hook"),
-                            Err(e) => warn!(
-                                program = name,
-                                hook,
-                                error = %e,
-                                "LSM hook NOT attached — kernel deny-list filesystem/exec \
-                                 enforcement and exec audit events are inactive (requires \
-                                 CONFIG_BPF_LSM and 'bpf' in the lsm= kernel cmdline)"
+                            Err(e) => {
+                                warn!(
+                                    program = name,
+                                    hook,
+                                    error = %e,
+                                    "LSM hook NOT attached — kernel deny-list filesystem/exec \
+                                     enforcement and exec audit events are inactive (requires \
+                                     CONFIG_BPF_LSM and 'bpf' in the lsm= kernel cmdline)"
+                                );
+                                failures.push(format!("{hook}: {e}"));
+                            }
+                        }
+                    }
+                    if failures.is_empty() {
+                        LsmStatus {
+                            active: true,
+                            detail: "file_open, bprm_check attached".to_string(),
+                        }
+                    } else {
+                        LsmStatus {
+                            active: false,
+                            detail: format!(
+                                "LSM hooks not attached ({}); requires CONFIG_BPF_LSM and \
+                                 'bpf' in the lsm= kernel cmdline",
+                                failures.join("; ")
                             ),
                         }
                     }
                 }
-                Err(e) => warn!(
-                    error = %e,
-                    "BTF unavailable — LSM hooks not attached; kernel deny-list \
-                     filesystem/exec enforcement and exec audit events are inactive"
-                ),
-            }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "BTF unavailable — LSM hooks not attached; kernel deny-list \
+                         filesystem/exec enforcement and exec audit events are inactive"
+                    );
+                    LsmStatus {
+                        active: false,
+                        detail: format!("BTF unavailable: {e}"),
+                    }
+                }
+            };
 
-            Ok(())
+            Ok(lsm_status)
         }
 
         /// Spawn background tasks that drain all BPF ring buffers and publish
@@ -1687,6 +1725,10 @@ mod linux {
                     "failed to read CGROUP_STATS for cgroup {cgroup_id}: {e}"
                 )),
             }
+        }
+
+        fn lsm_status(&self) -> LsmStatus {
+            self.lsm_status.clone()
         }
 
         async fn subscribe_events(

@@ -40,10 +40,11 @@ var _ InteractiveExecer = (*DockerRuntime)(nil)
 
 // DockerRuntime implements the Runtime interface using the Docker Engine API.
 type DockerRuntime struct {
-	client      client.APIClient
-	logger      *zap.Logger
-	stopTimeout time.Duration
-	strategy    enforcement.Strategy
+	client       client.APIClient
+	logger       *zap.Logger
+	stopTimeout  time.Duration
+	strategy     enforcement.Strategy
+	cgroupnsHost bool
 }
 
 // DockerOption configures a DockerRuntime.
@@ -56,6 +57,7 @@ type dockerOptions struct {
 	stopTimeout      time.Duration
 	enforcementLevel *enforcement.Level
 	strategy         enforcement.Strategy
+	cgroupnsHost     bool
 }
 
 // defaultDockerOptions returns sensible defaults for the Docker runtime.
@@ -118,6 +120,19 @@ func WithEnforcementStrategy(s enforcement.Strategy) DockerOption {
 	}
 }
 
+// WithCgroupnsHost runs containers in the host cgroup namespace
+// (docker create --cgroupns=host) so the container's cgroup hierarchy is
+// visible to the host kernel's BPF maps, letting the eBPF enforcer's per-cgroup
+// hooks see the container's processes. It is the kernel-primary posture used on
+// Docker Engine (no sandboxd VM); see config.EnforcerConfig.KernelPrimary.
+// Default (false) leaves Docker's default cgroup namespace (private) in place,
+// preserving the Docker Desktop path unchanged.
+func WithCgroupnsHost(enabled bool) DockerOption {
+	return func(o *dockerOptions) {
+		o.cgroupnsHost = enabled
+	}
+}
+
 // NewDockerRuntime creates a new Docker-backed Runtime. If no client is provided
 // via WithDockerClient, it creates one from the default environment variables
 // (DOCKER_HOST, DOCKER_TLS_VERIFY, etc.).
@@ -136,9 +151,10 @@ func NewDockerRuntime(opts ...DockerOption) (*DockerRuntime, error) {
 	}
 
 	d := &DockerRuntime{
-		client:      o.client,
-		logger:      o.logger,
-		stopTimeout: o.stopTimeout,
+		client:       o.client,
+		logger:       o.logger,
+		stopTimeout:  o.stopTimeout,
+		cgroupnsHost: o.cgroupnsHost,
 	}
 
 	// Prefer an explicitly injected strategy (built from a connection profile).
@@ -607,6 +623,15 @@ func (d *DockerRuntime) buildContainerConfig(
 		CapAdd:         p.CapAdd,
 		SecurityOpt:    p.SecurityOpt,
 		ReadonlyRootfs: p.ReadonlyRootfs,
+	}
+
+	// Kernel-primary posture (Docker Engine, no sandboxd VM): run in the host
+	// cgroup namespace so the container's cgroup is visible to the host kernel's
+	// BPF maps and the enforcer's per-cgroup LSM/network hooks can scope to it.
+	// Left unset, Docker's default (private) namespace applies — the Docker
+	// Desktop path is unchanged.
+	if d.cgroupnsHost {
+		hostCfg.CgroupnsMode = container.CgroupnsMode("host")
 	}
 
 	networkCfg := &network.NetworkingConfig{}

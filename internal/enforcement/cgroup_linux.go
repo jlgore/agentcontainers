@@ -85,6 +85,36 @@ func findCgroupDir(root, containerID, systemdDir string) (string, error) {
 	return result, err
 }
 
+// CheckKernelPrimaryHost verifies the host preconditions for kernel-primary
+// containment (Docker Engine, no sandboxd VM): the unified cgroup v2 hierarchy
+// must be mounted, and "bpf" must be present in the active kernel LSM ordering
+// (/sys/kernel/security/lsm) so the enforcer's file_open/bprm_check hooks can
+// attach. It returns a descriptive error when a precondition is unmet so the
+// caller can fail loudly before starting any unenforced container. This is a
+// fast, local check; the authoritative confirmation that hooks actually
+// attached comes from the enforcer via CheckLSMActive.
+func CheckKernelPrimaryHost() error {
+	if _, err := findCgroup2Mount(); err != nil {
+		return fmt.Errorf("kernel-primary requires the cgroup v2 unified hierarchy: %w", err)
+	}
+
+	const lsmPath = "/sys/kernel/security/lsm"
+	data, err := os.ReadFile(lsmPath)
+	if err != nil {
+		return fmt.Errorf("kernel-primary requires BPF LSM but %s is unreadable "+
+			"(securityfs not mounted, or kernel lacks LSM support): %w", lsmPath, err)
+	}
+	for _, name := range strings.Split(strings.TrimSpace(string(data)), ",") {
+		if name == "bpf" {
+			return nil
+		}
+	}
+	return fmt.Errorf("kernel-primary requires BPF LSM but %q does not contain \"bpf\" "+
+		"(content: %q) — rebuild the kernel with CONFIG_BPF_LSM=y and add \"bpf\" to the "+
+		"lsm= kernel cmdline (see scripts/bootstrap.sh), then reboot", lsmPath,
+		strings.TrimSpace(string(data)))
+}
+
 // findCgroup2Mount finds the cgroup v2 mount point by reading /proc/mounts.
 func findCgroup2Mount() (string, error) {
 	f, err := os.Open("/proc/mounts")

@@ -48,11 +48,46 @@ func TestDiagnoseOutputFormat(t *testing.T) {
 		"Kernel Version",
 		"Cgroup Version",
 		"BPF Support",
+		"BPF LSM",
 	}
 	for _, check := range checks {
 		if !strings.Contains(output, check) {
 			t.Errorf("output missing check %q\noutput: %s", check, output)
 		}
+	}
+}
+
+func TestLsmListHasBPF(t *testing.T) {
+	cases := []struct {
+		list string
+		want bool
+	}{
+		{"capability,landlock,lockdown,yama,bpf", true},
+		{"bpf", true},
+		{"capability, bpf", true}, // tolerates whitespace
+		{"capability,landlock,lockdown,yama,apparmor", false},
+		{"", false},
+		{"bpffs", false}, // must be exact token, not a prefix match
+	}
+	for _, c := range cases {
+		if got := lsmListHasBPF(c.list); got != c.want {
+			t.Errorf("lsmListHasBPF(%q) = %v, want %v", c.list, got, c.want)
+		}
+	}
+}
+
+func TestCheckBPFLSMReportsValidStatus(t *testing.T) {
+	// checkBPFLSM reads the host's real LSM list; assert it produces a
+	// well-formed check (name + a recognized status) rather than a fixed value,
+	// since the host kernel config varies.
+	c := checkBPFLSM()
+	if c.Name != "BPF LSM" {
+		t.Errorf("Name = %q, want %q", c.Name, "BPF LSM")
+	}
+	switch c.Status {
+	case "PASS", "FAIL", "WARN":
+	default:
+		t.Errorf("unexpected Status %q (detail: %q)", c.Status, c.Detail)
 	}
 }
 

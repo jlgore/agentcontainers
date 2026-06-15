@@ -67,6 +67,20 @@ pub struct EnforcementStats {
     pub credential_blocked: u64,
 }
 
+/// Whether the kernel BPF LSM hooks (file_open, bprm_check) are actually
+/// attached. Network/cgroup hooks can attach on kernels that lack BPF LSM, so
+/// the enforcer can look healthy while filesystem deny-list and exec
+/// enforcement are silently inactive. On Docker Engine — where the eBPF LSM is
+/// the primary containment boundary — callers refuse to run unenforced
+/// containers when `active` is false. `detail` carries the reason for the
+/// negative case (e.g. CONFIG_BPF_LSM missing, or "bpf" absent from the kernel
+/// lsm= ordering).
+#[derive(Debug, Clone)]
+pub struct LsmStatus {
+    pub active: bool,
+    pub detail: String,
+}
+
 /// Enforcement event emitted from BPF ring buffers.
 #[derive(Debug, Clone)]
 pub struct EnforcementEvent {
@@ -173,6 +187,18 @@ pub trait PolicyManager: Send + Sync + 'static {
 
     /// Get enforcement stats for a container (empty string = aggregate).
     async fn get_stats(&self, container_id: &str) -> anyhow::Result<EnforcementStats>;
+
+    /// Report whether the kernel BPF LSM hooks are attached. Manager-global, not
+    /// per-container. The default is inactive — stub/non-Linux managers have no
+    /// kernel LSM enforcement; the real Linux manager overrides this with the
+    /// result captured at program-attach time.
+    fn lsm_status(&self) -> LsmStatus {
+        LsmStatus {
+            active: false,
+            detail: "kernel BPF LSM enforcement unavailable (no Linux BPF policy manager)"
+                .to_string(),
+        }
+    }
 
     /// Subscribe to enforcement events. Returns a receiver that yields events
     /// for the given container (empty string = all containers).

@@ -65,10 +65,13 @@ func runEnforcerDiagnose(cmd *cobra.Command, skipDocker bool) error {
 	// Check 4: BPF support
 	checks = append(checks, checkBPFSupport())
 
-	// Check 5: Nested container detection
+	// Check 5: BPF LSM in the active kernel LSM ordering
+	checks = append(checks, checkBPFLSM())
+
+	// Check 6: Nested container detection
 	checks = append(checks, checkNestedContainer())
 
-	// Check 6: Enforcer sidecar health (requires Docker)
+	// Check 7: Enforcer sidecar health (requires Docker)
 	if skipDocker {
 		checks = append(checks, diagCheck{
 			Name:   "Enforcer Health",
@@ -159,6 +162,47 @@ func checkBPFSupport() diagCheck {
 		return diagCheck{Name: "BPF Support", Status: "FAIL", Detail: "/sys/fs/bpf not mounted"}
 	}
 	return diagCheck{Name: "BPF Support", Status: "PASS", Detail: "/sys/fs/bpf available"}
+}
+
+// checkBPFLSM reports whether "bpf" is present in the active kernel LSM ordering
+// (/sys/kernel/security/lsm). Without it, the enforcer's file_open/bprm_check
+// LSM hooks cannot attach — the network/cgroup hooks still attach, so the
+// enforcer looks healthy while filesystem deny-list and exec enforcement are
+// silently inactive. This is the precondition that checkBPFSupport (which only
+// confirms /sys/fs/bpf is mounted) cannot detect, and that kernel-primary
+// (Docker Engine) deployments depend on.
+func checkBPFLSM() diagCheck {
+	if runtime.GOOS != "linux" {
+		return diagCheck{Name: "BPF LSM", Status: "WARN", Detail: "BPF LSM requires Linux"}
+	}
+	const lsmPath = "/sys/kernel/security/lsm"
+	data, err := os.ReadFile(lsmPath)
+	if err != nil {
+		return diagCheck{Name: "BPF LSM", Status: "FAIL", Detail: fmt.Sprintf("%s unreadable: %v", lsmPath, err)}
+	}
+	active := strings.TrimSpace(string(data))
+	if lsmListHasBPF(active) {
+		return diagCheck{Name: "BPF LSM", Status: "PASS", Detail: fmt.Sprintf("bpf active (lsm=%s)", active)}
+	}
+	return diagCheck{
+		Name:   "BPF LSM",
+		Status: "FAIL",
+		Detail: fmt.Sprintf("bpf not in lsm=%s — filesystem/exec enforcement inactive; "+
+			"rebuild with CONFIG_BPF_LSM=y and add 'bpf' to the lsm= cmdline (see bootstrap.sh), then reboot", active),
+	}
+}
+
+// lsmListHasBPF reports whether the comma-separated kernel LSM ordering (the
+// contents of /sys/kernel/security/lsm, e.g. "capability,landlock,lockdown,bpf")
+// includes the "bpf" LSM, which the enforcer's file_open/bprm_check hooks
+// require.
+func lsmListHasBPF(list string) bool {
+	for _, name := range strings.Split(list, ",") {
+		if strings.TrimSpace(name) == "bpf" {
+			return true
+		}
+	}
+	return false
 }
 
 func checkNestedContainer() diagCheck {

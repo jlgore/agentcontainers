@@ -16,3 +16,12 @@ func ResolveCgroupPath(containerID string) (string, error) {
 	// Docker Desktop's Linux VM uses cgroupfs driver by default.
 	return "/sys/fs/cgroup/docker/" + containerID, nil
 }
+
+// CheckKernelPrimaryHost is a no-op on non-Linux hosts: the kernel BPF LSM and
+// cgroup v2 hierarchy that kernel-primary containment depends on live inside the
+// Docker Desktop Linux VM, not on this host. The authoritative check there is
+// CheckLSMActive against the in-VM enforcer. Returning nil keeps the host-side
+// precheck from rejecting a valid Docker Desktop deployment.
+func CheckKernelPrimaryHost() error {
+	return nil
+}

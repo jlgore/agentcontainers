@@ -1360,8 +1360,16 @@ type StatsResponse struct {
 	ProcessBlocked    uint64                 `protobuf:"varint,6,opt,name=process_blocked,json=processBlocked,proto3" json:"process_blocked,omitempty"`
 	CredentialAllowed uint64                 `protobuf:"varint,7,opt,name=credential_allowed,json=credentialAllowed,proto3" json:"credential_allowed,omitempty"`
 	CredentialBlocked uint64                 `protobuf:"varint,8,opt,name=credential_blocked,json=credentialBlocked,proto3" json:"credential_blocked,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// lsm_active reports whether the kernel BPF LSM hooks (file_open,
+	// bprm_check) are attached. Network/cgroup hooks can attach on kernels
+	// without BPF LSM, so the enforcer can be SERVING while filesystem deny-list
+	// and exec enforcement are silently inactive. Clients running kernel-primary
+	// (Docker Engine, no sandboxd VM) refuse to start containers when this is
+	// false. lsm_detail carries the reason for the negative case.
+	LsmActive     bool   `protobuf:"varint,9,opt,name=lsm_active,json=lsmActive,proto3" json:"lsm_active,omitempty"`
+	LsmDetail     string `protobuf:"bytes,10,opt,name=lsm_detail,json=lsmDetail,proto3" json:"lsm_detail,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *StatsResponse) Reset() {
@@ -1448,6 +1456,20 @@ func (x *StatsResponse) GetCredentialBlocked() uint64 {
 		return x.CredentialBlocked
 	}
 	return 0
+}
+
+func (x *StatsResponse) GetLsmActive() bool {
+	if x != nil {
+		return x.LsmActive
+	}
+	return false
+}
+
+func (x *StatsResponse) GetLsmDetail() string {
+	if x != nil {
+		return x.LsmDetail
+	}
+	return ""
 }
 
 type ComponentPolicy struct {
@@ -2373,7 +2395,7 @@ const file_enforcer_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"4\n" +
 	"\x0fGetStatsRequest\x12!\n" +
-	"\fcontainer_id\x18\x01 \x01(\tR\vcontainerId\"\xef\x02\n" +
+	"\fcontainer_id\x18\x01 \x01(\tR\vcontainerId\"\xad\x03\n" +
 	"\rStatsResponse\x12'\n" +
 	"\x0fnetwork_allowed\x18\x01 \x01(\x04R\x0enetworkAllowed\x12'\n" +
 	"\x0fnetwork_blocked\x18\x02 \x01(\x04R\x0enetworkBlocked\x12-\n" +
@@ -2382,7 +2404,12 @@ const file_enforcer_proto_rawDesc = "" +
 	"\x0fprocess_allowed\x18\x05 \x01(\x04R\x0eprocessAllowed\x12'\n" +
 	"\x0fprocess_blocked\x18\x06 \x01(\x04R\x0eprocessBlocked\x12-\n" +
 	"\x12credential_allowed\x18\a \x01(\x04R\x11credentialAllowed\x12-\n" +
-	"\x12credential_blocked\x18\b \x01(\x04R\x11credentialBlocked\"\x9b\x01\n" +
+	"\x12credential_blocked\x18\b \x01(\x04R\x11credentialBlocked\x12\x1d\n" +
+	"\n" +
+	"lsm_active\x18\t \x01(\bR\tlsmActive\x12\x1d\n" +
+	"\n" +
+	"lsm_detail\x18\n" +
+	" \x01(\tR\tlsmDetail\"\x9b\x01\n" +
 	"\x0fComponentPolicy\x12#\n" +
 	"\rnetwork_hosts\x18\x01 \x03(\tR\fnetworkHosts\x12\"\n" +
 	"\rfs_read_paths\x18\x02 \x03(\tR\vfsReadPaths\x12$\n" +
