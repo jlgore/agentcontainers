@@ -13,8 +13,15 @@
 FROM python:3.12-slim
 LABEL org.opencontainers.image.source=https://github.com/jlgore/agentcontainers
 
+# sleuthkit provides the TSK CLI (fsstat/fls/mmls/img_stat) the forensic
+# backends shell out to; ewf-tools provides ewf* helpers. NOTE: this TSK build
+# segfaults reading .E01 directly via libewf, so the forensic-e2e example
+# presents evidence as a raw device with host-side ewfmount and TSK reads that
+# raw — see examples/forensic-e2e. Without sleuthkit here, run_command reports
+# "Binary 'fsstat' not found" and the investigation segment cannot run.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates \
+       sleuthkit ewf-tools \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir uv
 

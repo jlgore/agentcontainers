@@ -44,7 +44,13 @@
             // Case directory read-write (findings, timeline, extractions, audit)…
             "/cases/e2e-demo:/cases/e2e-demo",
             // …with the acquired evidence pinned read-only.
-            "/cases/e2e-demo/evidence:/cases/e2e-demo/evidence:ro"
+            "/cases/e2e-demo/evidence:/cases/e2e-demo/evidence:ro",
+            // The acquired image is EWF/E01, but this gateway's bundled
+            // sleuthkit (Debian TSK 4.12.1 + libewf2) SEGFAULTS on libewf
+            // reads. up.sh runs ewfmount on the HOST to decode the EWF and
+            // expose a raw device at <case>/.ewfraw/ewf1; bind it read-only so
+            // TSK analyzes it natively (no libewf in the container path).
+            "/cases/e2e-demo/.ewfraw:/cases/e2e-demo/evidence-raw:ro"
           ],
           "env": {
             "VHIR_CASE_DIR": "/cases/e2e-demo",

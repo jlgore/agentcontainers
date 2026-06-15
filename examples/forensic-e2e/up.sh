@@ -39,6 +39,34 @@ command -v agentcontainer >/dev/null 2>&1 || die "agentcontainer CLI not found �
 
 mkdir -p "$RUN_DIR"
 
+# Present EWF/E01 evidence as a raw device for the gateway. The gateway image's
+# bundled sleuthkit (Debian TSK 4.12.1 + libewf2) segfaults on any libewf read,
+# so the container cannot open the .E01 directly. ewfmount on the HOST decodes
+# the EWF and exposes a flat raw image at <case>/.ewfraw/ewf1; the gateway binds
+# that read-only (see agentcontainer.json) and TSK reads it natively. allow_root
+# lets the Docker daemon (root) traverse the FUSE mount when it sets up the bind.
+RAW_MNT="$CASE_DIR/.ewfraw"
+mkdir -p "$RAW_MNT"
+E01="$(ls "$CASE_DIR"/evidence/*.E01 2>/dev/null | head -1 || true)"
+if [ -n "$E01" ]; then
+  if mount | grep -q " on $RAW_MNT "; then
+    ok "evidence already presented raw at $RAW_MNT/ewf1 (ewfmount)"
+  else
+    command -v ewfmount >/dev/null 2>&1 || die "ewfmount not found — install ewf-tools/libewf-tools"
+    if ! grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null; then
+      warn "enabling user_allow_other in /etc/fuse.conf (one-time, needs sudo)"
+      echo user_allow_other | sudo tee -a /etc/fuse.conf >/dev/null
+    fi
+    if ewfmount -X allow_root "$E01" "$RAW_MNT" >/dev/null 2>&1; then
+      ok "ewfmount: $(basename "$E01") -> $RAW_MNT/ewf1 (raw, read-only)"
+    else
+      die "ewfmount failed for $E01 — check ewf-tools and /etc/fuse.conf"
+    fi
+  fi
+else
+  warn "no .E01 in $CASE_DIR/evidence — assuming raw/dd evidence (skipping ewfmount)"
+fi
+
 # The checked-in config references /cases/e2e-demo. If CASE_DIR differs, render a
 # copy with the case paths substituted so the run stays reproducible.
 CFG="$HERE/agentcontainer.json"
@@ -63,6 +91,25 @@ fi
 #    the container backend).
 log "Starting agent under enforcement"
 ( cd "$(dirname "$CFG")" && agentcontainer run -d 2>&1 | grep -avE 'lockfile not found' || true )
+
+# Ensure the proxy port is free. On the demo VM another container may already
+# publish :4510 (the default); rather than fail to bind, bump to the next free
+# port so a fresh judge run never collides. Override with PROXY_PORT=.
+port_busy() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnH 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"
+  else
+    (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && { exec 3>&- 3<&-; return 0; } || return 1
+  fi
+}
+if port_busy "$PROXY_PORT"; then
+  orig="$PROXY_PORT"
+  for cand in $(seq "$PROXY_PORT" $((PROXY_PORT + 20))); do
+    port_busy "$cand" || { PROXY_PORT="$cand"; break; }
+  done
+  [ "$PROXY_PORT" = "$orig" ] && die "no free port found near $orig (set PROXY_PORT)"
+  warn "port $orig is in use — using free port $PROXY_PORT instead"
+fi
 
 # 3. MCP proxy launches the gateway as an enforced container backend, mounts the
 #    case (evidence read-only), and fronts the SIFT tools through audit/approval.

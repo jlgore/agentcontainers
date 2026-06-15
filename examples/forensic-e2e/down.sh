@@ -22,5 +22,11 @@ orphans="$(docker ps -aq --filter 'name=ac-mcp-sift-' 2>/dev/null)"
 
 agentcontainer enforcer stop --force >/dev/null 2>&1 && echo "  stopped enforcer" || true
 
+# Release any ewfmount FUSE raw mount(s) established by up.sh (<case>/.ewfraw).
+# The mount source reports as /dev/fuse, so match on the .ewfraw mountpoint.
+for m in $(mount 2>/dev/null | awk '$3 ~ /\/\.ewfraw$/ {print $3}'); do
+  fusermount -u "$m" 2>/dev/null && echo "  released ewfmount $m" || true
+done
+
 rm -rf "$RUN_DIR"
 echo "Done."
