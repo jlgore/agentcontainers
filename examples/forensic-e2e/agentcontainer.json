@@ -49,10 +49,27 @@
           "transport": "http",
           "port": 4508,
           "path": "/mcp",
+          // Run the gateway as the examiner uid that owns the case skeleton on
+          // the host (sansforensics = 1000:1000). The proxy drops ALL Linux
+          // capabilities on backends, so a default-root process has no
+          // CAP_DAC_OVERRIDE and CANNOT write the case dir (owner/group 1000,
+          // mode 0775) — its findings/timeline/audit writes hit EACCES, which
+          // silently empties the case audit trail and breaks audit_id
+          // validation in record_finding. Running as 1000:1000 writes through
+          // normal owner permissions, keeps every created file examiner-owned
+          // to match the host skeleton, and needs no capability restored.
+          "user": "1000:1000",
           "mounts": [
-            // Case directory read-write (findings, timeline, extractions, audit)…
-            "/cases/e2e-demo:/cases/e2e-demo",
-            // …with the acquired evidence pinned read-only.
+            // Cases ROOT read-write so the policy-gated, audited case lifecycle
+            // (case_init / case_activate / findings / timeline) can create and
+            // manage cases under VHIR_CASES_DIR. Every write still flows through
+            // the proxy's OPA evaluation + approval + audit chain; acquired
+            // evidence stays immutable via the nested read-only mounts below.
+            // (For multi-case production, kernel-protect each case's evidence
+            // with an enforcer filesystem deny policy rather than relying only
+            // on these per-case ro mounts.)
+            "/cases:/cases",
+            // The acquired evidence for the active case pinned read-only.
             "/cases/e2e-demo/evidence:/cases/e2e-demo/evidence:ro",
             // The acquired image is EWF/E01, but this gateway's bundled
             // sleuthkit (Debian TSK 4.12.1 + libewf2) SEGFAULTS on libewf

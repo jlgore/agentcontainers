@@ -1363,6 +1363,21 @@ func TestValidate_MCPToolTypeMatrix(t *testing.T) {
 				`agent.tools.mcp["t"].port: port is only valid for container-type tools`,
 			},
 		},
+		// --- container user ---
+		{
+			name: "container user is valid",
+			tool: MCPToolConfig{Image: "x:1", User: "1000:1000"},
+		},
+		{
+			name:     "component with user is rejected",
+			tool:     MCPToolConfig{Type: "component", Image: "x:1", User: "1000:1000"},
+			wantErrs: []string{`agent.tools.mcp["t"].user: user is only valid for container-type tools`},
+		},
+		{
+			name:     "remote with user is rejected",
+			tool:     MCPToolConfig{Type: "remote", URL: "http://h:1/mcp", User: "1000:1000"},
+			wantErrs: []string{`agent.tools.mcp["t"].user: user is only valid for container-type tools`},
+		},
 		// --- container transport/port ---
 		{
 			name: "container http transport with port is valid",
@@ -1519,6 +1534,23 @@ func TestValidate_MCPToolTypeMatrix(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestMCPToolConfig_ResolveContainerUser(t *testing.T) {
+	// The user field must survive resolution onto the ContainerTool view —
+	// that view is what transport.go reads to set container.Config.User. A
+	// field that validates but never reaches the view is a silent no-op.
+	tool := MCPToolConfig{Image: "x:1", User: "1000:1000"}
+	resolved, errs := tool.Resolve("t")
+	if len(errs) != 0 {
+		t.Fatalf("Resolve() unexpected errors: %v", errs)
+	}
+	if resolved.Container == nil {
+		t.Fatalf("Resolve() did not produce a container view")
+	}
+	if got := resolved.Container.User; got != "1000:1000" {
+		t.Errorf("ContainerTool.User = %q, want %q", got, "1000:1000")
 	}
 }
 

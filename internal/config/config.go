@@ -255,6 +255,17 @@ type MCPToolConfig struct {
 	// Command overrides the container entrypoint. Container type only.
 	Command []string `json:"command,omitempty"`
 
+	// User sets the uid[:gid] (or name[:group]) the container process runs as,
+	// passed through to the container runtime's user setting. Container type
+	// only. When empty, the image's baked user is used (root if none).
+	//
+	// This matters under the proxy's hardening: backends run with all Linux
+	// capabilities dropped, so a default-root process has no CAP_DAC_OVERRIDE
+	// and is subject to ordinary DAC checks. To write a bind-mounted host
+	// directory, set User to a uid that owns (or shares a group with) that
+	// directory rather than relying on root's bypass.
+	User string `json:"user,omitempty"`
+
 	// Env sets environment variables. Container type only.
 	Env map[string]string `json:"env,omitempty"`
 
@@ -296,6 +307,7 @@ type ContainerTool struct {
 	Path         string
 	Command      []string
 	Env          map[string]string
+	User         string
 	Policy       *MCPServerPolicy
 }
 
@@ -921,6 +933,7 @@ func (t MCPToolConfig) resolveContainer(name string, field func(string) string) 
 		Path:         t.Path,
 		Command:      t.Command,
 		Env:          t.Env,
+		User:         t.User,
 		Policy:       t.Policy,
 	}
 	return ResolvedTool{Name: name, Kind: KindContainer, Container: view}, errs
@@ -949,6 +962,9 @@ func (t MCPToolConfig) resolveComponent(name string, field func(string) string) 
 	}
 	if len(t.Env) > 0 {
 		errs = append(errs, fmt.Errorf("%s: env is only valid for container-type tools", field("env")))
+	}
+	if t.User != "" {
+		errs = append(errs, fmt.Errorf("%s: user is only valid for container-type tools", field("user")))
 	}
 	if len(t.Mounts) > 0 {
 		errs = append(errs, fmt.Errorf("%s: mounts are not valid for component-type tools", field("mounts")))
@@ -995,6 +1011,9 @@ func (t MCPToolConfig) resolveRemote(name string, field func(string) string) (Re
 	}
 	if len(t.Env) > 0 {
 		errs = append(errs, fmt.Errorf("%s: env is only valid for container-type tools", field("env")))
+	}
+	if t.User != "" {
+		errs = append(errs, fmt.Errorf("%s: user is only valid for container-type tools", field("user")))
 	}
 	if len(t.Mounts) > 0 {
 		errs = append(errs, fmt.Errorf("%s: mounts are not valid for remote-type tools", field("mounts")))
