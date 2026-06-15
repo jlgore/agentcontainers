@@ -14,42 +14,34 @@ import (
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/enforcement"
 )
 
-// credsTar builds a tar stream mimicking `docker cp <container>:/creds`, with
-// the five PEM files the enforcer writes under a "creds/" prefix.
-func credsTar(t *testing.T) io.ReadCloser {
+// namesInTar returns the regular-file entry names in a tar stream.
+func namesInTar(t *testing.T, r io.Reader) []string {
 	t.Helper()
-	var buf bytes.Buffer
-	tw := tar.NewWriter(&buf)
-	files := map[string]string{
-		"creds/server.crt":        "server-cert",
-		"creds/server.key":        "server-key",
-		"creds/" + clientCAFile:   "ca-pem",
-		"creds/" + clientCertFile: "client-cert-pem",
-		"creds/" + clientKeyFile:  "client-key-pem",
-	}
-	for name, body := range files {
-		if err := tw.WriteHeader(&tar.Header{
-			Name:     name,
-			Mode:     0o600,
-			Size:     int64(len(body)),
-			Typeflag: tar.TypeReg,
-		}); err != nil {
-			t.Fatalf("tar header: %v", err)
+	var names []string
+	tr := tar.NewReader(r)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
 		}
-		if _, err := tw.Write([]byte(body)); err != nil {
-			t.Fatalf("tar write: %v", err)
+		if err != nil {
+			t.Fatalf("read tar: %v", err)
+		}
+		if hdr.Typeflag == tar.TypeReg {
+			names = append(names, hdr.Name)
 		}
 	}
-	if err := tw.Close(); err != nil {
-		t.Fatalf("tar close: %v", err)
-	}
-	return io.NopCloser(&buf)
+	return names
 }
 
 // TestStartSidecar_MTLS_LoopbackAndCreds asserts that a managed mTLS sidecar
-// publishes only on 127.0.0.1, runs with --creds-dir, and returns a connection
-// profile populated with the retrieved client credentials.
+// publishes only on 127.0.0.1, runs with host-provided --tls-* certs, has the
+// server material pushed into its creds dir, and returns a connection profile
+// pointing at the stable host client material.
 func TestStartSidecar_MTLS_LoopbackAndCreds(t *testing.T) {
+	// Redirect the stable creds dir to a throwaway location for the test.
+	t.Setenv(credsHostDirEnv, t.TempDir())
+
 	// The profile prober would otherwise make a real network call.
 	origProber := defaultProfileProber
 	defaultProfileProber = func(enforcement.ConnectionProfile) bool { return true }
@@ -57,6 +49,7 @@ func TestStartSidecar_MTLS_LoopbackAndCreds(t *testing.T) {
 
 	var gotCmd []string
 	var gotBindings map[string][]string // port -> []hostIP
+	var pushedNames []string
 
 	m := &mockDockerClient{
 		imageInspectFn: func(_ context.Context, _ string, _ ...client.ImageInspectOption) (client.ImageInspectResult, error) {
@@ -76,8 +69,9 @@ func TestStartSidecar_MTLS_LoopbackAndCreds(t *testing.T) {
 			}
 			return client.ContainerCreateResult{ID: "cid"}, nil
 		},
-		copyFromContainerFn: func(_ context.Context, _ string, _ client.CopyFromContainerOptions) (client.CopyFromContainerResult, error) {
-			return client.CopyFromContainerResult{Content: credsTar(t)}, nil
+		copyToContainerFn: func(_ context.Context, _ string, opts client.CopyToContainerOptions) (client.CopyToContainerResult, error) {
+			pushedNames = namesInTar(t, opts.Content)
+			return client.CopyToContainerResult{}, nil
 		},
 	}
 
@@ -93,7 +87,6 @@ func TestStartSidecar_MTLS_LoopbackAndCreds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartSidecar: %v", err)
 	}
-	t.Cleanup(func() { cleanupCreds(handle) })
 
 	// Loopback-only publication.
 	for port, ips := range gotBindings {
@@ -104,12 +97,40 @@ func TestStartSidecar_MTLS_LoopbackAndCreds(t *testing.T) {
 		}
 	}
 
-	// --creds-dir present in the command.
-	if !containsArg(gotCmd, "--creds-dir") {
-		t.Errorf("Cmd %v missing --creds-dir", gotCmd)
+	// Host-provided TLS flags present (and the old --creds-dir gone).
+	for _, want := range []string{"--tls-cert", "--tls-key", "--tls-ca"} {
+		if !containsArg(gotCmd, want) {
+			t.Errorf("Cmd %v missing %s", gotCmd, want)
+		}
+	}
+	if containsArg(gotCmd, "--creds-dir") {
+		t.Errorf("Cmd %v should not pass --creds-dir under host-gen creds", gotCmd)
 	}
 
-	// Profile carries retrieved mTLS material that exists on disk.
+	// Server material pushed into the container's creds dir.
+	wantPushed := map[string]bool{
+		"creds/" + serverCertFile: false,
+		"creds/" + serverKeyFile:  false,
+		"creds/" + clientCAFile:   false,
+	}
+	for _, n := range pushedNames {
+		if _, ok := wantPushed[n]; ok {
+			wantPushed[n] = true
+		}
+	}
+	for name, seen := range wantPushed {
+		if !seen {
+			t.Errorf("expected %s pushed into container, got %v", name, pushedNames)
+		}
+	}
+	// Client private key must never be pushed into the container.
+	for _, n := range pushedNames {
+		if n == "creds/"+clientKeyFile || n == "creds/"+clientCertFile {
+			t.Errorf("client material %s must not be pushed into the container", n)
+		}
+	}
+
+	// Profile carries the stable host client material, present on disk.
 	profile := handle.Profile()
 	if !profile.HasMTLS() {
 		t.Fatalf("handle profile is not mTLS: %+v", profile)
@@ -120,13 +141,63 @@ func TestStartSidecar_MTLS_LoopbackAndCreds(t *testing.T) {
 		}
 	}
 
-	// Stopping removes the creds dir.
+	// Stopping leaves the creds in place (they are reusable).
 	credsDir := handle.credsDir
 	if err := StopSidecar(context.Background(), m, handle); err != nil {
 		t.Fatalf("StopSidecar: %v", err)
 	}
+	if _, err := os.Stat(credsDir); err != nil {
+		t.Errorf("creds dir %s should persist after StopSidecar: %v", credsDir, err)
+	}
+
+	// Purge explicitly removes them.
+	if err := PurgeCreds(); err != nil {
+		t.Fatalf("PurgeCreds: %v", err)
+	}
 	if _, err := os.Stat(credsDir); !os.IsNotExist(err) {
-		t.Errorf("creds dir %s should be removed after StopSidecar", credsDir)
+		t.Errorf("creds dir %s should be removed after PurgeCreds", credsDir)
+	}
+}
+
+// TestEnsureHostCreds_ReuseAndRegenerate asserts that valid creds are reused
+// across calls and that removing material forces regeneration.
+func TestEnsureHostCreds_ReuseAndRegenerate(t *testing.T) {
+	t.Setenv(credsHostDirEnv, t.TempDir())
+
+	first, err := ensureHostCreds()
+	if err != nil {
+		t.Fatalf("ensureHostCreds (first): %v", err)
+	}
+	before, err := os.ReadFile(first.clientCert)
+	if err != nil {
+		t.Fatalf("read client cert: %v", err)
+	}
+
+	// Second call reuses the same material untouched.
+	if _, err := ensureHostCreds(); err != nil {
+		t.Fatalf("ensureHostCreds (reuse): %v", err)
+	}
+	after, err := os.ReadFile(first.clientCert)
+	if err != nil {
+		t.Fatalf("re-read client cert: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Error("valid creds should be reused, but client cert changed")
+	}
+
+	// Removing a file forces regeneration of the whole set.
+	if err := os.Remove(first.clientKey); err != nil {
+		t.Fatalf("remove client key: %v", err)
+	}
+	if _, err := ensureHostCreds(); err != nil {
+		t.Fatalf("ensureHostCreds (regen): %v", err)
+	}
+	regen, err := os.ReadFile(first.clientCert)
+	if err != nil {
+		t.Fatalf("read regenerated client cert: %v", err)
+	}
+	if bytes.Equal(before, regen) {
+		t.Error("missing material should force regeneration, but client cert was unchanged")
 	}
 }
 

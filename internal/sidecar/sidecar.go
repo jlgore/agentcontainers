@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/netip"
 	"os"
+	"path"
 	"strings"
 	"time"
 
@@ -233,11 +234,26 @@ func StartSidecar(ctx context.Context, dockerClient client.APIClient, opts Start
 
 	// Command: bind to all interfaces *inside* the container netns (host port
 	// publication is what restricts external reach — see PortBindings below).
-	// In mTLS mode, --creds-dir makes the enforcer generate ephemeral session
-	// credentials and require client certificates on every RPC.
+	// In mTLS mode the host generates the credentials and pushes the server
+	// material into credsContainerDir (see pushServerCreds); --tls-cert/--tls-key
+	// /--tls-ca make the enforcer consume them and require client certs on every
+	// RPC. The host keeps the matching client material at the stable path.
 	cmd := []string{"--listen", "0.0.0.0:" + portStr}
+	var creds credPaths
 	if opts.MTLS {
-		cmd = append(cmd, "--creds-dir", credsContainerDir)
+		var credErr error
+		creds, credErr = ensureHostCreds()
+		if credErr != nil {
+			if opts.Required {
+				return nil, fmt.Errorf("preparing enforcer credentials: %w", credErr)
+			}
+			return nil, nil
+		}
+		cmd = append(cmd,
+			"--tls-cert", path.Join(credsContainerDir, serverCertFile),
+			"--tls-key", path.Join(credsContainerDir, serverKeyFile),
+			"--tls-ca", path.Join(credsContainerDir, clientCAFile),
+		)
 	}
 
 	containerCfg := &container.Config{
@@ -318,22 +334,20 @@ func StartSidecar(ctx context.Context, dockerClient client.APIClient, opts Start
 		// Handle name conflict: a container named "agentcontainer-enforcer" already exists
 		// (e.g., from a previous crash or concurrent agentcontainer run). Try to adopt it.
 		if isNameConflict(err) {
-			// Retrieve the existing container's credentials so the adoption
-			// health probe authenticates exactly as a real client would. A
-			// plaintext probe of an mTLS enforcer would always fail and wrongly
-			// destroy a healthy sidecar.
-			adoptHandle := &SidecarHandle{Addr: addr, Managed: false, InsecureDev: opts.InsecureDev}
+			// Probe the existing container with the stable host client material
+			// so the adoption health probe authenticates exactly as a real client
+			// would. A plaintext probe of an mTLS enforcer would always fail and
+			// wrongly destroy a healthy sidecar. A pre-existing enforcer started
+			// with different creds simply fails the probe and is recreated below.
+			adoptHandle := &SidecarHandle{Addr: addr, Managed: false, InsecureDev: opts.InsecureDev, ServerName: opts.ServerName}
 			if opts.MTLS {
-				if credErr := retrieveCreds(ctx, dockerClient, ContainerName, adoptHandle); credErr != nil {
-					adoptHandle = nil // can't authenticate — treat as unhealthy
-				}
+				adoptHandle.CACertPath = creds.clientCA
+				adoptHandle.ClientCertPath = creds.clientCert
+				adoptHandle.ClientKeyPath = creds.clientKey
 			}
-			if adoptHandle != nil && defaultProfileProber(adoptHandle.Profile()) {
+			if defaultProfileProber(adoptHandle.Profile()) {
 				// Existing container is healthy — adopt it as unmanaged.
 				return adoptHandle, nil
-			}
-			if adoptHandle != nil {
-				cleanupCreds(adoptHandle)
 			}
 			// Existing container is unhealthy — remove it and retry once.
 			_ = removeByName(ctx, dockerClient, ContainerName)
@@ -357,7 +371,21 @@ func StartSidecar(ctx context.Context, dockerClient client.APIClient, opts Start
 		}
 	}
 
-	// 3. Start the container.
+	// 3. Push the server mTLS material into the created (not yet running)
+	// container so the enforcer finds it at its --tls-* paths on startup. Done
+	// over the Docker API (not a bind mount) so it works identically for the
+	// per-VM sandbox socket, where no host directory is shared.
+	if opts.MTLS {
+		if err := pushServerCreds(ctx, dockerClient, resp.ID, creds); err != nil {
+			cleanupContainer(ctx, dockerClient, resp.ID)
+			if opts.Required {
+				return nil, fmt.Errorf("pushing enforcer credentials: %w", err)
+			}
+			return nil, nil
+		}
+	}
+
+	// 4. Start the container.
 	if _, err := dockerClient.ContainerStart(ctx, resp.ID, client.ContainerStartOptions{}); err != nil {
 		// Best-effort cleanup on start failure.
 		_, _ = dockerClient.ContainerRemove(ctx, resp.ID, client.ContainerRemoveOptions{Force: true})
@@ -374,27 +402,20 @@ func StartSidecar(ctx context.Context, dockerClient client.APIClient, opts Start
 		InsecureDev: opts.InsecureDev,
 		ServerName:  opts.ServerName,
 	}
-
-	// 4. Retrieve ephemeral mTLS credentials before the health gate. The
-	// enforcer writes them to --creds-dir at startup, before binding the gRPC
-	// server; because the server requires mTLS, the health probe must present
-	// these client credentials. Failure here is fatal: an mTLS sidecar we can't
-	// authenticate to is unusable.
 	if opts.MTLS {
-		if err := retrieveCredsWithRetry(ctx, dockerClient, resp.ID, handle, opts.HealthTimeout, opts.HealthInterval); err != nil {
-			cleanupContainer(ctx, dockerClient, resp.ID)
-			if opts.Required {
-				return nil, fmt.Errorf("retrieving enforcer credentials: %w", err)
-			}
-			return nil, nil
-		}
+		// The client material stays at the stable host path; clients (this
+		// process, a later `ac run`, `mcp start`) read it from there.
+		handle.credsDir = creds.dir
+		handle.CACertPath = creds.clientCA
+		handle.ClientCertPath = creds.clientCert
+		handle.ClientKeyPath = creds.clientKey
 	}
 
 	// 5. Wait for health check, presenting the same credentials a real client uses.
 	if err := WaitHealthyProfile(ctx, handle.Profile(), opts.HealthTimeout, opts.HealthInterval); err != nil {
-		// Health check failed — clean up the container and credentials.
+		// Health check failed — remove the container. The host credentials are
+		// reusable and persist (rotate explicitly with `enforcer stop --purge`).
 		cleanupContainer(ctx, dockerClient, resp.ID)
-		cleanupCreds(handle)
 		if opts.Required {
 			return nil, fmt.Errorf("enforcer failed to reach SERVING: %w", err)
 		}
@@ -427,8 +448,8 @@ func StopSidecar(ctx context.Context, dockerClient client.APIClient, handle *Sid
 		return fmt.Errorf("removing sidecar: %w", err)
 	}
 
-	// Remove the retrieved ephemeral credentials from the host.
-	cleanupCreds(handle)
+	// The host credentials are deliberately left in place: they are reusable
+	// across restarts. Rotate them explicitly with `enforcer stop --purge`.
 
 	return nil
 }
