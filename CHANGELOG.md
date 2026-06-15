@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7](https://github.com/jlgore/agentcontainers/compare/v0.1.6...v0.1.7) (2026-06-15)
+
+
+### Bug Fixes
+
+* **enforcer:** aggregate get_stats for empty container_id ([#9](https://github.com/jlgore/agentcontainers/issues/9)) ([55629e1](https://github.com/jlgore/agentcontainers/commit/55629e1f2a8521f9b65cb5d8ba8661797acba07b))
+
 ## [0.1.6](https://github.com/jlgore/agentcontainers/compare/v0.1.5...v0.1.6) (2026-06-15)
 
 
