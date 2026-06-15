@@ -15,7 +15,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
-IMAGE="${IMAGE:-sift-gateway:demo}"
+IMAGE="${IMAGE:-ghcr.io/jlgore/sift-gateway:demo}"
 PROXY_PORT="${PROXY_PORT:-4510}"
 RUN_DIR="$HERE/.run"
 
@@ -31,13 +31,15 @@ command -v agentcontainer >/dev/null 2>&1 || die "agentcontainer CLI not found �
 
 mkdir -p "$RUN_DIR"
 
-# 1. Gateway image.
+# 1. Gateway image — pull the vendored image (a judge pulls, doesn't build).
 log "Gateway image: $IMAGE"
 if docker image inspect "$IMAGE" >/dev/null 2>&1; then
   ok "present"
+elif docker pull "$IMAGE" >/dev/null 2>&1; then
+  ok "pulled"
 else
-  warn "not found — building (clones upstream; a few minutes)"
-  "$HERE/build.sh"
+  warn "pull failed — building locally (clones upstream; a few minutes)"
+  IMAGE="$IMAGE" "$HERE/build.sh"
 fi
 
 # 2. Agent under enforcement (enforcer auto-starts — the proxy needs it for the

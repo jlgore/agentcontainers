@@ -1,0 +1,93 @@
+name: Demo images
+
+# Vendors the demo images a judge pulls (no local builds): the SIFT gateway and
+# the claude-agent image. Published to ghcr.io/<owner>/{sift-gateway,claude-agent}.
+#
+# Runs on demand (workflow_dispatch) and when the relevant sources change. The
+# claude-agent image embeds the agentcontainer CLI, so it also rebuilds when the
+# CLI source changes.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'examples/sift-platform/**'
+      - 'examples/claude-agent/**'
+      - 'cmd/**'
+      - 'internal/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/demo-images.yml'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  sift-gateway:
+    name: Build & push sift-gateway
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      SIFT_REF: main
+      VHIR_REF: main
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Clone upstream SIFT and stage build context
+        run: |
+          set -eux
+          git clone --depth 1 --branch "$SIFT_REF" \
+            https://github.com/AppliedIR/sift-mcp.git /tmp/sift-mcp
+          cp examples/sift-platform/Dockerfile \
+             examples/sift-platform/gateway.docker.yaml \
+             examples/sift-platform/entrypoint.sh \
+             /tmp/sift-mcp/
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: /tmp/sift-mcp
+          file: /tmp/sift-mcp/Dockerfile
+          build-args: VHIR_REF=${{ env.VHIR_REF }}
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/sift-gateway:latest
+            ghcr.io/${{ github.repository_owner }}/sift-gateway:demo
+            ghcr.io/${{ github.repository_owner }}/sift-gateway:e2e
+
+  claude-agent:
+    name: Build & push claude-agent
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Context is the repo root: stage 1 of the Dockerfile compiles the
+      # agentcontainer CLI (for the in-container guard hook) from this source.
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: examples/claude-agent/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/claude-agent:latest
+            ghcr.io/${{ github.repository_owner }}/claude-agent:demo
+            ghcr.io/${{ github.repository_owner }}/claude-agent:e2e

@@ -9,7 +9,8 @@
   // MCP endpoint to the agent. The gateway itself aggregates forensic-mcp,
   // sift-mcp, case-mcp, report-mcp.
   //
-  // Build the image first:  ./build.sh   (produces sift-gateway:demo)
+  // The gateway image is vendored at ghcr.io/jlgore/sift-gateway:demo and is
+  // pulled automatically. To rebuild it locally instead, run ./build.sh.
   "name": "sift-agent",
   "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
 
@@ -45,7 +46,7 @@
         // (Docker Desktop).
         "sift": {
           "type": "container",
-          "image": "sift-gateway:demo",
+          "image": "ghcr.io/jlgore/sift-gateway:demo",
           "transport": "http",
           "port": 4508,
           "path": "/mcp"

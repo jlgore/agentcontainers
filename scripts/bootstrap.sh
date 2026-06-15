@@ -25,10 +25,14 @@
 #   --with-sift-demo       After the host is ready, bring up the SIFT platform
 #                          demo (examples/sift-platform/up.sh). Skipped while a
 #                          reboot is pending; run again after rebooting.
+#   --from-source          Build the CLI from this checkout (installs Go) instead
+#                          of pulling the published release binary (the default).
 #   -h, --help             Show this help.
 #
 # Environment:
 #   ENFORCER_IMAGE   Same as --enforcer-image.
+#   REPO_SLUG        GitHub owner/repo to pull the CLI release from
+#                    (default: jlgore/agentcontainers).
 #   GHCR_TOKEN       If set, `docker login ghcr.io` is performed before pulling
 #                    (needed while the fork's package is private). Pairs with
 #                    GHCR_USER (default: derived from the image owner).
@@ -51,6 +55,8 @@ SKIP_ENFORCER_IMAGE=0
 SKIP_SIGNING_TOOLS=0
 SKIP_SMOKE=0
 WITH_SIFT_DEMO=0
+FROM_SOURCE=0
+REPO_SLUG="${REPO_SLUG:-jlgore/agentcontainers}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REBOOT_REQUIRED=0
@@ -84,6 +90,7 @@ while [ $# -gt 0 ]; do
     --skip-signing-tools) SKIP_SIGNING_TOOLS=1; shift ;;
     --skip-smoke) SKIP_SMOKE=1; shift ;;
     --with-sift-demo) WITH_SIFT_DEMO=1; shift ;;
+    --from-source) FROM_SOURCE=1; shift ;;
     -h|--help) usage ;;
     *) die "unknown option: $1 (try --help)" ;;
   esac
@@ -184,38 +191,54 @@ fi
 # ---------------------------------------------------------------------------
 # Phase 3 — Go toolchain + agentcontainer CLI
 # ---------------------------------------------------------------------------
-step "Go toolchain"
-# Pin to whatever go.mod requires so the toolchain never drifts from the source.
-GO_VERSION="$(awk '/^go [0-9]/{print $2; exit}' "$REPO_ROOT/go.mod")"
-[ -n "$GO_VERSION" ] || die "could not read Go version from $REPO_ROOT/go.mod"
-info "go.mod requires Go $GO_VERSION"
-
-go_ok() {
-  command -v /usr/local/go/bin/go >/dev/null 2>&1 || return 1
-  local have; have="$(/usr/local/go/bin/go env GOVERSION 2>/dev/null | sed 's/^go//')"
-  [ -n "$have" ] || return 1
-  # ok if installed >= required
-  [ "$(printf '%s\n%s\n' "$GO_VERSION" "$have" | sort -V | head -1)" = "$GO_VERSION" ]
+# agentcontainer CLI — pull the published release binary by default (a judge
+# pulls our vendored artifacts; no Go toolchain needed). --from-source builds
+# from the checked-out tree instead, for development.
+# ---------------------------------------------------------------------------
+build_cli_from_source() {
+  step "Build agentcontainer CLI (from source)"
+  local go_version
+  go_version="$(awk '/^go [0-9]/{print $2; exit}' "$REPO_ROOT/go.mod")"
+  [ -n "$go_version" ] || die "could not read Go version from $REPO_ROOT/go.mod"
+  if ! { command -v /usr/local/go/bin/go >/dev/null 2>&1 \
+      && [ "$(printf '%s\n%s\n' "$go_version" "$(/usr/local/go/bin/go env GOVERSION 2>/dev/null | sed 's/^go//')" | sort -V | head -1)" = "$go_version" ]; }; then
+    info "installing Go $go_version to /usr/local/go"
+    curl -fsSL "https://go.dev/dl/go${go_version}.linux-${ARCH}.tar.gz" -o /tmp/go.tgz
+    rm -rf /usr/local/go && tar -C /usr/local -xzf /tmp/go.tgz
+    echo 'export PATH=$PATH:/usr/local/go/bin' > /etc/profile.d/go.sh && chmod 644 /etc/profile.d/go.sh
+  fi
+  export PATH="$PATH:/usr/local/go/bin"
+  info "building from $REPO_ROOT (CGO disabled, static)"
+  ( cd "$REPO_ROOT" && CGO_ENABLED=0 /usr/local/go/bin/go build -trimpath \
+      -o /usr/local/bin/agentcontainer ./cmd/agentcontainer )
+  chmod 755 /usr/local/bin/agentcontainer
 }
 
-if go_ok; then
-  ok "Go present: $(/usr/local/go/bin/go env GOVERSION)"
-else
-  info "installing Go $GO_VERSION to /usr/local/go"
-  curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${ARCH}.tar.gz" -o /tmp/go.tgz
-  rm -rf /usr/local/go
-  tar -C /usr/local -xzf /tmp/go.tgz
-  echo 'export PATH=$PATH:/usr/local/go/bin' > /etc/profile.d/go.sh
-  chmod 644 /etc/profile.d/go.sh
-  ok "installed $(/usr/local/go/bin/go env GOVERSION)"
-fi
-export PATH="$PATH:/usr/local/go/bin"
+install_cli_from_release() {
+  step "Install agentcontainer CLI (released binary)"
+  local asset="agentcontainers_Linux_${CRANE_ARCH}.tar.gz"
+  # Latest CLI release = newest plain vX.Y.Z tag (the "ac" component; the
+  # enforcer uses ac-enforcer-* tags and ships as an image).
+  local tag
+  tag="$(curl -fsSL "https://api.github.com/repos/$REPO_SLUG/releases" \
+      | jq -r '[.[] | select(.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))][0].tag_name')"
+  [ -n "$tag" ] && [ "$tag" != "null" ] || die "no published CLI release found for $REPO_SLUG (use --from-source)"
+  info "pulling CLI $tag ($asset) from GitHub Releases"
+  local base="https://github.com/$REPO_SLUG/releases/download/$tag"
+  curl -fsSL -o /tmp/ac.tgz  "$base/$asset"        || die "download failed: $base/$asset"
+  curl -fsSL -o /tmp/ac.sums "$base/checksums.txt" || die "download failed: $base/checksums.txt"
+  ( cd /tmp && grep " $asset\$" ac.sums | sha256sum -c - ) >/dev/null 2>&1 \
+      || die "CLI checksum verification failed for $asset"
+  tar -C /tmp -xzf /tmp/ac.tgz agentcontainer
+  install -m 0755 /tmp/agentcontainer /usr/local/bin/agentcontainer
+  rm -f /tmp/ac.tgz /tmp/ac.sums /tmp/agentcontainer
+}
 
-step "Build agentcontainer CLI"
-info "building from $REPO_ROOT (CGO disabled, static)"
-( cd "$REPO_ROOT" && CGO_ENABLED=0 /usr/local/go/bin/go build -trimpath \
-    -o /usr/local/bin/agentcontainer ./cmd/agentcontainer )
-chmod 755 /usr/local/bin/agentcontainer
+if [ "$FROM_SOURCE" = 1 ]; then
+  build_cli_from_source
+else
+  install_cli_from_release
+fi
 ok "installed: $(/usr/local/bin/agentcontainer version 2>/dev/null | head -1 || echo /usr/local/bin/agentcontainer)"
 
 # ---------------------------------------------------------------------------

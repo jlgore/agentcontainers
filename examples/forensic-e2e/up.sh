@@ -21,7 +21,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
-IMAGE="${IMAGE:-sift-gateway:e2e}"
+IMAGE="${IMAGE:-ghcr.io/jlgore/sift-gateway:e2e}"
 PROXY_PORT="${PROXY_PORT:-4510}"
 CASE_DIR="${CASE_DIR:-/cases/e2e-demo}"
 RUN_DIR="$HERE/.run"
@@ -49,10 +49,15 @@ if [ "$CASE_DIR" != "/cases/e2e-demo" ]; then
     "$HERE/agentcontainer.json" > "$CFG"
 fi
 
-# 1. Gateway image.
+# 1. Gateway image — pull the vendored image (a judge pulls, doesn't build).
 log "Gateway image: $IMAGE"
-docker image inspect "$IMAGE" >/dev/null 2>&1 && ok "present" \
-  || die "image $IMAGE not found — build the sift gateway first (see examples/sift-platform/build.sh)"
+if docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  ok "present"
+elif docker pull "$IMAGE" >/dev/null 2>&1; then
+  ok "pulled"
+else
+  die "image $IMAGE not present and pull failed — build via examples/sift-platform/build.sh"
+fi
 
 # 2. Agent under enforcement (the enforcer auto-starts; the proxy needs it for
 #    the container backend).

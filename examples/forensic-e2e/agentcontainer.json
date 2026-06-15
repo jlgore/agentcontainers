@@ -36,7 +36,7 @@
       "mcp": {
         "sift": {
           "type": "container",
-          "image": "sift-gateway:e2e",
+          "image": "ghcr.io/jlgore/sift-gateway:e2e",
           "transport": "http",
           "port": 4508,
           "path": "/mcp",
