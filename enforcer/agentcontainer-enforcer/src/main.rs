@@ -165,8 +165,10 @@ struct Args {
     ///   client.key — client private key for `ac` to present (PEM)
     ///
     /// When set, the enforcer ignores --tls-cert/--tls-key/--tls-ca and uses
-    /// generated ephemeral certs instead.  This is the recommended mode for
-    /// production; --tls-* flags are provided for testing and CI.
+    /// generated ephemeral certs instead. This is a self-contained mode for
+    /// local/Unix-socket use and tests. In production the `ac` CLI instead
+    /// generates the credentials host-side, pushes the server material into the
+    /// container, and passes --tls-cert/--tls-key/--tls-ca (see those flags).
     #[arg(long, env = "AC_ENFORCER_CREDS_DIR")]
     creds_dir: Option<String>,
 }
@@ -238,9 +240,9 @@ async fn main() -> anyhow::Result<()> {
 
     // --- TLS configuration ---
     // When --creds-dir is set, generate ephemeral session certs and use them for
-    // mTLS.  This is the recommended production mode.  --tls-cert/--tls-key/--tls-ca
-    // are provided as an escape hatch for testing and CI environments that supply
-    // their own certificates.
+    // mTLS — a self-contained mode for local/Unix-socket use and tests. In
+    // production the `ac` CLI supplies host-generated certs and passes
+    // --tls-cert/--tls-key/--tls-ca, which the next branch consumes.
     let tls_config: Option<tonic::transport::ServerTlsConfig> = if let Some(ref creds_dir) =
         args.creds_dir
     {
