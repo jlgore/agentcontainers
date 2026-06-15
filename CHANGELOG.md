@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.8](https://github.com/jlgore/agentcontainers/compare/v0.1.7...v0.1.8) (2026-06-15)
+
+
+### Bug Fixes
+
+* **enforcer:** make exec-allowlist enforcement opt-in per cgroup ([#11](https://github.com/jlgore/agentcontainers/issues/11)) ([be49f53](https://github.com/jlgore/agentcontainers/commit/be49f533a5e44dc2db8a3a06476cc5157b1f6d7a))
+
 ## [0.1.7](https://github.com/jlgore/agentcontainers/compare/v0.1.6...v0.1.7) (2026-06-15)
 
 
