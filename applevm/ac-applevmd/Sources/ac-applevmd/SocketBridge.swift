@@ -31,12 +31,12 @@ final class SocketBridge: @unchecked Sendable {
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
-        hostSocketPath.withCString { ptr in
-            withUnsafeMutablePointer(to: &addr.sun_path) {
-                $0.withMemoryRebound(to: CChar.self, capacity: MemoryLayout.size(ofValue: addr.sun_path)) { dst in
-                    strncpy(dst, ptr, MemoryLayout.size(ofValue: addr.sun_path) - 1)
-                }
-            }
+        let pathBytes = Array(hostSocketPath.utf8)
+        withUnsafeMutableBytes(of: &addr.sun_path) { raw in
+            let dst = raw.bindMemory(to: CChar.self)
+            let n = min(pathBytes.count, dst.count - 1)
+            for i in 0..<n { dst[i] = CChar(bitPattern: pathBytes[i]) }
+            dst[n] = 0
         }
         let len = socklen_t(MemoryLayout<sockaddr_un>.size)
         let bound = withUnsafePointer(to: &addr) {

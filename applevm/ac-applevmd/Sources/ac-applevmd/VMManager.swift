@@ -12,9 +12,10 @@ import Containerization
 // and bridge via LinuxContainer.dialVsock(port:) — see README; left as a
 // follow-up.)
 //
-// NOTE: This is the initial spike. Lines marked `// VERIFY:` use containerization
-// API surface that must be checked against the installed library version on a
-// Mac (the exact initializer/method names have moved between releases).
+// The boot sequence mirrors the canonical example in the containerization
+// package's `cctl` RunCommand: Kernel + VmnetNetwork -> ContainerManager ->
+// manager.create(reference:) which pulls the image and builds the rootfs ->
+// container.create()/start(). dockerd is the container's PID 1 process.
 actor VMManager {
     struct VMRecord {
         let id: String
@@ -30,13 +31,16 @@ actor VMManager {
     }
 
     private var vms: [String: VMRecord] = [:]  // keyed by vm_name
+    private var managers: [String: ContainerManager] = [:]  // keyed by vm_name (for delete)
     private let kernelPath: String
     private let dindImage: String
+    private let rootfsSizeMiB: UInt64
     private let stateDir: URL
 
-    init(kernelPath: String, dindImage: String, stateDir: URL) {
+    init(kernelPath: String, dindImage: String, rootfsSizeMiB: UInt64 = 8192, stateDir: URL) {
         self.kernelPath = kernelPath
         self.dindImage = dindImage
+        self.rootfsSizeMiB = rootfsSizeMiB
         self.stateDir = stateDir
     }
 
@@ -50,51 +54,49 @@ actor VMManager {
             throw DaemonError.conflict("VM \(name) already exists")
         }
 
-        // VERIFY: Kernel + ContainerManager construction. Per the containerization
-        // docs/cctl, the high-level path is roughly:
-        //   let kernel = Kernel(path: URL(fileURLWithPath: kernelPath), platform: .linuxArm)
-        //   let manager = try await ContainerManager(kernel: kernel,
-        //                       initfsReference: "vminit:latest", network: ..., rosetta: false)
-        //   let container = try await manager.create(name, reference: dindImage,
-        //                       rootfsSizeInBytes: ..., networking: true) { config in
-        //       config.process.arguments = ["/usr/local/bin/dockerd",
-        //                                    "-H", "tcp://0.0.0.0:2375",
-        //                                    "-H", "unix:///var/run/docker.sock"]
-        //       config.process.workingDirectory = "/"
-        //   }
-        //   try await container.create()
-        //   try await container.start()
-        let kernel = Kernel(path: URL(fileURLWithPath: kernelPath), platform: .linuxArm)  // VERIFY
-        let manager = try await ContainerManager(                                          // VERIFY
+        let kernel = Kernel(path: URL(fileURLWithPath: kernelPath), platform: .linuxArm)
+        let network: Network = try VmnetNetwork()
+        var manager = try await ContainerManager(
             kernel: kernel,
             initfsReference: "vminit:latest",
+            network: network,
             rosetta: false
         )
-        let container = try await manager.create(                                          // VERIFY
+
+        let container = try await manager.create(
             name,
-            reference: workloadImage(for: req),
+            reference: dindImage,
+            rootfsSizeInBytes: rootfsSizeMiB * 1024 * 1024,
+            readOnly: false,
             networking: true
         ) { config in
+            // dockerd as PID 1. Use the dind image's entrypoint so it performs
+            // the usual cgroup/iptables setup, then expose the API over TCP (for
+            // the host bridge) and the conventional unix socket (in-VM use).
             config.process.arguments = [
-                "/usr/local/bin/dockerd",
+                "dockerd-entrypoint.sh",
+                "dockerd",
                 "-H", "tcp://0.0.0.0:2375",
                 "-H", "unix:///var/run/docker.sock",
             ]
             config.process.workingDirectory = "/"
+            config.process.capabilities = .allCapabilities
         }
-        try await container.create()  // VERIFY
-        try await container.start()   // VERIFY
 
-        // VERIFY: how to read the VM's vmnet IP. Per docs LinuxContainer carries
-        // `interfaces: [any Interface]`; resolve the IPv4 address from there.
-        let ips = try await resolveIPAddresses(container)
+        try await container.create()
+        try await container.start()
+
+        managers[name] = manager
+
+        let ips = container.interfaces.map { $0.ipv4Address.address.description }
         guard let vmIP = ips.first else {
             try? await container.stop()
+            managers.removeValue(forKey: name)
             throw DaemonError.internalError("VM \(name) came up with no IP address")
         }
 
         // Wait for dockerd to accept connections before handing the socket back.
-        try await waitForDockerd(host: vmIP, port: 2375, timeout: 30)
+        try await waitForDockerd(host: vmIP, port: 2375, timeout: 60)
 
         // Stand up the host unix socket -> <vmIP>:2375 proxy.
         let sockPath = stateDir.appendingPathComponent("\(name)/docker.sock").path
@@ -169,7 +171,7 @@ actor VMManager {
 
     func stop(_ name: String) async throws {
         guard var r = vms[name] else { throw DaemonError.notFound("VM \(name) not found") }
-        try? await r.container.stop()  // VERIFY
+        try? await r.container.stop()
         r.status = "stopped"
         vms[name] = r
     }
@@ -177,7 +179,11 @@ actor VMManager {
     func delete(_ name: String) async throws {
         guard let r = vms[name] else { throw DaemonError.notFound("VM \(name) not found") }
         r.bridge.stop()
-        try? await r.container.stop()  // VERIFY
+        try? await r.container.stop()
+        if var manager = managers[name] {
+            try? manager.delete(name)
+            managers.removeValue(forKey: name)
+        }
         try? FileManager.default.removeItem(atPath: r.hostSocketPath)
         vms.removeValue(forKey: name)
     }
@@ -200,23 +206,6 @@ actor VMManager {
     }
 
     // MARK: - Helpers
-
-    private func workloadImage(for req: VMCreateRequest) -> String {
-        // The Go side passes cfg.Image as the workload; if it omitted one it
-        // defaults to docker:dind. We don't see cfg.Image here (the Go runtime
-        // creates the agent container itself via the bridged Docker socket), so
-        // the VM workload is always the dind image.
-        _ = req
-        return dindImage
-    }
-
-    private func resolveIPAddresses(_ container: LinuxContainer) async throws -> [String] {
-        // VERIFY: pull IPv4 addresses off container.interfaces. Shape depends on
-        // the Interface protocol in the installed version.
-        // Example sketch:
-        //   container.interfaces.compactMap { $0.address?.ipv4String }
-        return []  // VERIFY: implement against real API
-    }
 
     private func waitForDockerd(host: String, port: Int, timeout: TimeInterval) async throws {
         let deadline = Date().addingTimeInterval(timeout)

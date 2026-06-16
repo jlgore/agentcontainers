@@ -18,36 +18,38 @@ struct Router {
         let path = String(uri.split(separator: "?", maxSplits: 1).first ?? "")
         let parts = path.split(separator: "/").map(String.init)
 
+        // Swift patterns can't bind inside array literals, so match on
+        // (method, segment count) with `where` guards and index into `parts`.
         do {
-            switch (method, parts) {
-            case (.GET, ["health"]):
+            switch (method, parts.count) {
+            case (.GET, 1) where parts[0] == "health":
                 let h = HealthResponse(status: "healthy", version: version, vms: await manager.count)
                 return ok(h)
 
-            case (.POST, ["vm"]):
+            case (.POST, 1) where parts[0] == "vm":
                 let req = try decode(VMCreateRequest.self, body)
                 let resp = try await manager.createVM(req)
                 return ok(resp)
 
-            case (.GET, ["vm"]):
+            case (.GET, 1) where parts[0] == "vm":
                 return ok(await manager.list())
 
-            case (.GET, ["vm", let name]):
-                return ok(try await manager.inspect(name))
+            case (.GET, 2) where parts[0] == "vm":
+                return ok(try await manager.inspect(parts[1]))
 
-            case (.POST, ["vm", let name, "stop"]):
-                try await manager.stop(name)
+            case (.POST, 3) where parts[0] == "vm" && parts[2] == "stop":
+                try await manager.stop(parts[1])
                 return ok(MessageResponse(message: "VM stopped"))
 
-            case (.DELETE, ["vm", let name]):
-                try await manager.delete(name)
+            case (.DELETE, 2) where parts[0] == "vm":
+                try await manager.delete(parts[1])
                 return Result(status: .noContent, body: Data())
 
-            case (.POST, ["vm", let name, "keepalive"]):
-                try await manager.keepalive(name)
+            case (.POST, 3) where parts[0] == "vm" && parts[2] == "keepalive":
+                try await manager.keepalive(parts[1])
                 return ok(MessageResponse(message: "keepalive received"))
 
-            case (.POST, ["network", "proxyconfig"]):
+            case (.POST, 2) where parts[0] == "network" && parts[1] == "proxyconfig":
                 let req = try decode(ProxyConfigRequest.self, body)
                 try await manager.updateProxyConfig(req)
                 return ok(MessageResponse(message: "proxy config accepted"))
