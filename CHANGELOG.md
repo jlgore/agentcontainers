@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.12](https://github.com/jlgore/agentcontainers/compare/v0.1.11...v0.1.12) (2026-06-16)
+
+
+### Bug Fixes
+
+* **release-please:** auto-tag the CLI + fix audit_id provenance ([#20](https://github.com/jlgore/agentcontainers/issues/20)) ([46cce01](https://github.com/jlgore/agentcontainers/commit/46cce01d2f19d595f8eb14df5601a4a132ae532c))
+
 ## [0.1.11](https://github.com/jlgore/agentcontainers/compare/v0.1.10...v0.1.11) (2026-06-16)
 
 
