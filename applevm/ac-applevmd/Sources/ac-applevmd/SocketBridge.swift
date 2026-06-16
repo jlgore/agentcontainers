@@ -25,18 +25,26 @@ final class SocketBridge: @unchecked Sendable {
     }
 
     func start() throws {
+        var addr = sockaddr_un()
+        let capacity = MemoryLayout.size(ofValue: addr.sun_path) // sun_path bytes (incl. NUL)
+        let pathBytes = Array(hostSocketPath.utf8)
+        // Fail loudly rather than binding a silently truncated path — a truncated
+        // socket would bind somewhere unexpected and the Go client could never
+        // dial the path we returned to it.
+        guard pathBytes.count < capacity else {
+            throw DaemonError.internalError(
+                "socket path too long (\(pathBytes.count) bytes, max \(capacity - 1)): \(hostSocketPath)")
+        }
+
         unlink(hostSocketPath)
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw DaemonError.internalError("socket(AF_UNIX) failed") }
 
-        var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
-        let pathBytes = Array(hostSocketPath.utf8)
         withUnsafeMutableBytes(of: &addr.sun_path) { raw in
             let dst = raw.bindMemory(to: CChar.self)
-            let n = min(pathBytes.count, dst.count - 1)
-            for i in 0..<n { dst[i] = CChar(bitPattern: pathBytes[i]) }
-            dst[n] = 0
+            for i in 0..<pathBytes.count { dst[i] = CChar(bitPattern: pathBytes[i]) }
+            dst[pathBytes.count] = 0
         }
         let len = socklen_t(MemoryLayout<sockaddr_un>.size)
         let bound = withUnsafePointer(to: &addr) {

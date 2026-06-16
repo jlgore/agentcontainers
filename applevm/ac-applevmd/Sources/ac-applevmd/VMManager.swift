@@ -104,40 +104,50 @@ actor VMManager {
 
         try await container.create()
         try await container.start()
-
         managers[name] = manager
 
-        let ips = container.interfaces.map { $0.ipv4Address.address.description }
-        guard let vmIP = ips.first else {
+        // The VM is now running but not yet tracked. Any failure between here
+        // and committing the record must tear the VM down, or we orphan a
+        // running microVM and leak manager state. (On a SocketBridge.start()
+        // failure the bridge already closes its own fd; nothing after a
+        // successful bridge.start() can throw, so the catch need not stop it.)
+        let record: VMRecord
+        do {
+            let ips = container.interfaces.map { $0.ipv4Address.address.description }
+            guard let vmIP = ips.first else {
+                throw DaemonError.internalError("VM \(name) came up with no IP address")
+            }
+
+            // Wait for dockerd to accept connections before handing the socket back.
+            try await waitForDockerd(host: vmIP, port: 2375, timeout: 60)
+
+            // Stand up the host unix socket -> <vmIP>:2375 proxy.
+            let sockPath = stateDir.appendingPathComponent("\(name)/docker.sock").path
+            try FileManager.default.createDirectory(
+                atPath: (sockPath as NSString).deletingLastPathComponent,
+                withIntermediateDirectories: true
+            )
+            let bridge = SocketBridge(hostSocketPath: sockPath, targetHost: vmIP, targetPort: 2375)
+            try bridge.start()
+
+            record = VMRecord(
+                id: "avm-\(UUID().uuidString.prefix(12))",
+                name: name,
+                agent: req.agent_name,
+                workspaceDir: req.workspace_dir,
+                createdAt: Date(),
+                ipAddresses: ips,
+                hostSocketPath: sockPath,
+                status: "running",
+                container: container,
+                bridge: bridge
+            )
+        } catch {
             try? await container.stop()
+            if var m = managers[name] { try? m.delete(name) }
             managers.removeValue(forKey: name)
-            throw DaemonError.internalError("VM \(name) came up with no IP address")
+            throw error
         }
-
-        // Wait for dockerd to accept connections before handing the socket back.
-        try await waitForDockerd(host: vmIP, port: 2375, timeout: 60)
-
-        // Stand up the host unix socket -> <vmIP>:2375 proxy.
-        let sockPath = stateDir.appendingPathComponent("\(name)/docker.sock").path
-        try FileManager.default.createDirectory(
-            atPath: (sockPath as NSString).deletingLastPathComponent,
-            withIntermediateDirectories: true
-        )
-        let bridge = SocketBridge(hostSocketPath: sockPath, targetHost: vmIP, targetPort: 2375)
-        try bridge.start()
-
-        let record = VMRecord(
-            id: "avm-\(UUID().uuidString.prefix(12))",
-            name: name,
-            agent: req.agent_name,
-            workspaceDir: req.workspace_dir,
-            createdAt: Date(),
-            ipAddresses: ips,
-            hostSocketPath: sockPath,
-            status: "running",
-            container: container,
-            bridge: bridge
-        )
         vms[name] = record
 
         // NOTE (parity gap vs sandboxd): no MITM egress proxy yet, so no CA cert
@@ -146,7 +156,7 @@ actor VMManager {
         // accepted on the request but not yet enforced. See README.
         return VMCreateResponse(
             vm_id: record.id,
-            vm_config: VMConfig(socketPath: sockPath),
+            vm_config: VMConfig(socketPath: record.hostSocketPath),
             ca_cert_path: nil,
             ca_cert_data: "",
             proxy_env_vars: [:],

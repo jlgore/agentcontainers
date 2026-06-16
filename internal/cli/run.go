@@ -129,6 +129,33 @@ func policyImageRef(imageTag, cfgPath string) string {
 	return ref + "@" + lf.Resolved.Image.Digest
 }
 
+// warnAppleVMEnforcement makes the applevm backend's current enforcement
+// limitations explicit, so the printed "Enforcement" line is not mistaken for
+// full enforcement. The in-VM enforcer starts but, on the default
+// containerization/Kata kernel, cannot attach BPF-LSM hooks (no CONFIG_BPF_LSM/
+// BTF), and the daemon does not yet implement the MITM egress proxy or
+// credential injection. The HITL approval broker still gates command execution.
+func warnAppleVMEnforcement(cmd *cobra.Command, cfg *config.AgentContainer, logger *zap.Logger) {
+	w := cmd.ErrOrStderr()
+	_, _ = fmt.Fprintln(w, "WARNING: --runtime=applevm is experimental; in-VM enforcement is AUDIT-ONLY:")
+	_, _ = fmt.Fprintln(w, "  - BPF-LSM kernel enforcement is inactive on the default kernel")
+	_, _ = fmt.Fprintln(w, "    (needs a CONFIG_BPF_LSM+BTF kernel; see applevm/kernel/).")
+	_, _ = fmt.Fprintln(w, "  - Network egress and secret/credential policy are not yet enforced.")
+	_, _ = fmt.Fprintln(w, "  The HITL approval broker still gates command execution.")
+
+	if cfg.Agent == nil {
+		return
+	}
+	if caps := cfg.Agent.Capabilities; caps != nil && caps.Network != nil && len(caps.Network.Egress) > 0 {
+		_, _ = fmt.Fprintln(w, "  NOTE: network.egress is declared but will NOT be enforced under applevm.")
+		logger.Warn("applevm: network egress policy declared but not enforced")
+	}
+	if len(cfg.Agent.Secrets) > 0 {
+		_, _ = fmt.Fprintln(w, "  NOTE: secrets are declared but credential enforcement is NOT applied under applevm.")
+		logger.Warn("applevm: secrets declared but credential enforcement not applied")
+	}
+}
+
 func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath string, runtimeFlag string, insecureSkipVerify bool) error {
 	// 0. Resolve "auto" to a concrete runtime type so all downstream checks
 	// (e.g. sandbox sidecar skip) work regardless of the original flag value.
@@ -141,6 +168,11 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 	// manage their enforcer sidecar inside the VM, so host-level sidecar
 	// resolution is skipped for both.
 	isVMBackend := resolvedRuntime == container.RuntimeSandbox || resolvedRuntime == container.RuntimeAppleVM
+	// AppleVM is experimental: its in-VM enforcer starts but, on the default
+	// kernel, cannot attach BPF-LSM hooks, and the daemon does not yet enforce
+	// network egress or secret policy. Track it so we don't print full
+	// "grpc (in-vm)" enforcement when it is really audit-only.
+	isAppleVM := resolvedRuntime == container.RuntimeAppleVM
 
 	// 1. Load and validate configuration.
 	cfg, cfgPath, err := loadConfig(configPath)
@@ -220,6 +252,12 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 		// level to LevelGRPC so the runtime knows to start the sidecar.
 		enfLevel = enforcement.LevelGRPC
 		enfSource = "in-vm"
+		if isAppleVM {
+			// Be honest: the enforcer cannot attach BPF-LSM on the default
+			// kernel, and egress/secret policy is not enforced yet.
+			enfSource = "in-vm, experimental — audit-only"
+			warnAppleVMEnforcement(cmd, cfg, logger)
+		}
 		logger.Info("VM-isolated runtime: in-VM enforcement, skipping host sidecar",
 			zap.String("runtime", string(resolvedRuntime)))
 	} else {

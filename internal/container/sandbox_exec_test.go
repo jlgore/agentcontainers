@@ -414,15 +414,14 @@ func TestSandboxRuntime_Logs_ContainerLogsError(t *testing.T) {
 }
 
 func TestSandboxRuntime_Logs_NoDockerClient(t *testing.T) {
+	// With no cached client, Logs reconnects via InspectVM; when that fails
+	// (unconfigured mock), the reconnect error surfaces.
 	rt := newTestSandboxRuntimeWithDocker(t, "", nil) // no client cached
 	session := &Session{ContainerID: "ac-no-client", Name: "ac-no-client", RuntimeType: RuntimeSandbox}
 
 	_, err := rt.Logs(context.Background(), session)
 	if err == nil {
-		t.Fatal("expected error when no Docker client cached")
-	}
-	if !strings.Contains(err.Error(), "no docker client") {
-		t.Errorf("expected no docker client error, got: %v", err)
+		t.Fatal("expected error when VM cannot be reconnected")
 	}
 }
 

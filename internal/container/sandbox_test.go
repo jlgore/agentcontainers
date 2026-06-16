@@ -438,6 +438,8 @@ func TestSandboxRuntime_Exec_EmptyCommand(t *testing.T) {
 }
 
 func TestSandboxRuntime_Exec_NoDockerClient(t *testing.T) {
+	// With no cached client, Exec reconnects via InspectVM. When that fails
+	// (here the mock has no InspectVM configured), Exec surfaces the error.
 	rt, err := NewSandboxRuntime(
 		WithSandboxClient(&mockSandboxAPI{}),
 	)
@@ -448,10 +450,74 @@ func TestSandboxRuntime_Exec_NoDockerClient(t *testing.T) {
 	session := &Session{Name: "unknown-vm"}
 	_, err = rt.Exec(context.Background(), session, []string{"echo", "hi"})
 	if err == nil {
-		t.Fatal("expected error for missing docker client")
+		t.Fatal("expected error when VM cannot be reconnected")
 	}
-	if err.Error() != "sandbox runtime: no docker client for VM unknown-vm" {
-		t.Errorf("unexpected error: %v", err)
+}
+
+// TestSandboxRuntime_Exec_Reconnects verifies a fresh runtime (no cached Docker
+// client, e.g. a separate CLI process) rebuilds the per-VM client from the VM's
+// socket path via InspectVM, and resolves the VM name from its ID via ListVMs.
+func TestSandboxRuntime_Exec_Reconnects(t *testing.T) {
+	mock := &mockSandboxAPI{
+		listVMsFn: func(_ context.Context) ([]sandbox.VMListEntry, error) {
+			return []sandbox.VMListEntry{
+				{VMID: "vm-xyz", VMName: "ac-reconnect", Status: "running"},
+			}, nil
+		},
+		inspectVMFn: func(_ context.Context, name string) (*sandbox.VMInspectResponse, error) {
+			if name != "ac-reconnect" {
+				t.Errorf("InspectVM called with %q, want ac-reconnect", name)
+			}
+			return &sandbox.VMInspectResponse{
+				VMName:   "ac-reconnect",
+				VMConfig: sandbox.VMConfig{SocketPath: "/tmp/vm-xyz/docker.sock"},
+			}, nil
+		},
+	}
+
+	var capturedHost string
+	factory := func(host string) (client.APIClient, error) {
+		capturedHost = host
+		return &mockDockerAPIClient{
+			containerListFn: func(_ context.Context, _ client.ContainerListOptions) (client.ContainerListResult, error) {
+				return client.ContainerListResult{Items: []container.Summary{
+					{ID: "ctr-1", State: container.StateRunning, Names: []string{"/ac-reconnect"}},
+				}}, nil
+			},
+			execCreateFn: func(_ context.Context, _ string, _ client.ExecCreateOptions) (client.ExecCreateResult, error) {
+				return client.ExecCreateResult{ID: "exec-1"}, nil
+			},
+			execAttachFn: func(_ context.Context, _ string, _ client.ExecAttachOptions) (client.ExecAttachResult, error) {
+				return newHijackedResponse(buildStdcopyPayload(1, "")), nil
+			},
+			execInspectFn: func(_ context.Context, _ string, _ client.ExecInspectOptions) (client.ExecInspectResult, error) {
+				return client.ExecInspectResult{ExitCode: 0}, nil
+			},
+		}, nil
+	}
+
+	rt, err := NewSandboxRuntime(
+		WithSandboxClient(mock),
+		WithDockerClientFactory(factory),
+	)
+	if err != nil {
+		t.Fatalf("NewSandboxRuntime: %v", err)
+	}
+
+	// Session as a later CLI process would reconstruct it: only the ID.
+	session := &Session{ContainerID: "vm-xyz"}
+	res, err := rt.Exec(context.Background(), session, []string{"echo", "hi"})
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if res.ExitCode != 0 {
+		t.Errorf("ExitCode = %d, want 0", res.ExitCode)
+	}
+	if capturedHost != "unix:///tmp/vm-xyz/docker.sock" {
+		t.Errorf("reconnect host = %q, want unix:///tmp/vm-xyz/docker.sock", capturedHost)
+	}
+	if session.Name != "ac-reconnect" {
+		t.Errorf("session.Name = %q, want ac-reconnect (backfilled from ID)", session.Name)
 	}
 }
 

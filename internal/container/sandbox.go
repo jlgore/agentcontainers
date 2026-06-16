@@ -332,6 +332,13 @@ func (s *SandboxRuntime) Start(ctx context.Context, cfg *config.AgentContainer, 
 	if cfg.Image != "" {
 		templateImage = cfg.Image
 	}
+	// Honor the lockfile-pinned, content-addressed reference when provided so the
+	// in-VM Docker daemon runs the same immutable manifest that policy/signature
+	// extraction validated. Without this a mutable tag could be swapped between
+	// validation and pull (F-4 TOCTOU). See StartOptions.PinnedImageRef.
+	if opts.PinnedImageRef != "" {
+		templateImage = opts.PinnedImageRef
+	}
 	if err := s.ensureVMImage(ctx, dockerCli, vmName, templateImage); err != nil {
 		_ = s.client.DeleteVM(ctx, vmName)
 		return nil, fmt.Errorf("sandbox runtime: pulling template image in VM %s: %w", vmName, err)
@@ -524,7 +531,15 @@ func (s *SandboxRuntime) Stop(ctx context.Context, session *Session) error {
 		return fmt.Errorf("sandbox runtime: nil session")
 	}
 
-	name := session.Name
+	// Resolve the VM name from daemon state when the session only carries an ID
+	// (e.g. `agentcontainer stop` from a separate CLI process). Best-effort:
+	// fall back to the ID so a forced delete can still proceed.
+	name, err := s.resolveVMName(ctx, session)
+	if err != nil {
+		s.logger.Warn("could not resolve VM name; falling back to ID",
+			zap.String("id", session.ContainerID), zap.Error(err))
+		name = session.ContainerID
+	}
 	s.logger.Info("stopping sandbox VM", zap.String("name", name))
 
 	// Remove enforcement strategy before stopping sidecar.
@@ -622,8 +637,7 @@ func (s *SandboxRuntime) Exec(ctx context.Context, session *Session, cmd []strin
 		return nil, fmt.Errorf("sandbox runtime: empty command")
 	}
 
-	vmName := session.Name
-	dockerCli, err := s.getVMDockerClient(vmName)
+	vmName, dockerCli, err := s.resolveVMConnection(ctx, session)
 	if err != nil {
 		return nil, err
 	}
@@ -672,8 +686,7 @@ func (s *SandboxRuntime) Logs(ctx context.Context, session *Session) (io.ReadClo
 		return nil, fmt.Errorf("sandbox runtime: nil session")
 	}
 
-	vmName := session.Name
-	dockerCli, err := s.getVMDockerClient(vmName)
+	vmName, dockerCli, err := s.resolveVMConnection(ctx, session)
 	if err != nil {
 		return nil, err
 	}
@@ -737,6 +750,62 @@ func (s *SandboxRuntime) getVMDockerClient(vmName string) (client.APIClient, err
 		return nil, fmt.Errorf("sandbox runtime: no docker client for VM %s", vmName)
 	}
 	return dockerCli, nil
+}
+
+// resolveVMName resolves the VM name for a session. A later CLI invocation
+// reconstructs the session with only ContainerID (the VM ID), so when Name is
+// empty we look the VM up via the daemon by ID (or name) and backfill it.
+func (s *SandboxRuntime) resolveVMName(ctx context.Context, session *Session) (string, error) {
+	if session.Name != "" {
+		return session.Name, nil
+	}
+	vms, err := s.client.ListVMs(ctx)
+	if err != nil {
+		return "", fmt.Errorf("sandbox runtime: listing VMs to resolve %s: %w", session.ContainerID, err)
+	}
+	for _, vm := range vms {
+		if vm.VMID == session.ContainerID || vm.VMName == session.ContainerID {
+			session.Name = vm.VMName
+			return vm.VMName, nil
+		}
+	}
+	return "", fmt.Errorf("sandbox runtime: no VM found for %s", session.ContainerID)
+}
+
+// resolveVMConnection ensures we have the VM name and a usable per-VM Docker
+// client for the session, reconstructing both from daemon state when they are
+// not cached in this process. The in-memory Docker client is only populated by
+// Start, so exec/logs from a separate CLI process must rediscover the VM by ID
+// and rebuild the client from the VM's socket path (via InspectVM).
+func (s *SandboxRuntime) resolveVMConnection(ctx context.Context, session *Session) (string, client.APIClient, error) {
+	vmName, err := s.resolveVMName(ctx, session)
+	if err != nil {
+		return "", nil, err
+	}
+
+	s.mu.Lock()
+	dockerCli, ok := s.vmDockerClients[vmName]
+	s.mu.Unlock()
+	if ok && dockerCli != nil {
+		return vmName, dockerCli, nil
+	}
+
+	info, err := s.client.InspectVM(ctx, vmName)
+	if err != nil {
+		return "", nil, fmt.Errorf("sandbox runtime: inspecting VM %s: %w", vmName, err)
+	}
+	socketPath := info.VMConfig.SocketPath
+	if socketPath == "" {
+		return "", nil, fmt.Errorf("sandbox runtime: VM %s has no socket path", vmName)
+	}
+	dockerCli, err = s.dockerFactory("unix://" + socketPath)
+	if err != nil {
+		return "", nil, fmt.Errorf("sandbox runtime: reconnecting docker client for VM %s: %w", vmName, err)
+	}
+	s.mu.Lock()
+	s.vmDockerClients[vmName] = dockerCli
+	s.mu.Unlock()
+	return vmName, dockerCli, nil
 }
 
 // mcpSidecarPrefix is the name prefix used by MCP sidecar services created
