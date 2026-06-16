@@ -54,6 +54,9 @@ actor VMManager {
             throw DaemonError.conflict("VM \(name) already exists")
         }
 
+        // Captured into the @Sendable create closure (a plain String is Sendable).
+        let workspaceDir = req.workspace_dir
+
         let kernel = Kernel(path: URL(fileURLWithPath: kernelPath), platform: .linuxArm)
         let network: Network = try VmnetNetwork()
         var manager = try await ContainerManager(
@@ -87,6 +90,16 @@ actor VMManager {
             ]
             config.process.workingDirectory = "/"
             config.process.capabilities = .allCapabilities
+
+            // Share the host workspace into the VM at the same path so the
+            // in-VM dockerd can bind-mount it into the agent container (the Go
+            // runtime binds workspacePath:workspacePath). Without this the bind
+            // fails with "bind source path does not exist" inside the VM.
+            if !workspaceDir.isEmpty {
+                config.mounts.append(
+                    Containerization.Mount.share(source: workspaceDir, destination: workspaceDir)
+                )
+            }
         }
 
         try await container.create()
