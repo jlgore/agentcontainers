@@ -103,7 +103,16 @@
             "VHIR_CASE_DIR": "/cases/e2e-demo",
             "VHIR_CASES_DIR": "/cases",
             "VHIR_ACTIVE_CASE": "e2e-demo",
-            "VHIR_EXAMINER": "jgore"
+            "VHIR_EXAMINER": "jgore",
+            // The gateway image bakes VHIR_AUDIT_DIR=/run/secrets/audit (an
+            // ephemeral tmpfs — a leftover from when the case dir was unwritable
+            // under capless root). That writes run_command audit_ids to the
+            // tmpfs while record_finding validates <case>/audit, so every
+            // audit_id is rejected and findings fall back to supporting_commands
+            // (provenance_grade PARTIAL). Point it at the case audit dir —
+            // writable now that the gateway runs as uid 1000 — so cross-backend
+            // audit_id provenance validates end-to-end.
+            "VHIR_AUDIT_DIR": "/cases/e2e-demo/audit"
           }
         }
       }

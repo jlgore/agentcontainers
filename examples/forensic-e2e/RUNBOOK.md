@@ -17,7 +17,7 @@ Two ways to drive it with a Claude Code harness:
 
 > **One command:** `./demo.sh up` brings up guard + enforcer + gateway + proxy and wires
 > the bare harness idempotently, then prints the `claude …` command. `./demo.sh status`
-> and `./demo.sh down` manage it. The step-by-step below is what that automates.
+> and `./demo.sh down` manage it. The runbook below uses that path.
 
 ---
 
@@ -32,6 +32,19 @@ Two ways to drive it with a Claude Code harness:
   - proxy panicked on Claude's numeric `progressToken` (every tool call crashed it) — CLI v0.1.9
 - `ewf-tools` installed and `user_allow_other` in `/etc/fuse.conf` (up.sh sets the latter).
 - A case laid out as `<case>/evidence/*.E01` (see §1).
+
+## TL;DR — one command
+
+```bash
+git clone https://github.com/jlgore/agentcontainers.git
+cd agentcontainers
+sudo ./scripts/bootstrap.sh --with-sift-demo
+#   ... configures the BPF LSM, then asks you to reboot ...
+sudo reboot
+# after reboot:
+cd agentcontainers
+sudo ./scripts/bootstrap.sh --with-sift-demo
+```
 
 ---
 
@@ -54,8 +67,17 @@ parts of one case.
 
 ```bash
 cd examples/forensic-e2e
-./up.sh            # ewfmount + gateway image + agent under enforcement + MCP proxy
+./demo.sh up
 ```
+
+`demo.sh up` is the primary bare-harness operator path. It:
+
+- Starts the guard with `agentcontainer guard serve --escalation inline`.
+- Calls `up.sh` for ewfmount, the gateway image, the enforced agent, and the MCP proxy.
+- Clones `teamdfir/protocol-sift` skills if needed and symlinks them into `.claude/skills/`.
+- Copies the `forensic-critic` subagent into `.claude/agents/`.
+- Writes `~/sift-proxy-mcp.json` and `~/.claude/settings.json` with guard hooks.
+- Prints the `claude` launch command.
 
 Success signals (the green banner prints unconditionally — look for these instead):
 
@@ -77,54 +99,31 @@ Success signals (the green banner prints unconditionally — look for these inst
 
 ---
 
-## 3a. Bare harness (Claude on the host)
+## 3. Launch Claude
 
 ```bash
-# install Claude Code (native, no Node)
-curl -fsSL https://claude.ai/install.sh | bash
-export PATH="$HOME/.local/bin:$PATH"        # add to ~/.bashrc too
-claude        # then /login   (or: export CLAUDE_CODE_OAUTH_TOKEN=…)
-```
-
-Wire the guard hook for the native install — `~/.claude/settings.json`:
-
-```json
-{
-  "hooks": {
-    "PreToolUse":  [ { "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit",
-      "hooks": [ { "type": "command", "command": "/usr/local/bin/agentcontainer guard hook --socket $HOME/.ac/guard.sock" } ] } ],
-    "PostToolUse": [ { "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit",
-      "hooks": [ { "type": "command", "command": "/usr/local/bin/agentcontainer guard hook --socket $HOME/.ac/guard.sock" } ] } ],
-    "PostToolUseFailure": [ { "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit",
-      "hooks": [ { "type": "command", "command": "/usr/local/bin/agentcontainer guard hook --socket $HOME/.ac/guard.sock" } ] } ]
-  }
-}
-```
-(Use an **absolute** socket path — hooks don't expand `~` reliably.)
-
-Proxy MCP config — `~/sift-proxy-mcp.json`:
-```json
-{ "mcpServers": { "sift": { "type": "http", "url": "http://localhost:4510/" } } }
-```
-
-Start the guard, then Claude:
-```bash
-agentcontainer guard serve --escalation inline    # inline = approvals prompt in Claude's TUI; can background
 claude --mcp-config ~/sift-proxy-mcp.json --strict-mcp-config
 ```
 
-In-session: `/mcp` should list `sift` with `mcp__sift__*` (49 tools). Claude's own
-Bash/Write hit the guard (OPA → allow/ask/deny inline); forensic tools hit the proxy
-(OPA + audit). `--escalation prompt` instead routes approvals to a separate
-`guard serve` terminal (out-of-band — the production default).
+In-session, `/mcp` should list `sift` with `mcp__sift__*` and 49 tools.
 
----
+There are two tool paths:
 
-## 3b. Containerized harness (Claude inside the enforced container)
+- Forensic MCP tools go through the proxy with OPA policy and hash-chained audit.
+- Claude's own Bash/Write/Edit tools go through the guard hook with OPA and inline HITL approval.
 
-Adds the eBPF kernel boundary around Claude. Full runbook:
-`examples/claude-agent/E2E-FORENSIC-DEMO.md`. Same proxy/OPA/audit story as bare,
-plus cgroup egress / file_open / exec enforcement and fail-closed on Claude itself.
+`demo.sh up` writes the MCP config and guard hook settings for the bare path.
+Use `--escalation prompt` only if you deliberately want approvals routed to a
+separate `guard serve` terminal instead of Claude's TUI.
+
+### 3b. Containerized harness (Claude inside the enforced container)
+
+`demo.sh` handles the bare host path only.
+
+For the containerized path, use `examples/claude-agent/E2E-FORENSIC-DEMO.md`.
+That adds the eBPF kernel boundary around Claude: cgroup egress, file_open,
+exec enforcement, and fail-closed behavior on Claude itself. The proxy, OPA,
+and audit story is the same.
 
 ---
 
@@ -138,6 +137,11 @@ agentcontainer audit show  <session-id>-proxy   # tool_call entries + verdicts
 agentcontainer audit verify <session-id>-proxy  # -> OK: N entries, chain intact
 ```
 
+The DFIR skills from protocol-sift and the forensic-critic subagent are in
+`.claude/skills/` and `.claude/agents/` respectively, wired by `demo.sh up`.
+The critic auto-spawns after `record_finding` to adversarially verify each
+staged finding.
+
 > `agentcontainer exec sift-forensic-agent -- sh -c '…'` is **not** the read-only test:
 > the guard denies `sh -c`, every exec is approval-gated, and the agent doesn't even mount
 > `/cases`. The real RO proof is a write attempt through the gateway's `run_command`.
@@ -147,9 +151,7 @@ agentcontainer audit verify <session-id>-proxy  # -> OK: N entries, chain intact
 ## 5. Teardown
 
 ```bash
-./demo.sh down      # guard + stack
-# or just the stack:
-./down.sh
+./demo.sh down
 ```
 
 ---
@@ -164,3 +166,56 @@ agentcontainer audit verify <session-id>-proxy  # -> OK: N entries, chain intact
 | `/mcp` shows 49 tools but every call → "socket closed" | Proxy panicked on Claude's numeric `progressToken`. Needs CLI ≥ v0.1.9. |
 | `no route to host` to the gateway on `up.sh` | Transient gateway-startup/timing blip; re-run. |
 | `evidence-raw/ewf1` empty on the host | Expected — that path only exists *inside the gateway*. Host raw image is `.ewfraw/ewf1`. |
+| `record_finding` rejects audit_ids | Gateway backend lifecycle resets the audit map between requests. Use `supporting_commands` with `audit_ids: []` for provenance. The proxy's own hash-chained audit trail (`agentcontainer audit verify`) independently records every tool call. |
+
+---
+
+## Manual setup (what demo.sh automates)
+
+Use this only for debugging or customization. The primary path is `./demo.sh up`.
+
+<details>
+<summary>Manual bare-harness setup</summary>
+
+Install Claude Code if needed:
+
+```bash
+curl -fsSL https://claude.ai/install.sh | bash
+export PATH="$HOME/.local/bin:$PATH"        # add to ~/.bashrc too
+claude        # then /login   (or: export CLAUDE_CODE_OAUTH_TOKEN=…)
+```
+
+Wire the guard hook for the native install in `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse":  [ { "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit",
+      "hooks": [ { "type": "command", "command": "/usr/local/bin/agentcontainer guard hook --socket $HOME/.ac/guard.sock" } ] } ],
+    "PostToolUse": [ { "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit",
+      "hooks": [ { "type": "command", "command": "/usr/local/bin/agentcontainer guard hook --socket $HOME/.ac/guard.sock" } ] } ],
+    "PostToolUseFailure": [ { "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit",
+      "hooks": [ { "type": "command", "command": "/usr/local/bin/agentcontainer guard hook --socket $HOME/.ac/guard.sock" } ] } ]
+  }
+}
+```
+
+Use an **absolute** socket path. Hooks do not expand `~` reliably.
+
+Write the proxy MCP config to `~/sift-proxy-mcp.json`:
+
+```json
+{ "mcpServers": { "sift": { "type": "http", "url": "http://localhost:4510/" } } }
+```
+
+Start the guard, then Claude:
+
+```bash
+agentcontainer guard serve --escalation inline
+claude --mcp-config ~/sift-proxy-mcp.json --strict-mcp-config
+```
+
+`--escalation inline` prompts for approvals in Claude's TUI. `--escalation prompt`
+routes approvals to a separate `guard serve` terminal.
+
+</details>

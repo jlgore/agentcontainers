@@ -19,6 +19,8 @@ GUARD_PID="$HOME/.ac/demo-guard.pid"   # stable (down.sh wipes .run/)
 GUARD_LOG="$HOME/.ac/demo-guard.log"
 MCP_JSON="$HOME/sift-proxy-mcp.json"
 SETTINGS="$HOME/.claude/settings.json"
+PROTOCOL_SIFT_DIR="$HOME/protocol-sift"
+SIFT_MCP_DIR="${SIFT_MCP_DIR:-$HOME/git/sift-mcp}"
 
 if [ -t 1 ]; then B='\033[1;34m'; G='\033[1;32m'; Y='\033[1;33m'; Z='\033[0m'; else B=''; G=''; Y=''; Z=''; fi
 log()  { printf "${B}==>${Z} %s\n" "$*"; }
@@ -53,6 +55,78 @@ JSON
   ok "guard hook wired -> $SETTINGS"
 }
 
+wire_skills() {
+  if [ -d "$PROTOCOL_SIFT_DIR" ]; then
+    ok "protocol-sift already present -> $PROTOCOL_SIFT_DIR"
+  else
+    log "Cloning protocol-sift skills"
+    if git clone --depth 1 https://github.com/teamdfir/protocol-sift.git "$PROTOCOL_SIFT_DIR"; then
+      ok "protocol-sift cloned -> $PROTOCOL_SIFT_DIR"
+    else
+      warn "could not clone protocol-sift; DFIR skills were not wired"
+      return 1
+    fi
+  fi
+
+  local skills_src="$PROTOCOL_SIFT_DIR/skills"
+  local skills_dst="$HERE/.claude/skills"
+  mkdir -p "$skills_dst"
+  local linked=0
+  local existing=0
+  local skipped=0
+  local skill_dir skill_name link_target current_target
+  for skill_dir in "$skills_src"/*/; do
+    [ -d "$skill_dir" ] || continue
+    skill_dir="${skill_dir%/}"
+    skill_name="$(basename "$skill_dir")"
+    link_target="$skills_dst/$skill_name"
+    if [ -L "$link_target" ]; then
+      current_target="$(readlink "$link_target")"
+      if [ "$current_target" = "$skill_dir" ]; then
+        existing=$((existing + 1))
+      else
+        warn "skill target exists with different symlink: $link_target -> $current_target"
+        skipped=$((skipped + 1))
+      fi
+    elif [ -e "$link_target" ]; then
+      warn "skill target exists and is not a symlink: $link_target"
+      skipped=$((skipped + 1))
+    elif ln -s "$skill_dir" "$link_target"; then
+      linked=$((linked + 1))
+    else
+      warn "failed to link skill: $skill_name"
+      skipped=$((skipped + 1))
+    fi
+  done
+  if [ "$linked" -eq 0 ] && [ "$existing" -eq 0 ]; then
+    warn "no skill directories found under $skills_src"
+  else
+    ok "skills wired -> $skills_dst ($linked linked, $existing existing, $skipped skipped)"
+  fi
+
+  local agents_dst="$HERE/.claude/agents"
+  local critic_src="$SIFT_MCP_DIR/.claude/agents/forensic-critic.md"
+  local critic_dst="$agents_dst/forensic-critic.md"
+  mkdir -p "$agents_dst"
+  if [ -e "$critic_dst" ]; then
+    ok "forensic-critic already present -> $critic_dst"
+  elif [ -f "$critic_src" ]; then
+    if cp "$critic_src" "$critic_dst"; then
+      ok "forensic-critic copied -> $critic_dst"
+    else
+      warn "could not copy forensic-critic from $critic_src"
+    fi
+  else
+    warn "forensic-critic source not found at $critic_src; place it in $agents_dst manually if needed"
+  fi
+
+  if [ -f "$HERE/CLAUDE.md" ]; then
+    ok "Claude investigation context -> $HERE/CLAUDE.md"
+  else
+    warn "$HERE/CLAUDE.md is missing; Claude will start without the forensic investigation context"
+  fi
+}
+
 start_guard() {
   if guard_running; then ok "guard already running (pid $(cat "$GUARD_PID"))"; return; fi
   mkdir -p "$HOME/.ac"
@@ -76,6 +150,8 @@ case "${1:-}" in
     PROXY_PORT="$PROXY_PORT" ./up.sh
     log "Native Claude Code harness wiring"
     wire_harness
+    log "DFIR skills and critic wiring"
+    wire_skills || exit 1
     cat <<EOT
 
 ${G}Forensic E2E (bare) is up.${Z} Run Claude against the audited proxy:
