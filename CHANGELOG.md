@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.10](https://github.com/jlgore/agentcontainers/compare/v0.1.9...v0.1.10) (2026-06-16)
+
+
+### Bug Fixes
+
+* **mcpproxy:** run container MCP backends as a configurable user (capless-root EACCES) ([#16](https://github.com/jlgore/agentcontainers/issues/16)) ([ef9fc15](https://github.com/jlgore/agentcontainers/commit/ef9fc1503e79281f5d41e742ade60c70918dc3bd))
+
 ## [0.1.9](https://github.com/jlgore/agentcontainers/compare/v0.1.8...v0.1.9) (2026-06-15)
 
 
