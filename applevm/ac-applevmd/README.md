@@ -51,16 +51,33 @@ Re-sign after every rebuild.
 
 ## Runtime prerequisites (one-time)
 
-1. **Kernel.** A Linux kernel image for the microVMs. The containerization
-   project points to the Kata Containers kernel:
+1. **Kernel.** A Linux kernel image for the microVMs. Use the BPF-LSM + BTF
+   kernel this repo builds in CI — it's what lets the in-VM enforcer attach its
+   eBPF/BPF-LSM hooks (the stock containerization kernel and the Kata kernel both
+   lack `CONFIG_BPF_LSM`/BTF, so enforcement degrades to audit-only on them). It
+   is attached to each GitHub Release as `vmlinux` (and produced by the
+   `applevm-kernel` workflow — see `applevm/kernel/`):
+
+   ```bash
+   mkdir -p ~/.agentcontainers/applevm
+   gh release download -R jlgore/agentcontainers --pattern vmlinux \
+     -O ~/.agentcontainers/applevm/kernel
+   ```
+
+   Verify after first boot: `zcat /proc/config.gz | grep -E 'BPF_LSM|DEBUG_INFO_BTF'`
+   should show `=y`, and `/sys/kernel/btf/vmlinux` should exist.
+
+   <details><summary>Fallback: the Kata kernel (no BPF-LSM enforcement)</summary>
 
    ```bash
    curl -SsL -o /tmp/kata.tar.xz \
      https://github.com/kata-containers/kata-containers/releases/download/3.17.0/kata-static-3.17.0-arm64.tar.xz
    tar -xf /tmp/kata.tar.xz -C /tmp
-   mkdir -p ~/.agentcontainers/applevm
    cp -L /tmp/opt/kata/share/kata-containers/vmlinux.container ~/.agentcontainers/applevm/kernel
    ```
+   The VM boots, but the enforcer's BPF programs cannot load (no BTF), so run
+   `--runtime=applevm` audit-only.
+   </details>
 
 2. **vminit initfs.** Build `vminit:latest` into the local image store from a
    checkout of apple/containerization at the **same revision** this package

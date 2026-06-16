@@ -12,6 +12,13 @@ on:
       containerization_ref:
         description: apple/containerization ref (kernel version + base config)
         default: e29657b86e10
+  # Callable from release.yml so each release ships the kernel as an asset.
+  workflow_call:
+    inputs:
+      containerization_ref:
+        type: string
+        required: false
+        default: e29657b86e10
   push:
     paths:
       - applevm/kernel/**
@@ -30,7 +37,7 @@ jobs:
     env:
       ARCH: arm64
       CROSS_COMPILE: aarch64-linux-gnu-
-      CZ_REF: ${{ github.event.inputs.containerization_ref || 'e29657b86e10' }}
+      CZ_REF: ${{ inputs.containerization_ref || 'e29657b86e10' }}
     steps:
       - uses: actions/checkout@v6
 
