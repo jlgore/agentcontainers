@@ -14,6 +14,11 @@ does real analysis and stages real findings, (3) the human approves them with
 `vhir approve`, (4) the case is no longer empty — with the enforcement and audit
 trail visible throughout.
 
+For the bare host path, use `examples/forensic-e2e/RUNBOOK.md` and `./demo.sh up`.
+This runbook is the containerized path: Claude itself runs inside the enforced
+`claude-agent` container, so the DFIR skills, critic agent, MCP config, and
+investigation context must be mounted or copied into `/workspace`.
+
 ---
 
 ## ⚑ Dry-run status (2026-06-11) — read this first
@@ -75,14 +80,27 @@ Artifacts left in place on the VM for the fresh session: the two `:e2e` images,
 `~/agentcontainers/examples/claude-agent/e2e/agentcontainer.json` (+ a
 `agentcontainer.demo.json` variant that uses the runnable ghcr image).
 
+**Current corrections from the bare proxy path to carry forward here:**
+- The gateway analyzes `/cases/e2e-demo/evidence-raw/ewf1`, a read-only bind of
+  host `.ewfraw/ewf1`. That path exists only inside the gateway, not on the host
+  or in Claude's agent container.
+- The image is a logical NTFS volume with no partition table. Use `fsstat`,
+  `fls`, `istat`, and `icat`; do not use `mmls`.
+- Use `record_finding` with `supporting_commands` and `audit_ids: []`. Proxy
+  `audit_ids` may be rejected by the gateway backend's case-audit validation.
+  The proxy hash chain is verified separately with
+  `agentcontainer audit verify <session>-proxy`.
+- Mount or copy both the protocol-sift skills and the `forensic-critic` subagent
+  into `/workspace/.claude/`. The critic should verify every staged finding.
+
 ---
 
 ## 0. What each requirement maps to
 
 | Requirement | Where it lives | Verified by |
 |---|---|---|
-| `protocol-sift` skills installed for the agent | host clone → mounted at `/workspace/.claude/skills` | **Gate G1** |
-| Container can call **`vhir-cli`** | baked into `claude-agent:e2e`; `/cases` mounted; `VHIR_CASE_DIR` set | **Gate G2** |
+| `protocol-sift` skills + `forensic-critic` installed for the agent | host clone/copy → mounted at `/workspace/.claude/{skills,agents}` | **Gate G1** |
+| Container can call **`vhir-cli`** | baked into `claude-agent:e2e`; `/cases` mounted; `VHIR_CASES_DIR` set | **Gate G2** |
 | Container can call **`sift-mcp`** | `agentcontainer mcp start` → enforced `sift-gateway:e2e`; Claude `mcp.json` → proxy | **Gate G3** |
 | Case **provably fresh** | `vhir case init` + sha256/size snapshot of empty record files | **Gate G4** |
 | Agent's own tools gated + egress enforced | `guard serve` (host) + eBPF enforcer | **Gate G5** |
@@ -100,7 +118,7 @@ Artifacts left in place on the VM for the fresh session: the two `:e2e` images,
                                          │  container+http, cgroup-enforced
                                          ▼
                               sift-gateway:e2e  ─┬─▶ forensic-mcp  (record_finding, timeline …)
-                              (TSK + yara,       ├─▶ sift-mcp      (run_command: fls/icat/mactime…)
+                              (TSK + yara,       ├─▶ sift-mcp      (run_command: fls/icat on evidence-raw/ewf1)
                                /cases mounted)   ├─▶ case-mcp      (evidence registry, case lifecycle)
                                                  └─▶ report-mcp
                                          │
@@ -129,16 +147,30 @@ scp /tmp/acdev sansforensics@192.168.8.129:/tmp/acdev
 ssh sansforensics@192.168.8.129 'install -m755 /tmp/acdev ~/.local/bin/acdev && ~/.local/bin/acdev guard --help >/dev/null && echo acdev-ok'
 ```
 
-### 1a. protocol-sift skills (host clone, mounted into the agent)
+### 1a. protocol-sift skills, critic, and investigation context
 
 ```bash
-git clone --depth=1 https://github.com/teamdfir/protocol-sift.git ~/protocol-sift
+[ -d ~/protocol-sift ] || git clone --depth=1 https://github.com/teamdfir/protocol-sift.git ~/protocol-sift
 ls ~/protocol-sift/skills        # expect: memory-analysis plaso-timeline sleuthkit windows-artifacts yara-hunting
+
+mkdir -p ~/agentcontainers/examples/claude-agent/e2e/.claude/agents
+SIFT_MCP_DIR="${SIFT_MCP_DIR:-$HOME/git/sift-mcp}"
+if [ -f "$SIFT_MCP_DIR/.claude/agents/forensic-critic.md" ]; then
+  cp "$SIFT_MCP_DIR/.claude/agents/forensic-critic.md" \
+    ~/agentcontainers/examples/claude-agent/e2e/.claude/agents/
+else
+  echo "WARN: forensic-critic not found at $SIFT_MCP_DIR/.claude/agents/forensic-critic.md"
+fi
 ```
 > We mount `~/protocol-sift/skills` into the container at `/workspace/.claude/skills`
 > rather than baking it in: the `/workspace` bind mount shadows anything the image
 > puts there. The skills are *knowledge* (tool invocations/flags) — the agent runs
 > the tools through `sift-mcp`, not from these dirs.
+>
+> We also mount the `forensic-critic` subagent at `/workspace/.claude/agents` and
+> the same investigation context used by the bare path at `/workspace/CLAUDE.md`.
+> `demo.sh up` wires these automatically only for the bare path; the containerized
+> path must mount them explicitly.
 
 ### 1b. vhir-cli on the host (for the human approval step)
 
@@ -176,7 +208,11 @@ docker build -f Dockerfile.e2e -t sift-gateway:e2e .
 > ⚠️ Minimal tool floor (TSK gives `fls`, `icat`, `mmls`, `fsstat`, `istat`,
 > `mactime` — enough for real Win7 triage; `yara` for the IOC-sweep skill). Add
 > `regripper`, `bulk_extractor`, plaso, volatility3 here if you want deeper
-> objectives. Verify the gateway can run a tool against the E01 in **Gate G3**.
+> objectives. Verify the gateway can run a tool against the raw view in **Gate G3**.
+>
+> For the current E01, TSK should analyze the host-mounted raw view at
+> `/cases/e2e-demo/evidence-raw/ewf1` inside the gateway. It is a logical NTFS
+> volume, so `mmls` is the wrong tool even though it is installed.
 
 Point the `sift` backend at the new image and mount the case dir into the gateway
 so `forensic-mcp`/`case-mcp` write to the real case. Edit
@@ -187,14 +223,24 @@ so `forensic-mcp`/`case-mcp` write to the real case. Edit
   "type": "container",
   "image": "sift-gateway:e2e",          // was sift-gateway:demo
   "transport": "http", "port": 4508, "path": "/mcp",
-  "mounts": [ "type=bind,source=/cases,target=/cases" ],
-  "env": { "VHIR_CASE_DIR": "/cases/e2e-demo" }
+  "user": "1000:1000",
+  "mounts": [
+    "/cases:/cases",
+    "/cases/e2e-demo/evidence:/cases/e2e-demo/evidence:ro",
+    "/cases/e2e-demo/.ewfraw:/cases/e2e-demo/evidence-raw:ro"
+  ],
+  "env": {
+    "VHIR_CASE_DIR": "/cases/e2e-demo",
+    "VHIR_CASES_DIR": "/cases",
+    "VHIR_ACTIVE_CASE": "e2e-demo",
+    "VHIR_EXAMINER": "jgore"
+  }
 }}}
 ```
 > Confirm the exact `tools.mcp.<name>` mount/env keys your build accepts with
 > `acdev mcp start --help`; if per-backend mounts aren't supported, run the
-> gateway via the `type: remote` fallback (README §"Alternative") with
-> `docker run -v /cases:/cases -e VHIR_CASE_DIR=/cases/e2e-demo`.
+> gateway via the `type: remote` fallback (README §"Alternative") with the same
+> `/cases`, `evidence:ro`, and `.ewfraw:evidence-raw:ro` mounts.
 
 ### 1d. Agent image with vhir-cli (`claude-agent:e2e`)
 
@@ -236,12 +282,20 @@ Create the agent config `~/agentcontainers/examples/claude-agent/e2e/agentcontai
   "mounts": [
     "type=bind,source=/run/ac/guard.sock,target=/run/ac/guard.sock",
     "type=bind,source=/home/sansforensics/protocol-sift/skills,target=/workspace/.claude/skills,readonly",
+    "type=bind,source=/home/sansforensics/agentcontainers/examples/claude-agent/e2e/.claude/agents,target=/workspace/.claude/agents,readonly",
+    "type=bind,source=/home/sansforensics/agentcontainers/examples/forensic-e2e/CLAUDE.md,target=/workspace/CLAUDE.md,readonly",
     "type=bind,source=/cases,target=/cases"
   ],
   "agent": {
     "capabilities": {
       "filesystem": {
-        "read":  ["/workspace/**", "/workspace/.claude/skills/**", "/cases/**"],
+        "read":  [
+          "/workspace/**",
+          "/workspace/.claude/skills/**",
+          "/workspace/.claude/agents/**",
+          "/workspace/CLAUDE.md",
+          "/cases/**"
+        ],
         "write": ["/workspace/**"]
       },
       "network": { "egress": [
@@ -282,6 +336,28 @@ ln /cases/e2e-test/evidence/win7-64-nfury-c-drive.E01 /cases/e2e-demo/evidence/ 
 ```
 > ✅ Done in the dry run (`/cases/e2e-demo`, examiner jgore, 12 G E01 hardlinked).
 > Re-running `vhir case init` is unnecessary; just re-snapshot to confirm freshness.
+
+Present the EWF image as a raw read-only device for the gateway:
+
+```bash
+mkdir -p /cases/e2e-demo/.ewfraw
+if ! mount | grep -q ' on /cases/e2e-demo/.ewfraw '; then
+  grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null \
+    || echo user_allow_other | sudo tee -a /etc/fuse.conf >/dev/null
+  ewfmount -X allow_root /cases/e2e-demo/evidence/*.E01 /cases/e2e-demo/.ewfraw
+fi
+[ -e /cases/e2e-demo/.ewfraw/ewf1 ] && echo "raw view ready: /cases/e2e-demo/.ewfraw/ewf1"
+```
+
+Lock acquired evidence so the capless gateway cannot modify, delete, or replace
+it even though `/cases` is mounted read-write for case outputs:
+
+```bash
+sudo chattr +i /cases/e2e-demo/evidence/* /cases/e2e-demo/evidence
+```
+
+Use `examples/forensic-e2e/down.sh --release-evidence` or `sudo chattr -i` on
+both the files and directory before removing or rebuilding the case.
 
 **Freshness snapshot** — run this and keep the output ON CAMERA at the start of the
 recording. A fresh case has empty record files (`[]` / `{"files":[]}`):
@@ -343,7 +419,7 @@ CID=$(~/.local/bin/acdev ps -q --filter name=claude-agent-e2e | head -1)   # adj
 ~/.local/bin/acdev exec "$CID" -- sh -lc '
   mkdir -p /workspace/.claude &&
   cat > /workspace/.claude/mcp.json <<JSON
-{ "mcpServers": { "sift": { "type": "http", "url": "http://172.20.0.1:4510/mcp" } } }
+{ "mcpServers": { "sift": { "type": "http", "url": "http://172.20.0.1:4510/" } } }
 JSON'
 ```
 > The proxy listens on the host; from inside the agent container the host is the
@@ -360,16 +436,19 @@ JSON'
 CID=$(~/.local/bin/acdev ps -q --filter name=claude-agent-e2e | head -1)
 X() { ~/.local/bin/acdev exec "$CID" -- sh -lc "$1"; }
 
-# G1 — protocol-sift skills visible to the agent
+# G1 — protocol-sift skills, critic, and CLAUDE.md context visible to the agent
 X 'ls /workspace/.claude/skills' | grep -E 'sleuthkit|yara-hunting|windows-artifacts' \
   && echo "G1 PASS" || echo "G1 FAIL"
+X 'test -f /workspace/.claude/agents/forensic-critic.md && test -f /workspace/CLAUDE.md' \
+  && echo "G1 assets PASS" || echo "G1 assets FAIL"
 
 # G2 — vhir-cli callable in the container, sees the fresh case
 X 'vhir --help >/dev/null 2>&1 && vhir --case e2e-demo case status' \
   && echo "G2 PASS" || echo "G2 FAIL"
 
 # G3 — sift-mcp reachable from the agent AND the gateway can actually run a tool
-X 'curl -sf http://172.20.0.1:4510/mcp -o /dev/null' && echo "G3a proxy reachable"
+X 'code=$(curl -sS -o /dev/null -w "%{http_code}" http://172.20.0.1:4510/); echo "proxy http=$code"; test "$code" != "000"' \
+  && echo "G3a proxy reachable"
 #   in the live `claude` session, `/mcp` should list a `sift` server and tools;
 #   and a no-op tool call (e.g. sift-mcp list_available_tools) must return tools.
 #   Confirm the gateway has real binaries:
@@ -423,18 +502,28 @@ find into the active Valhuntir case `e2e-demo`. Evidence guides theory — never
 reverse.
 
 EVIDENCE
-- One disk image: /cases/e2e-demo/evidence/win7-64-nfury-c-drive.E01  (host "nfury", C: volume).
-- It is read-only. Do not modify it.
+- Case root: /cases/e2e-demo.
+- Audited raw image path inside the gateway: /cases/e2e-demo/evidence-raw/ewf1.
+- Original acquired E01: /cases/e2e-demo/evidence/win7-64-nfury-c-drive.E01.
+- The gateway raw path is a bind mount from host .ewfraw/ewf1. It does not
+  exist on the host or in this Claude agent container.
+- The image is a logical NTFS volume with no partition table. Use fsstat, fls,
+  istat, and icat; do not use mmls.
+- Evidence is read-only. Do not modify it.
 
 TOOLS & RULES
 - Run ALL forensic tools through the sift-mcp tool surface (the `sift` MCP server:
   forensic-mcp / sift-mcp / case-mcp / report-mcp). Use run_command for tool
   execution so every action is provenance-tracked; do not shell out to forensic
   binaries directly.
+- All evidence-touching operations MUST go through run_command. Do not use raw
+  Bash, ls, stat, Python, or local filesystem commands against evidence paths.
 - Consult your installed skills (sleuthkit, windows-artifacts, yara-hunting,
   plaso-timeline, memory-analysis) for the correct invocations and flags.
 - Your own Bash/Write/Edit are policy-gated and may escalate to a human — that is
   expected; adapt when a command is denied, don't fight it.
+- If an OPA denial includes structured feedback, read it and retry with corrected
+  arguments instead of repeating the blocked call.
 - `vhir --case e2e-demo …` is available for READ-ONLY orientation (case status,
   evidence list, audit summary). Do not approve, reject, or mutate the case —
   findings stage as DRAFT and a human approves them out of band.
@@ -444,11 +533,17 @@ METHOD (query forensic-mcp://investigation-framework first if available)
 2. Register the E01 as evidence in the case before analyzing it.
 3. For every substantive result, present it in this format and get conversational
    approval BEFORE calling record_finding:
-   Source | Extraction (tool + audit_id) | Content | Observation | Interpretation | Confidence
+   Source | Extraction (tool + command) | Content | Observation | Interpretation | Confidence
 4. record_finding for each substantive finding (anomaly, IOC, benign exclusion,
-   causal link, or evidence gap) — include audit_id, host, affected_account,
-   event_timestamp. After staging, delegate to the forensic-critic subagent to
-   verify the finding against raw tool output; correct or withdraw per its verdict.
+   causal link, or evidence gap). Use audit_ids: [] and supporting_commands with
+   command, purpose, and output_excerpt. Include host, affected_account, and
+   event_timestamp when known.
+   If record_finding rejects an audit_id, switch to supporting_commands. The
+   proxy hash chain is verified separately with agentcontainer audit verify
+   <session>-proxy.
+   After staging, delegate to the forensic-critic subagent to verify the finding
+   against raw tool output. Act on its verdict: fix, downgrade confidence, or
+   withdraw the finding.
 5. record_timeline_event for events that belong in the incident narrative
    (event_type, artifact_ref, related_findings).
 6. log_reasoning at decision points. Do not batch — record as you go.
@@ -497,9 +592,17 @@ PY
 Audit trails to show:
 - `cat ~/.ac/audit/e2e-demo.jsonl | tail` — the **guard** chain (the agent's own
   Bash/Write decisions, allow/deny/escalated, hash-linked).
-- `/cases/e2e-demo/audit/{sift,forensic,case}-mcp.jsonl` — the **platform** chain
-  (every forensic tool execution with provenance).
-- `~/.ac/mcp.log` — the proxy's policy/approval/audit for the `sift` tool surface.
+- `agentcontainer audit list` — find the proxy session produced by `mcp start`.
+- `agentcontainer audit show <session-id>-proxy` — the proxy chain for every
+  forensic tool call, including policy verdicts and correlation IDs.
+- `agentcontainer audit verify <session-id>-proxy` — the hash-chain proof that
+  the proxy record is intact.
+- `~/.ac/mcp.log` — the proxy's startup and policy/audit log for the `sift` tool
+  surface.
+
+Findings may show `provenance_grade: PARTIAL` when they use
+`supporting_commands` with `audit_ids: []`. That is expected for this proxy path:
+the proxy audit chain independently records the exact tool calls.
 
 The demo passes when: G1–G5 were green, `FRESH-BEFORE.txt` shows an empty case,
 the agent staged ≥1 finding + ≥1 timeline event through `sift-mcp`, a human
@@ -522,8 +625,8 @@ vhir --case e2e-demo backup ~/case-backups/e2e-demo-$(date -u +%Y%m%d)
 
 ## Known-uncertain integration points (this e2e is what flushes them out)
 
-These are the places most likely to need a fix during the first run — none are
-proven wired today; each has a gate above:
+These are the places most likely to need a fix during the first recorded
+containerized run. Each has a gate above:
 
 1. **Per-backend mount/env on the `sift` MCP tool** (1c) — if `tools.mcp.<name>`
    doesn't accept `mounts`/`env`, use the `type: remote` gateway fallback so the
@@ -535,8 +638,13 @@ proven wired today; each has a gate above:
 3. **Gateway has real binaries** (1c, G3b) — stock `sift-gateway:demo` ships none;
    `sift-gateway:e2e` adds TSK+YARA. Without this the agent cannot find anything.
 4. **vhir on PATH + case visibility in-container** (1d, G2) — venv symlink and
-   `VHIR_CASE_DIR`/`/cases` mount.
+   `VHIR_CASES_DIR`/`/cases` mount.
 5. **Auth** — supply a fresh `ANTHROPIC_API_KEY` (native `/run/secrets` path,
    exercises the enforcer SYS_PTRACE+chown fixes) or swap to
    `CLAUDE_CODE_OAUTH_TOKEN` via `exec -e` for a simpler demo.
-```
+6. **Finding provenance** — if `record_finding` rejects proxy `audit_ids`, use
+   `supporting_commands` with `audit_ids: []`. Verify the proxy evidence trail
+   with `agentcontainer audit verify <session-id>-proxy`.
+7. **Evidence path confusion** — `/cases/e2e-demo/evidence-raw/ewf1` exists only
+   inside the gateway. The host raw path is `/cases/e2e-demo/.ewfraw/ewf1`; the
+   Claude agent container should not inspect either path with raw Bash.
