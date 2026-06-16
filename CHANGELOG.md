@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.11](https://github.com/jlgore/agentcontainers/compare/v0.1.10...v0.1.11) (2026-06-16)
+
+
+### Bug Fixes
+
+* **forensic-e2e:** also chattr +i the evidence directory, not just the files ([#18](https://github.com/jlgore/agentcontainers/issues/18)) ([05437b2](https://github.com/jlgore/agentcontainers/commit/05437b210d16b94e991ab233e361e104ee8a2a67))
+
 ## [0.1.10](https://github.com/jlgore/agentcontainers/compare/v0.1.9...v0.1.10) (2026-06-16)
 
 
