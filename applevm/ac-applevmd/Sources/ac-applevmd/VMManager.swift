@@ -79,6 +79,12 @@ actor VMManager {
                 "-H", "tcp://0.0.0.0:2375",
                 "-H", "unix:///var/run/docker.sock",
             ]
+            // DOCKER_TLS_CERTDIR="" disables docker:dind's default auto-TLS so
+            // dockerd serves plain HTTP on :2375 (what the host bridge speaks).
+            config.process.environmentVariables = [
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "DOCKER_TLS_CERTDIR=",
+            ]
             config.process.workingDirectory = "/"
             config.process.capabilities = .allCapabilities
         }

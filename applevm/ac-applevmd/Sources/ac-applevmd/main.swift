@@ -23,7 +23,8 @@ let base = home.appendingPathComponent(".agentcontainers/applevm")
 
 let socketPath = env("AC_APPLEVM_API") ?? base.appendingPathComponent("applevmd.sock").path
 let kernelPath = env("AC_APPLEVM_KERNEL") ?? base.appendingPathComponent("kernel").path
-let dindImage = env("AC_APPLEVM_DIND_IMAGE") ?? "docker:dind"
+// Fully-qualified reference: the containerization OCI parser requires a domain.
+let dindImage = env("AC_APPLEVM_DIND_IMAGE") ?? "docker.io/library/docker:dind"
 let stateDir = URL(fileURLWithPath: env("AC_APPLEVM_STATE") ?? base.appendingPathComponent("vms").path)
 
 let manager = VMManager(kernelPath: kernelPath, dindImage: dindImage, stateDir: stateDir)

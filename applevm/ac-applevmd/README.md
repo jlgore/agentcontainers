@@ -36,11 +36,62 @@ swift build -c release
 # binary at .build/release/ac-applevmd
 ```
 
-## Run
+### Code signing (required)
+
+Any process that uses Virtualization.framework must carry the
+`com.apple.security.virtualization` entitlement. Ad-hoc signing is fine for
+local development:
 
 ```bash
-./.build/release/ac-applevmd
+codesign --force --sign - --timestamp=none \
+  --entitlements signing/vz.entitlements .build/release/ac-applevmd
 ```
+
+Re-sign after every rebuild.
+
+## Runtime prerequisites (one-time)
+
+1. **Kernel.** A Linux kernel image for the microVMs. The containerization
+   project points to the Kata Containers kernel:
+
+   ```bash
+   curl -SsL -o /tmp/kata.tar.xz \
+     https://github.com/kata-containers/kata-containers/releases/download/3.17.0/kata-static-3.17.0-arm64.tar.xz
+   tar -xf /tmp/kata.tar.xz -C /tmp
+   mkdir -p ~/.agentcontainers/applevm
+   cp -L /tmp/opt/kata/share/kata-containers/vmlinux.container ~/.agentcontainers/applevm/kernel
+   ```
+
+2. **vminit initfs.** Build `vminit:latest` into the local image store from a
+   checkout of apple/containerization at the **same revision** this package
+   pins (so the guest init matches the host library). This cross-compiles
+   `vminitd` via the Swift static Linux SDK — use `swiftly` to get a toolchain
+   that matches the SDK version (Xcode's Swift may be a point release ahead and
+   fail with a module-version mismatch):
+
+   ```bash
+   git clone https://github.com/apple/containerization.git && cd containerization
+   git checkout <pinned-revision>           # see Package.resolved
+   make -C vminitd cross-prep               # installs swiftly + Swift 6.3.0 + static SDK
+   make init                                # builds vminit:latest into the image store
+   ```
+
+   Because `ac-applevmd` runs as root (for vmnet, below), load `vminit:latest`
+   into **root's** image store — run `make init` (or the `cctl rootfs create`
+   step it invokes) under `sudo`.
+
+## Run
+
+`vmnet` networking and Virtualization.framework both require privilege, so run
+the daemon as root:
+
+```bash
+sudo ./.build/release/ac-applevmd
+```
+
+> **Verified end-to-end** on macOS 26.5.1 / Apple M4 / Swift 6.3.2: `POST /vm`
+> boots a `docker.io/library/docker:dind` microVM and the bridged socket serves
+> a live Docker Engine (29.5.3, linux/arm64, overlayfs).
 
 Configuration (all optional, via environment):
 

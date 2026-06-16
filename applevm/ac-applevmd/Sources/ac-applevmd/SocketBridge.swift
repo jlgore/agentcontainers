@@ -88,13 +88,21 @@ final class SocketBridge: @unchecked Sendable {
     }
 
     private static func relay(from: Int32, to: Int32) {
-        var buf = [UInt8](repeating: 0, count: 32 * 1024)
+        let bufSize = 32 * 1024
+        let buf = UnsafeMutableRawPointer.allocate(byteCount: bufSize, alignment: 1)
+        defer {
+            buf.deallocate()
+            // Unblock the paired relay reading the other direction so the
+            // connection tears down promptly instead of hanging on read().
+            shutdown(from, Int32(SHUT_RD))
+            shutdown(to, Int32(SHUT_WR))
+        }
         while true {
-            let n = read(from, &buf, buf.count)
+            let n = read(from, buf, bufSize)
             if n <= 0 { break }
             var off = 0
             while off < n {
-                let w = write(to, &buf[off], n - off)
+                let w = write(to, buf + off, n - off)
                 if w <= 0 { return }
                 off += w
             }
