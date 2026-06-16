@@ -386,6 +386,7 @@ func dialStdioContainer(ctx context.Context, deps Deps, name string, tool *confi
 		Image:        tool.Image,
 		Cmd:          tool.Command,
 		Env:          envList(tool.Env),
+		User:         tool.User,
 		OpenStdin:    true,
 		StdinOnce:    false,
 		AttachStdin:  true,
@@ -550,6 +551,7 @@ func dialHTTPContainer(ctx context.Context, deps Deps, name string, tool *config
 		Image: tool.Image,
 		Cmd:   tool.Command,
 		Env:   envList(tool.Env),
+		User:  tool.User,
 		Tty:   false,
 		Labels: map[string]string{
 			LabelRole:    RoleMCPBackend,

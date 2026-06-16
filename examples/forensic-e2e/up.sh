@@ -67,6 +67,24 @@ else
   warn "no .E01 in $CASE_DIR/evidence — assuming raw/dd evidence (skipping ewfmount)"
 fi
 
+# Evidence immutability. The gateway runs as the owner uid (1000) on a
+# read-write /cases (needed so case_init can create new cases), so neither the
+# mount nor DAC stops it from deleting/altering acquired evidence. Mark every
+# evidence file immutable: the gateway is launched CapDrop:["ALL"] → no
+# CAP_LINUX_IMMUTABLE → it cannot modify, delete, rename, or clear +i, even as
+# owner. This is the kernel-level evidence guarantee the proxy path relies on.
+# Idempotent (chattr +i on an already-immutable file is a no-op); needs sudo.
+CASES_DIR="$(dirname "$CASE_DIR")"
+shopt -s nullglob
+locked=0
+for f in "$CASE_DIR"/evidence/* "$CASES_DIR"/*.zip "$CASES_DIR"/*.E01 "$CASES_DIR"/*.dd "$CASES_DIR"/*.raw; do
+  [ -f "$f" ] || continue
+  if sudo chattr +i "$f" 2>/dev/null; then locked=$((locked + 1)); else warn "could not chattr +i $f (evidence not immutable!)"; fi
+done
+shopt -u nullglob
+ok "evidence marked immutable (chattr +i): $locked file(s) — capless gateway cannot clear it"
+# NOTE: removing a case later needs `sudo chattr -i <evidence>` first (by design).
+
 # The checked-in config references /cases/e2e-demo. If CASE_DIR differs, render a
 # copy with the case paths substituted so the run stays reproducible.
 CFG="$HERE/agentcontainer.json"

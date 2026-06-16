@@ -12,7 +12,14 @@
   // Adjust the /cases/e2e-demo paths and VHIR_* values for your case; this
   // mirrors the layout produced by the SIFT/Valhuntir tooling on the VM.
   "name": "sift-forensic-agent",
-  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  // The agent here is just the MCP-client placeholder — the forensic tooling
+  // lives in the sift gateway backend below. Any small base works. We use a
+  // Docker Hub image rather than mcr.microsoft.com/devcontainers/base:ubuntu
+  // because `agentcontainer run` re-fetches this image's manifest from its
+  // registry for org-policy extraction (fail-closed, no local-image fallback),
+  // and MCR intermittently returns 401/429 even when the image is already
+  // local — which aborts the whole bringup.
+  "image": "ubuntu:24.04",
   "agent": {
     "capabilities": {
       "filesystem": {
@@ -28,6 +35,13 @@
       }
     },
     "enforcer": {
+      // Pin the enforcer that carries the opt-in per-cgroup exec-enforcement
+      // fix. The default (kubedoll) image gates the gateway's sub-backend
+      // `python` exec under kernelPrimary with an empty allowlist → the gateway
+      // serves 0 tools ("Permission denied: /app/venv/bin/python"). The fix
+      // (EXEC flag bit, only set for a non-empty allowlist) ships in this image.
+      // Remove this override once the default image is rebuilt from that commit.
+      "image": "ghcr.io/jlgore/agentcontainer-enforcer:latest",
       // Development convenience for the demo VM. Remove for production, where
       // the managed enforcer runs ephemeral mTLS on loopback by default.
       "insecureDev": true,
@@ -49,10 +63,34 @@
           "transport": "http",
           "port": 4508,
           "path": "/mcp",
+          // Run the gateway as the examiner uid that owns the case skeleton on
+          // the host (sansforensics = 1000:1000). The proxy drops ALL Linux
+          // capabilities on backends, so a default-root process has no
+          // CAP_DAC_OVERRIDE and CANNOT write the case dir (owner/group 1000,
+          // mode 0775) — its findings/timeline/audit writes hit EACCES, which
+          // silently empties the case audit trail and breaks audit_id
+          // validation in record_finding. Running as 1000:1000 writes through
+          // normal owner permissions, keeps every created file examiner-owned
+          // to match the host skeleton, and needs no capability restored.
+          "user": "1000:1000",
           "mounts": [
-            // Case directory read-write (findings, timeline, extractions, audit)…
-            "/cases/e2e-demo:/cases/e2e-demo",
-            // …with the acquired evidence pinned read-only.
+            // Cases ROOT read-write so the policy-gated, audited case lifecycle
+            // (case_init creates a new case dir under VHIR_CASES_DIR) works.
+            //
+            // SECURITY NOTE — the gateway runs as the owner uid (1000), so on a
+            // read-write /cases it could in principle modify or DELETE acquired
+            // evidence (owner perms + directory-write allow unlink). Evidence
+            // immutability therefore does NOT rely on this mount or on DAC. It
+            // is enforced two ways: (1) the active case's evidence is re-pinned
+            // read-only below, and (2) up.sh runs `chattr +i` on every evidence
+            // file. The gateway is launched with CapDrop:["ALL"], so it lacks
+            // CAP_LINUX_IMMUTABLE and physically cannot modify, delete, rename,
+            // or clear the immutable bit on evidence — even as owner, even with
+            // /cases read-write. (Acquisition/registration must `chattr +i` new
+            // evidence; up.sh does it for this demo's images.)
+            "/cases:/cases",
+            // The active case's acquired evidence pinned read-only (mount-level
+            // EROFS, on top of the chattr +i immutability above).
             "/cases/e2e-demo/evidence:/cases/e2e-demo/evidence:ro",
             // The acquired image is EWF/E01, but this gateway's bundled
             // sleuthkit (Debian TSK 4.12.1 + libewf2) SEGFAULTS on libewf
