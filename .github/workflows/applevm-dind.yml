@@ -1,0 +1,81 @@
+# Builds the applevm microVM workload image with the agentcontainers enforcer
+# embedded: docker:dind + the enforcer image baked in (loaded into the in-VM
+# daemon on startup, so the enforcer sidecar runs without a ghcr pull). Built
+# for linux/arm64 (Apple silicon microVMs) and pushed to this repo's ghcr
+# namespace. Opt in at runtime with
+#   AC_APPLEVM_DIND_IMAGE=ghcr.io/<owner>/agentcontainer-applevm-dind
+# See applevm/dind-enforcer/README.md.
+name: applevm-dind-enforcer
+
+on:
+  workflow_dispatch:
+    inputs:
+      enforcer_ref:
+        description: enforcer image to embed (docker save'd with its tag preserved)
+        default: ghcr.io/kubedoll-heavy-industries/agentcontainer-enforcer:latest
+  push:
+    paths:
+      - applevm/dind-enforcer/**
+      - .github/workflows/applevm-dind.yml
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: applevm-dind-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ENFORCER_REF: ${{ inputs.enforcer_ref || 'ghcr.io/kubedoll-heavy-industries/agentcontainer-enforcer:latest' }}
+      IMAGE: ghcr.io/${{ github.repository_owner }}/agentcontainer-applevm-dind
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Save arm64 enforcer image into the build context
+        run: |
+          set -euo pipefail
+          # Pull the arm64 variant and save it with its tag preserved, so the
+          # in-VM `docker load` restores the exact ref the sidecar looks up.
+          docker pull --platform linux/arm64 "$ENFORCER_REF"
+          docker save "$ENFORCER_REF" -o applevm/dind-enforcer/enforcer.tar
+          ls -lh applevm/dind-enforcer/enforcer.tar
+
+      - uses: docker/metadata-action@v6
+        id: meta
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+
+      - uses: docker/build-push-action@v7
+        id: build
+        with:
+          context: applevm/dind-enforcer
+          file: applevm/dind-enforcer/Dockerfile
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Summary
+        run: |
+          echo "Built ${IMAGE} (linux/arm64) embedding ${ENFORCER_REF}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Digest: ${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Use: AC_APPLEVM_DIND_IMAGE=${IMAGE}@${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
