@@ -29,7 +29,7 @@ sessions are shown. Use --all to include stopped sessions.`,
 		},
 	}
 
-	cmd.Flags().StringVar(&runtime, "runtime", "docker", "Container runtime backend (auto|docker|compose|sandbox)")
+	cmd.Flags().StringVar(&runtime, "runtime", "docker", "Container runtime backend (auto|docker|compose|sandbox|applevm)")
 	cmd.Flags().BoolVarP(&all, "all", "a", false, "Include stopped sessions")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "Output machine-readable JSON")
 

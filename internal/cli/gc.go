@@ -33,7 +33,7 @@ cleaned without making changes.`,
 		},
 	}
 
-	cmd.Flags().StringVar(&runtime, "runtime", "docker", "Container runtime backend (docker|compose)")
+	cmd.Flags().StringVar(&runtime, "runtime", "docker", "Container runtime backend (docker|compose|sandbox|applevm)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be cleaned without removing anything")
 	cmd.Flags().BoolVarP(&force, "force", "f", false, "Skip confirmation prompt")
 	cmd.Flags().BoolVarP(&all, "all", "a", false, "Also remove running containers (default: only stopped)")
@@ -153,7 +153,7 @@ func isAgentcontainerSession(s *container.Session) bool {
 		return false
 	}
 	switch s.RuntimeType {
-	case container.RuntimeDocker, container.RuntimeCompose, container.RuntimeSandbox:
+	case container.RuntimeDocker, container.RuntimeCompose, container.RuntimeSandbox, container.RuntimeAppleVM:
 		return true
 	default:
 		return false

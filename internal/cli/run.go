@@ -60,7 +60,7 @@ It cannot be overridden at runtime.`,
 	cmd.Flags().BoolVarP(&detach, "detach", "d", false, "Run container in background")
 	cmd.Flags().DurationVar(&timeout, "timeout", 4*time.Hour, "Session timeout")
 	cmd.Flags().StringVarP(&configPath, "config", "c", "", "Path to agentcontainer.json")
-	cmd.Flags().StringVar(&runtimeFlag, "runtime", "docker", "Container runtime backend (auto|docker|compose|sandbox)")
+	cmd.Flags().StringVar(&runtimeFlag, "runtime", "docker", "Container runtime backend (auto|docker|compose|sandbox|applevm)")
 	cmd.Flags().BoolVar(&insecureSkipVerify, "insecure-skip-verify", false, "Skip cosign signature verification (dev only)")
 
 	return cmd
@@ -137,7 +137,10 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 		resolvedRuntime = container.DetectRuntime(container.DefaultSandboxProber)
 		logger.Info("runtime auto-detected", zap.String("runtime", string(resolvedRuntime)))
 	}
-	isSandbox := resolvedRuntime == container.RuntimeSandbox
+	// Both VM-isolated backends (Docker Sandbox and Apple containerization)
+	// manage their enforcer sidecar inside the VM, so host-level sidecar
+	// resolution is skipped for both.
+	isVMBackend := resolvedRuntime == container.RuntimeSandbox || resolvedRuntime == container.RuntimeAppleVM
 
 	// 1. Load and validate configuration.
 	cfg, cfgPath, err := loadConfig(configPath)
@@ -212,12 +215,13 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 	enfLevel := enforcement.LevelNone
 	var enfSource string
 
-	if isSandbox {
-		// Sandbox manages its own in-VM enforcer. Set enforcement level to
-		// LevelGRPC so the runtime knows to start the sidecar.
+	if isVMBackend {
+		// VM-isolated backends manage their own in-VM enforcer. Set enforcement
+		// level to LevelGRPC so the runtime knows to start the sidecar.
 		enfLevel = enforcement.LevelGRPC
 		enfSource = "in-vm"
-		logger.Info("sandbox runtime: in-VM enforcement, skipping host sidecar")
+		logger.Info("VM-isolated runtime: in-VM enforcement, skipping host sidecar",
+			zap.String("runtime", string(resolvedRuntime)))
 	} else {
 		sidecarHandle, enfAddr, err = resolveSidecar(cmd, cfg)
 		if err != nil {
@@ -325,8 +329,8 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 		return fmt.Errorf("run: starting container: %w", err)
 	}
 
-	// For sandbox, read enforcer address from the session (set by the runtime).
-	if isSandbox && session.EnforcerAddr != "" {
+	// For VM-isolated backends, read enforcer address from the session (set by the runtime).
+	if isVMBackend && session.EnforcerAddr != "" {
 		enfAddr = session.EnforcerAddr
 		_ = os.Setenv("AC_ENFORCER_ADDR", enfAddr)
 		logger.Info("in-VM enforcer address", zap.String("addr", enfAddr))
@@ -445,8 +449,8 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 	_, _ = fmt.Fprintf(out, "Container stopped\n")
 
 	// Stop managed sidecar after agent container is stopped.
-	// (Sandbox runtime manages its own sidecar teardown in Stop().)
-	if !isSandbox && sidecarHandle != nil && sidecarHandle.Managed {
+	// (VM-isolated runtimes manage their own sidecar teardown in Stop().)
+	if !isVMBackend && sidecarHandle != nil && sidecarHandle.Managed {
 		dockerCli, cliErr := client.New(client.FromEnv)
 		if cliErr == nil {
 			if stopErr := sidecar.StopSidecar(context.Background(), dockerCli, sidecarHandle); stopErr != nil {

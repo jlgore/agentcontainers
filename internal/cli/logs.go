@@ -31,7 +31,7 @@ If --follow is specified, logs are streamed continuously until interrupted.`,
 		},
 	}
 
-	cmd.Flags().StringVar(&runtime, "runtime", "docker", "Container runtime backend (auto|docker|compose|sandbox)")
+	cmd.Flags().StringVar(&runtime, "runtime", "docker", "Container runtime backend (auto|docker|compose|sandbox|applevm)")
 	cmd.Flags().BoolVarP(&follow, "follow", "f", false, "Stream logs continuously until interrupted")
 
 	return cmd

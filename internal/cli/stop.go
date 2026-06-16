@@ -26,7 +26,7 @@ If --force is specified, the container is killed with a shorter timeout.`,
 		},
 	}
 
-	cmd.Flags().StringVar(&runtime, "runtime", "docker", "Container runtime backend (auto|docker|compose|sandbox)")
+	cmd.Flags().StringVar(&runtime, "runtime", "docker", "Container runtime backend (auto|docker|compose|sandbox|applevm)")
 	cmd.Flags().BoolVar(&force, "force", false, "Force stop with shorter timeout")
 
 	return cmd

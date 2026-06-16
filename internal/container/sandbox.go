@@ -87,6 +87,14 @@ type SandboxRuntime struct {
 	sidecarStopper  sidecarStopperFunc
 	strategyFactory strategyFactory
 
+	// Runtime identity. These default to the Docker Sandbox values
+	// (RuntimeSandbox, vmNamePrefix, defaultTemplateImage) but are overridden
+	// by NewAppleVMRuntime so the same VM-over-Docker lifecycle drives both the
+	// sandboxd and ac-applevmd backends. See WithRuntimeIdentity.
+	runtimeType  RuntimeType
+	namePrefix   string
+	defaultImage string
+
 	mu                sync.Mutex
 	vmDockerClients   map[string]client.APIClient       // per-VM Docker clients keyed by VM name
 	vmSidecarHandles  map[string]*sidecar.SidecarHandle // per-VM sidecar handles
@@ -106,6 +114,28 @@ type sandboxOptions struct {
 	sidecarStarter  sidecarStarterFunc
 	sidecarStopper  sidecarStopperFunc
 	strategyFactory strategyFactory
+
+	runtimeType  RuntimeType
+	namePrefix   string
+	defaultImage string
+}
+
+// WithRuntimeIdentity overrides the runtime type, VM name prefix, and default
+// agent image used by the VM-over-Docker lifecycle. It lets a sibling backend
+// (e.g. the Apple containerization runtime) reuse SandboxRuntime while tagging
+// its sessions and VMs distinctly. Empty values are ignored (defaults retained).
+func WithRuntimeIdentity(rt RuntimeType, namePrefix, defaultImage string) SandboxOption {
+	return func(o *sandboxOptions) {
+		if rt != "" {
+			o.runtimeType = rt
+		}
+		if namePrefix != "" {
+			o.namePrefix = namePrefix
+		}
+		if defaultImage != "" {
+			o.defaultImage = defaultImage
+		}
+	}
 }
 
 // WithSandboxLogger sets the logger for the Sandbox runtime.
@@ -178,7 +208,10 @@ func WithStrategyFactory(f strategyFactory) SandboxOption {
 // connects to the sandboxd Unix socket.
 func NewSandboxRuntime(opts ...SandboxOption) (*SandboxRuntime, error) {
 	o := &sandboxOptions{
-		logger: zap.NewNop(),
+		logger:       zap.NewNop(),
+		runtimeType:  RuntimeSandbox,
+		namePrefix:   vmNamePrefix,
+		defaultImage: defaultTemplateImage,
 	}
 	for _, opt := range opts {
 		opt(o)
@@ -220,6 +253,9 @@ func NewSandboxRuntime(opts ...SandboxOption) (*SandboxRuntime, error) {
 		sidecarStarter:    starter,
 		sidecarStopper:    stopper,
 		strategyFactory:   sf,
+		runtimeType:       o.runtimeType,
+		namePrefix:        o.namePrefix,
+		defaultImage:      o.defaultImage,
 		vmDockerClients:   make(map[string]client.APIClient),
 		vmSidecarHandles:  make(map[string]*sidecar.SidecarHandle),
 		vmStrategies:      make(map[string]enforcement.Strategy),
@@ -233,7 +269,7 @@ func NewSandboxRuntime(opts ...SandboxOption) (*SandboxRuntime, error) {
 // extracted from the CreateVM response and used to create a per-VM Docker client
 // for subsequent Exec/Logs operations.
 func (s *SandboxRuntime) Start(ctx context.Context, cfg *config.AgentContainer, opts StartOptions) (*Session, error) {
-	vmName := vmNamePrefix + cfg.Name
+	vmName := s.namePrefix + cfg.Name
 
 	req := &sandbox.VMCreateRequest{
 		AgentName:    "shell",
@@ -292,7 +328,7 @@ func (s *SandboxRuntime) Start(ctx context.Context, cfg *config.AgentContainer, 
 	// Pull the agent template image and create the agent container inside the VM.
 	// The sandboxd API only creates the VM + Docker daemon; the agent container
 	// must be created explicitly, matching what `docker sandbox create shell` does.
-	templateImage := defaultTemplateImage
+	templateImage := s.defaultImage
 	if cfg.Image != "" {
 		templateImage = cfg.Image
 	}
@@ -473,7 +509,7 @@ func (s *SandboxRuntime) Start(ctx context.Context, cfg *config.AgentContainer, 
 	return &Session{
 		ContainerID:  resp.VMID,
 		Name:         vmName,
-		RuntimeType:  RuntimeSandbox,
+		RuntimeType:  s.runtimeType,
 		Status:       "running",
 		CreatedAt:    time.Now(),
 		EnforcerAddr: enforcerAddr,
@@ -669,7 +705,7 @@ func (s *SandboxRuntime) List(ctx context.Context, all bool) ([]*Session, error)
 
 	var sessions []*Session
 	for _, vm := range vms {
-		if !strings.HasPrefix(vm.VMName, vmNamePrefix) {
+		if !strings.HasPrefix(vm.VMName, s.namePrefix) {
 			continue
 		}
 		if !all && vm.Status != "running" && !vm.Active {
@@ -684,7 +720,7 @@ func (s *SandboxRuntime) List(ctx context.Context, all bool) ([]*Session, error)
 		sessions = append(sessions, &Session{
 			ContainerID: vm.VMID,
 			Name:        vm.VMName,
-			RuntimeType: RuntimeSandbox,
+			RuntimeType: s.runtimeType,
 			Status:      vm.Status,
 			CreatedAt:   createdAt,
 		})

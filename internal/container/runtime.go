@@ -27,6 +27,13 @@ const (
 	// RuntimeSandbox is the Docker Sandbox microVM backend for full agent
 	// isolation with a private Docker daemon.
 	RuntimeSandbox RuntimeType = "sandbox"
+
+	// RuntimeAppleVM is the Apple containerization microVM backend. It mirrors
+	// the Sandbox backend's contract — a helper daemon (ac-applevmd) boots a
+	// Linux microVM running a private Docker daemon and hands back its socket —
+	// but uses Apple's open-source containerization library instead of Docker
+	// Desktop's proprietary sandboxd. macOS 26 / Apple silicon only.
+	RuntimeAppleVM RuntimeType = "applevm"
 )
 
 // Runtime is the core abstraction for managing agent container lifecycles.

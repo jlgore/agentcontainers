@@ -50,7 +50,16 @@ func newRuntime(runtimeFlag string, log *zap.Logger, enfLevel enforcement.Level)
 			return nil, fmt.Errorf("creating sandbox runtime: %w", err)
 		}
 		return rt, nil
+	case container.RuntimeAppleVM:
+		rt, err := container.NewAppleVMRuntime(
+			container.WithAppleVMLogger(log),
+			container.WithAppleVMEnforcementLevel(enfLevel),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("creating applevm runtime: %w", err)
+		}
+		return rt, nil
 	default:
-		return nil, fmt.Errorf("unknown runtime %q (valid: auto, docker, compose, sandbox)", runtimeFlag)
+		return nil, fmt.Errorf("unknown runtime %q (valid: auto, docker, compose, sandbox, applevm)", runtimeFlag)
 	}
 }
