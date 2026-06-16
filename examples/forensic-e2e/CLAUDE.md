@@ -30,30 +30,46 @@ Do not use `mmls` for this image.
 
 ## Recording Findings
 
-When staging findings with `record_finding`, use `supporting_commands` for provenance:
+Cite the `audit_id` from each MCP tool response that produced your evidence. They
+persist to the case audit trail (`<case>/audit/*.jsonl`) and `record_finding`
+validates them there, so this is the primary, full-provenance path. Put
+`audit_ids` inside the `finding` dict:
 
 ```json
 {
-  "audit_ids": [],
-  "supporting_commands": [
-    {
-      "command": "fls -r /cases/e2e-demo/evidence-raw/ewf1",
-      "purpose": "Explain why this command supports the finding",
-      "output_excerpt": "Paste the relevant raw output excerpt"
-    }
-  ]
+  "title": "...",
+  "type": "finding",
+  "observation": "...",
+  "interpretation": "...",
+  "confidence": "HIGH",
+  "confidence_justification": "...",
+  "event_timestamp": "2012-04-06T13:43:21Z",
+  "audit_ids": ["sift-jgore-20260406-001"]
 }
 ```
 
-The proxy returns `audit_ids` in tool responses, but the gateway backend lifecycle does not persist those IDs into the case audit directory. `record_finding` cross-validates audit IDs against that directory and will reject them. Use `audit_ids: []` with `supporting_commands`; this produces `provenance_grade: PARTIAL`.
+For richer provenance, also pass the top-level `artifacts` parameter — each
+`{source, extraction, content, audit_id}`.
 
-This is expected. It is not an evidence gap. The proxy's own hash-chained audit trail, verified later with `agentcontainer audit verify <session>-proxy`, independently records every tool call with correlation IDs.
+Use `supporting_commands` (a top-level parameter, list of
+`{command, purpose, output_excerpt}`) ONLY for shell evidence that did not come
+through an MCP tool, so there is no `audit_id` to cite. That path yields
+`provenance_grade: PARTIAL` — prefer real `audit_ids` whenever the evidence came
+from a forensic MCP tool.
+
+The proxy also keeps its own hash-chained audit trail, verified later with
+`agentcontainer audit verify <session>-proxy`, recording every tool call with
+correlation IDs.
 
 ## Self-Correction
 
 If a tool call is denied by OPA policy, read the structured denial. It includes blocked flags and allowed alternatives. Correct the arguments and retry.
 
-If `record_finding` rejects an `audit_id`, switch to the `supporting_commands` path with `audit_ids: []`.
+If `record_finding` rejects an `audit_id` as "not found in audit trail", that's an
+infrastructure misconfiguration, not a normal case: the gateway's `VHIR_AUDIT_DIR`
+must point at `<case>/audit` (where `run_command` writes and `record_finding`
+reads). Flag it to the examiner rather than silently downgrading to
+`supporting_commands`.
 
 ## Forensic Critic
 
