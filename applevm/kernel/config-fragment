@@ -17,7 +17,17 @@ CONFIG_BPF_LSM=y
 # not activated). Extra tokens for LSMs not compiled in are ignored.
 CONFIG_LSM="bpf,yama,loadpin,safesetid,integrity"
 
+# BPF_LSM dependency chain (the minimal base config trims these):
+#   BPF_LSM depends on BPF_EVENTS + BPF_JIT + BPF_SYSCALL + SECURITY.
+#   BPF_EVENTS (def_bool) needs PERF_EVENTS (already y) and KPROBE/UPROBE_EVENTS,
+#   which in turn require the ftrace/tracing infrastructure (base has FTRACE off).
+CONFIG_BPF_JIT=y
+CONFIG_FTRACE=y
+CONFIG_KPROBES=y
+CONFIG_KPROBE_EVENTS=y
+CONFIG_UPROBE_EVENTS=y
+
 # BTF, so CO-RE eBPF/BPF-LSM programs load (needs pahole/dwarves at build time).
-CONFIG_DEBUG_INFO=y
+# The base selects CONFIG_DEBUG_INFO_NONE; choosing a DWARF format flips it.
 CONFIG_DEBUG_INFO_DWARF5=y
 CONFIG_DEBUG_INFO_BTF=y

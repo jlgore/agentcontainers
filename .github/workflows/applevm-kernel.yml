@@ -63,8 +63,8 @@ jobs:
           cp ../cz/kernel/config-arm64 .config
           ./scripts/kconfig/merge_config.sh -m -O . .config ../applevm/kernel/config-fragment
           make olddefconfig
-          echo '--- resolved options ---'
-          grep -E '^(CONFIG_SECURITY=|CONFIG_BPF_LSM=|CONFIG_DEBUG_INFO_BTF=|CONFIG_LSM=)' .config
+          echo '--- resolved options (BPF / LSM / tracing / BTF) ---'
+          grep -E '(BPF_LSM|BPF_JIT|BPF_EVENTS|BPF_SYSCALL|^CONFIG_SECURITY=|CONFIG_SECURITYFS|CONFIG_LSM=|FTRACE|KPROBE|UPROBE_EVENTS|PERF_EVENTS|DEBUG_INFO)' .config || true
           # Fail early if olddefconfig dropped anything we require.
           for opt in CONFIG_SECURITY=y CONFIG_BPF_LSM=y CONFIG_DEBUG_INFO_BTF=y; do
             grep -qx "$opt" .config || { echo "::error::missing $opt after olddefconfig"; exit 1; }
