@@ -1,0 +1,9 @@
+FRESH snapshot 2026-06-16T02:09:35Z
+evidence.json: absent
+findings.json: absent
+timeline.json: absent
+iocs.json: absent
+actions.jsonl: absent
+audit files: 0
+extractions: 0
+evidence:    win7-64-nfury-c-drive.E01 (immutable: i)

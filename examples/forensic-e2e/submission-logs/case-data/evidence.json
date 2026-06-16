@@ -1,0 +1,11 @@
+{
+  "files": [
+    {
+      "path": "/cases/e2e-demo/evidence/win7-64-nfury-c-drive.E01",
+      "sha256": "a5df0b38ec699656e8c9925ffa515945288aaa32cd29c284fb519cf06d1589c7",
+      "description": "Original acquired EWF image \u2014 Windows 7 x64 'nfury' C: drive (logical NTFS volume, no partition table). Acquired evidence under investigation in case e2e-demo.",
+      "registered_at": "2026-06-16T02:15:12.524410+00:00",
+      "registered_by": "jgore"
+    }
+  ]
+}

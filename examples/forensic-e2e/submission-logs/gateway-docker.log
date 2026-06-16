@@ -1,0 +1,410 @@
+INFO:     Started server process [1]
+INFO:     Waiting for application startup.
+{"ts": "2026-06-16T02:11:26.645850+00:00", "level": "INFO", "logger": "report_mcp.server", "message": "Starting report-mcp server", "service": "report-mcp"}
+{"ts": "2026-06-16T02:11:26.676097+00:00", "level": "INFO", "logger": "sift_gateway.backends.stdio_backend", "message": "Backend sift-mcp started (stdio)", "service": "sift-gateway"}
+{"ts": "2026-06-16T02:11:26.679190+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Started backend: sift-mcp", "service": "sift-gateway"}
+{"ts": "2026-06-16T02:11:26.716160+00:00", "level": "INFO", "logger": "case_mcp.server", "message": "Starting case-mcp server", "service": "case-mcp"}
+{"ts": "2026-06-16T02:11:26.739072+00:00", "level": "INFO", "logger": "sift_gateway.backends.stdio_backend", "message": "Backend forensic-mcp started (stdio)", "service": "sift-gateway"}
+{"ts": "2026-06-16T02:11:26.739376+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Started backend: forensic-mcp", "service": "sift-gateway"}
+{"ts": "2026-06-16T02:11:26.748863+00:00", "level": "INFO", "logger": "sift_gateway.backends.stdio_backend", "message": "Backend report-mcp started (stdio)", "service": "sift-gateway"}
+{"ts": "2026-06-16T02:11:26.749045+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Started backend: report-mcp", "service": "sift-gateway"}
+{"ts": "2026-06-16T02:11:26.836458+00:00", "level": "INFO", "logger": "sift_gateway.backends.stdio_backend", "message": "Backend case-mcp started (stdio)", "service": "sift-gateway"}
+{"ts": "2026-06-16T02:11:26.836706+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Started backend: case-mcp", "service": "sift-gateway"}
+Processing request of type ListToolsRequest
+Processing request of type ListToolsRequest
+Processing request of type ListToolsRequest
+Processing request of type ListToolsRequest
+{"ts": "2026-06-16T02:11:26.867799+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Tool map built: 55 tools across 4 backends", "service": "sift-gateway"}
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:4508 (Press CTRL+C to quit)
+INFO:     192.168.128.1:56390 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:56390 - "POST /mcp/ HTTP/1.1" 200 OK
+INFO:     192.168.128.1:56390 - "GET /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:56390 - "GET /mcp/ HTTP/1.1" 200 OK
+INFO:     192.168.128.1:56400 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:56400 - "POST /mcp/ HTTP/1.1" 202 Accepted
+INFO:     192.168.128.1:56400 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:56400 - "POST /mcp/ HTTP/1.1" 200 OK
+INFO:     192.168.128.1:35720 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:35720 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:12:36.880606+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool get_investigation_framework -> backend forensic-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:35720 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:35720 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:12:36.962374+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool case_status -> backend case-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:35720 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:35720 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:12:37.943278+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool evidence_list -> backend case-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:35720 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:35720 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:12:38.509283+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool get_case_metadata -> backend report-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:38960 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:38960 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:12:52.744611+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool evidence_register -> backend case-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:38960 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:38960 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:15:12.563218+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool log_reasoning -> backend case-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:38960 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:38960 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:15:12.601928+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool evidence_list -> backend case-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:48682 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:48682 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:15:21.503369+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool log_reasoning -> backend case-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:48682 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:48682 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:15:23.625534+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:47732 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:47732 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:15:34.655431+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:35016 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:35016 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:16:15.819788+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+{"ts": "2026-06-16T02:16:15.830010+00:00", "level": "WARNING", "logger": "sift_mcp.server", "message": "run_command unexpected error: ValueError: Blocked shell metacharacter in extra_args for bash", "service": "sift-mcp", "location": {"file": "/app/sift-mcp/packages/sift-mcp/src/sift_mcp/server.py", "line": 328, "function": "run_command"}}
+INFO:     192.168.128.1:54358 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:54358 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:16:23.753281+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:54358 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:54358 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:16:25.154195+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:54358 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:54358 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:16:26.036286+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:43522 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:43522 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:16:47.846226+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:43522 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:43522 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:16:49.744193+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:43522 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:43522 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:16:51.630017+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:35926 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:35926 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:17:24.019955+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:35926 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:35926 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:17:24.822995+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:42030 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:42030 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:18:04.214120+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool log_reasoning -> backend case-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:42030 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:42030 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:18:06.208683+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:42030 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:42030 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:18:07.424190+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:42030 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:42030 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:18:08.622146+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:49042 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:49042 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:18:31.344301+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool check_tools -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:54334 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:54334 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:18:41.737895+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:54334 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:54334 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:18:42.608091+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:39750 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:39750 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:19:00.910707+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool list_available_tools -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:39750 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:39750 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:19:01.611890+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool check_tools -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:53852 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:53852 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:19:17.400137+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:53852 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:53852 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:19:19.254256+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:53852 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:53852 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:19:21.166499+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:53852 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:53852 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:19:22.552433+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:53852 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:53852 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:19:23.896667+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:42134 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:42134 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:20:26.263980+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:42134 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:42134 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:20:28.141638+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:42134 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:42134 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:20:29.519568+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:34680 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:34680 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:22:01.463071+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool log_reasoning -> backend case-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:34680 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:34680 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:22:03.806093+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:34680 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:34680 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:22:05.214368+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:35328 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:35328 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:22:20.254471+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:35328 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:35328 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:22:22.139420+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:35328 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:35328 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:22:23.564053+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:57504 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:57504 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:22:46.501763+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:57504 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:57504 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:22:47.960542+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:57504 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:57504 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:22:49.381223+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:57504 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:57504 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:22:51.268366+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:57504 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:57504 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:22:52.386950+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:33000 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:33000 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:24:18.107599+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool record_finding -> backend forensic-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+{"ts": "2026-06-16T02:24:18.113349+00:00", "level": "ERROR", "logger": "forensic_mcp.server", "message": "record_finding failed: No active case. Run 'vhir case activate <id>' first.", "service": "forensic-mcp", "location": {"file": "/app/sift-mcp/packages/forensic-mcp/src/forensic_mcp/server.py", "line": 223, "function": "record_finding"}}
+INFO:     192.168.128.1:60786 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:60786 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:24:30.025545+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool case_activate -> backend case-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:32942 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:32942 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:24:45.878384+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool record_finding -> backend forensic-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:39766 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:39766 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:25:07.220253+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool record_finding -> backend forensic-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:57854 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:57854 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:29:02.193015+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool log_reasoning -> backend case-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:57854 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:57854 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:29:04.560759+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:57854 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:57854 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:29:07.189873+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:47682 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:47682 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:29:48.146930+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:47682 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:47682 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:29:49.517842+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:47682 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:47682 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:29:51.303861+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:44056 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:44056 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:30:16.549585+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:44056 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:44056 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:30:18.672310+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:46682 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:46682 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:30:43.228422+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:46682 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:46682 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:30:45.226210+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:46682 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:46682 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:30:46.235614+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:37048 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:37048 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:31:33.523810+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:38802 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:38802 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:31:49.220834+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:38804 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:38804 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:31:50.592487+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:38804 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:38804 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:31:52.068729+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:38804 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:38804 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:31:54.155310+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:47120 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:47120 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:32:09.096559+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:47120 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:47120 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:32:11.543038+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+{"ts": "2026-06-16T02:32:11.551917+00:00", "level": "WARNING", "logger": "sift_mcp.server", "message": "run_command unexpected error: ValueError: Blocked dangerous flag '-e' in extra_args for strings", "service": "sift-mcp", "location": {"file": "/app/sift-mcp/packages/sift-mcp/src/sift_mcp/server.py", "line": 328, "function": "run_command"}}
+INFO:     192.168.128.1:33624 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:33624 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:33:33.035463+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool record_finding -> backend forensic-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:44972 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:44972 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:33:55.811460+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool record_finding -> backend forensic-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:36626 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:36626 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:34:14.367850+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool record_finding -> backend forensic-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:38148 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:38148 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:34:29.945525+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool record_timeline_event -> backend forensic-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:38148 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:38148 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:34:30.827687+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool record_timeline_event -> backend forensic-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:33788 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:33788 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:35:22.665400+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:33788 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:33788 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:35:24.071188+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:33788 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:33788 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:35:25.498562+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:52366 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:52366 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:36:09.115183+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:52366 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:52366 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:36:10.984748+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:43322 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:43322 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:37:10.191655+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:43322 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:43322 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:37:11.861579+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:58552 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:58552 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:37:20.878658+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:51840 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:51840 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:37:30.211644+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:51840 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:51840 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:37:31.616621+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:57248 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:57248 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:37:54.835868+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:50138 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:50138 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:39:22.683528+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool record_finding -> backend forensic-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:32886 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:32886 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:39:31.240765+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool record_finding -> backend forensic-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:34742 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:34742 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:39:56.848357+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool record_finding -> backend forensic-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:35086 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:35086 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:40:10.253974+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool record_finding -> backend forensic-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:36746 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:36746 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:40:36.434240+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool case_status -> backend case-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:36762 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:36762 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:40:38.178990+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool get_timeline -> backend forensic-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:60044 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:60044 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:43:05.570091+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool log_reasoning -> backend case-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:60224 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:60224 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:43:17.904581+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool log_reasoning -> backend case-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:59058 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+INFO:     192.168.128.1:59058 - "POST /mcp/ HTTP/1.1" 200 OK
+{"ts": "2026-06-16T02:51:07.447686+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool run_command -> backend sift-mcp (examiner=jgore)", "service": "sift-gateway"}
+Processing request of type CallToolRequest
+INFO:     192.168.128.1:59070 - "POST /mcp HTTP/1.1" 307 Temporary Redirect
+{"ts": "2026-06-16T02:51:14.707245+00:00", "level": "INFO", "logger": "sift_gateway.server", "message": "Routing tool log_reasoning -> backend case-mcp (examiner=jgore)", "service": "sift-gateway"}
+INFO:     192.168.128.1:59070 - "POST /mcp/ HTTP/1.1" 200 OK
+Processing request of type CallToolRequest

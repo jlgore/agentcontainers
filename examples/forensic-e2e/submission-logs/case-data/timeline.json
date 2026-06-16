@@ -1,0 +1,207 @@
+[
+  {
+    "id": "T-jgore-001",
+    "timestamp": "2012-04-08",
+    "description": "System profile and time baseline: WKS-WIN764BITB, Windows 7 Ultimate SP1 x64, US Eastern (UTC-4 EDT)",
+    "source": "shell-jgore-20260616-001",
+    "event_type": "other",
+    "related_findings": [
+      "F-jgore-001"
+    ],
+    "auto_created_from": "F-jgore-001",
+    "status": "DRAFT",
+    "staged": "2026-06-16T02:24:45.888940+00:00",
+    "modified_at": "2026-06-16T02:24:45.888940+00:00",
+    "created_by": "jgore",
+    "examiner": "jgore",
+    "audit_ids": [
+      "shell-jgore-20260616-001",
+      "shell-jgore-20260616-002",
+      "shell-jgore-20260616-003",
+      "shell-jgore-20260616-004",
+      "shell-jgore-20260616-005"
+    ],
+    "content_hash": "9c1683b642e1a61ba5cd90cc94c37af63067ab91f5061688de8d27eedc60ed00"
+  },
+  {
+    "id": "T-jgore-002",
+    "timestamp": "2012-03-13T23:29:25Z",
+    "description": "Anomalous locally-created administrator account 'SRL-Helpdesk' (RID 1001) created 2012-03-13",
+    "source": "shell-jgore-20260616-006",
+    "event_type": "persistence",
+    "related_findings": [
+      "F-jgore-002"
+    ],
+    "auto_created_from": "F-jgore-002",
+    "status": "DRAFT",
+    "staged": "2026-06-16T02:25:07.230713+00:00",
+    "modified_at": "2026-06-16T02:25:07.230713+00:00",
+    "created_by": "jgore",
+    "examiner": "jgore",
+    "audit_ids": [
+      "shell-jgore-20260616-006",
+      "shell-jgore-20260616-007"
+    ],
+    "content_hash": "fdb4df7ae90f543f3cf1a7a065795a8644257dd3809a620c8f5e7f8eae3b5431"
+  },
+  {
+    "id": "T-jgore-003",
+    "timestamp": "2012-04-05T16:54:26Z",
+    "description": "Planted malware C:\\Windows\\System32\\spinlock.exe (PyInstaller/Python, timestomped) deployed 2012-04-05",
+    "source": "shell-jgore-20260616-008",
+    "event_type": "execution",
+    "related_findings": [
+      "F-jgore-003"
+    ],
+    "auto_created_from": "F-jgore-003",
+    "status": "DRAFT",
+    "staged": "2026-06-16T02:33:33.042092+00:00",
+    "modified_at": "2026-06-16T02:33:33.042092+00:00",
+    "created_by": "jgore",
+    "examiner": "jgore",
+    "audit_ids": [
+      "shell-jgore-20260616-008",
+      "shell-jgore-20260616-009",
+      "shell-jgore-20260616-010"
+    ],
+    "content_hash": "a0caa6ced6bfd09ce721ce72f5b89919059e86ed6743aa8c106d0020f5802464"
+  },
+  {
+    "id": "T-jgore-004",
+    "timestamp": "2012-04-05T13:01:00Z",
+    "description": "Persistence + execution: malicious HKLM Run key and two AT scheduled tasks (At1/At2) created 2012-04-05",
+    "source": "shell-jgore-20260616-011",
+    "event_type": "other",
+    "related_findings": [
+      "F-jgore-004"
+    ],
+    "auto_created_from": "F-jgore-004",
+    "status": "DRAFT",
+    "staged": "2026-06-16T02:33:55.815585+00:00",
+    "modified_at": "2026-06-16T02:33:55.815585+00:00",
+    "created_by": "jgore",
+    "examiner": "jgore",
+    "audit_ids": [
+      "shell-jgore-20260616-011",
+      "shell-jgore-20260616-012",
+      "shell-jgore-20260616-013"
+    ],
+    "content_hash": "39b947eaabf2eee7e03fcffc7eaf3bae779af34593c3896db8f51ef6f91dc55a"
+  },
+  {
+    "timestamp": "2012-04-05T13:47:00Z",
+    "description": "Scheduled task At2 set to run 'cmd /c c:\\windows\\system32\\dllhost\\svchost.exe' (masqueraded svchost payload). AT job, @AtServiceAccount, RunLevel HighestAvailable.",
+    "source": "System32\\Tasks\\At2 (icat MFT 92254)",
+    "event_type": "persistence",
+    "artifact_ref": "task:At2",
+    "related_findings": [
+      "F-jgore-004"
+    ],
+    "id": "T-jgore-005",
+    "status": "DRAFT",
+    "staged": "2026-06-16T02:34:29.950401+00:00",
+    "modified_at": "2026-06-16T02:34:29.950401+00:00",
+    "created_by": "jgore",
+    "examiner": "jgore",
+    "content_hash": "ca540332f0bb5ffdb034e3eddc7bc473bb116e5d2b683b77ffaba4f99ed8cf00"
+  },
+  {
+    "timestamp": "2012-04-05T17:53:13Z",
+    "description": "Malicious autostart Run value created: HKLM\\...\\Wow6432Node\\...\\Run 'svchost' = c:\\windows\\system32\\dllhost\\svchost.exe (key LastWrite).",
+    "source": "SOFTWARE hive Run key (RegRipper run plugin)",
+    "event_type": "persistence",
+    "artifact_ref": "regkey:Wow6432Run:svchost",
+    "related_findings": [
+      "F-jgore-004"
+    ],
+    "id": "T-jgore-006",
+    "status": "DRAFT",
+    "staged": "2026-06-16T02:34:30.830762+00:00",
+    "modified_at": "2026-06-16T02:34:30.830762+00:00",
+    "created_by": "jgore",
+    "examiner": "jgore",
+    "content_hash": "740f8a1c7f7830620a04c03123a0c6b56ded2f83ad6bda8d7308a3a4666e6f3a"
+  },
+  {
+    "id": "T-jgore-007",
+    "timestamp": "2012-04-04T20:00:47Z",
+    "description": "SRL-Helpdesk backdoor account interactive use: Computer Management, Remote Desktop, cmd (UserAssist ~2012-04-04)",
+    "source": "shell-jgore-20260616-017",
+    "event_type": "execution",
+    "related_findings": [
+      "F-jgore-006"
+    ],
+    "auto_created_from": "F-jgore-006",
+    "status": "DRAFT",
+    "staged": "2026-06-16T02:39:22.689624+00:00",
+    "modified_at": "2026-06-16T02:39:22.689624+00:00",
+    "created_by": "jgore",
+    "examiner": "jgore",
+    "audit_ids": [
+      "shell-jgore-20260616-017"
+    ],
+    "content_hash": "2f26ca245bb18e330c7d13339c0da9e20a616fb5f1055bf5facce8a4f99a2188"
+  },
+  {
+    "id": "T-jgore-008",
+    "timestamp": "2012-04-07T18:50:55Z",
+    "description": "USB mass-storage device (HP v100w) connected 2012-04-07, day before acquisition",
+    "source": "shell-jgore-20260616-018",
+    "event_type": "other",
+    "related_findings": [
+      "F-jgore-007"
+    ],
+    "auto_created_from": "F-jgore-007",
+    "status": "DRAFT",
+    "staged": "2026-06-16T02:39:31.245540+00:00",
+    "modified_at": "2026-06-16T02:39:31.245540+00:00",
+    "created_by": "jgore",
+    "examiner": "jgore",
+    "audit_ids": [
+      "shell-jgore-20260616-018"
+    ],
+    "content_hash": "33db7a4bfff73a2e33caee1551a259ca3181f071f5f27c23c72a61163c90141b"
+  },
+  {
+    "id": "T-jgore-009",
+    "timestamp": "2012-04-05T16:54:26Z",
+    "description": "IOC sweep: custom YARA rule detects spinlock.exe; anti-forensics (BCWipe) present; chrome_updater.exe initial-access lead",
+    "source": "shell-jgore-20260616-019",
+    "event_type": "execution",
+    "related_findings": [
+      "F-jgore-008"
+    ],
+    "auto_created_from": "F-jgore-008",
+    "status": "DRAFT",
+    "staged": "2026-06-16T02:39:56.857795+00:00",
+    "modified_at": "2026-06-16T02:39:56.857795+00:00",
+    "created_by": "jgore",
+    "examiner": "jgore",
+    "audit_ids": [
+      "shell-jgore-20260616-019",
+      "shell-jgore-20260616-020"
+    ],
+    "content_hash": "c7d5d81f6c9a21b9709883c6df03d3b331b3995abdf46aea3646358b6c95fec2"
+  },
+  {
+    "id": "T-jgore-010",
+    "timestamp": "2012-04-08",
+    "description": "Evidence/tooling gaps: Windows event logs unparsed (no EVTX parser); Security.evtx small; C2 packed",
+    "source": "shell-jgore-20260616-021",
+    "event_type": "other",
+    "related_findings": [
+      "F-jgore-009"
+    ],
+    "auto_created_from": "F-jgore-009",
+    "status": "DRAFT",
+    "staged": "2026-06-16T02:40:10.260546+00:00",
+    "modified_at": "2026-06-16T02:40:10.260546+00:00",
+    "created_by": "jgore",
+    "examiner": "jgore",
+    "audit_ids": [
+      "shell-jgore-20260616-021",
+      "shell-jgore-20260616-022"
+    ],
+    "content_hash": "383b0179fb9b107fe538b90ec78d42213829f2fa5f606a335cdc8049901a5541"
+  }
+]

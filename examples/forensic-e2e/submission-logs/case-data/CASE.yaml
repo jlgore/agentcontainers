@@ -1,0 +1,7 @@
+id: e2e-demo
+case_id: e2e-demo
+name: "E2E Forensic Demo — win7-64 nfury"
+status: open
+examiner: jgore
+created_at: "2026-06-15T00:00:00Z"
+description: "Win7-64 nfury C: drive triage via agentcontainers forensic-e2e (proxy path)"

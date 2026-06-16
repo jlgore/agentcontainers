@@ -1,0 +1,19 @@
+### enforcer diagnose ###
+agentcontainer-enforcer diagnostics
+──────────────────────────────────────────────────
+  Platform               [INFO] linux/amd64
+  Kernel Version         [PASS] 6.8.0-124-generic
+  Cgroup Version         [PASS] cgroup2 (unified)
+  BPF Support            [PASS] /sys/fs/bpf available
+  BPF LSM                [PASS] bpf active (lsm=lockdown,capability,landlock,yama,apparmor,bpf)
+  Nested Container       [PASS] not detected
+  Enforcer Health        [WARN] not reachable at 127.0.0.1:50051 — start with: agentcontainer enforcer start
+──────────────────────────────────────────────────
+Result: 1 WARN — BPF enforcement may be degraded
+
+### enforcer status ###
+Container:  a2b216c3351c
+Status:     running
+Port:       50051/tcp -> 50051
+Uptime:     50m31s
+Health:     UNHEALTHY
