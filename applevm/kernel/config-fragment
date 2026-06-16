@@ -1,0 +1,23 @@
+# agentcontainers / applevm kernel config fragment
+#
+# Merged onto apple/containerization's kernel/config-arm64 (the base config for
+# the microVM kernel) via scripts/kconfig/merge_config.sh; the build then runs
+# `make olddefconfig` to resolve dependencies.
+#
+# Purpose: the stock containerization kernel and the Kata 3.17.0 kernel both
+# lack CONFIG_BPF_LSM and BTF, so the agentcontainers eBPF/BPF-LSM enforcer
+# cannot attach its LSM hooks inside the microVM (verified via /proc/config.gz
+# and the absent /sys/kernel/btf/vmlinux). These options close that gap.
+
+# LSM framework + BPF-LSM (the base config has CONFIG_SECURITY unset).
+CONFIG_SECURITY=y
+CONFIG_SECURITYFS=y
+CONFIG_BPF_LSM=y
+# Make sure the bpf LSM is initialized at boot (unlisted-but-compiled LSMs are
+# not activated). Extra tokens for LSMs not compiled in are ignored.
+CONFIG_LSM="bpf,yama,loadpin,safesetid,integrity"
+
+# BTF, so CO-RE eBPF/BPF-LSM programs load (needs pahole/dwarves at build time).
+CONFIG_DEBUG_INFO=y
+CONFIG_DEBUG_INFO_DWARF5=y
+CONFIG_DEBUG_INFO_BTF=y

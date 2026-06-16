@@ -1,0 +1,97 @@
+# Builds a Linux kernel for the applevm microVM backend with CONFIG_BPF_LSM +
+# BTF enabled, so the agentcontainers eBPF/BPF-LSM enforcer can attach inside
+# the VM. This is a pure Linux cross-compile (arm64) — it does NOT need macOS;
+# the Mac is only needed to *run* the resulting kernel under Apple
+# Virtualization.framework. Download the `ac-applevm-vmlinux` artifact and point
+# AC_APPLEVM_KERNEL at it. See applevm/kernel/README.md.
+name: applevm-kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      containerization_ref:
+        description: apple/containerization ref (kernel version + base config)
+        default: e29657b86e10
+  push:
+    paths:
+      - applevm/kernel/**
+      - .github/workflows/applevm-kernel.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: applevm-kernel-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      ARCH: arm64
+      CROSS_COMPILE: aarch64-linux-gnu-
+      CZ_REF: ${{ github.event.inputs.containerization_ref || 'e29657b86e10' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install kernel build toolchain (+ pahole/dwarves for BTF)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libelf-dev libssl-dev \
+            gcc-aarch64-linux-gnu dwarves cpio xz-utils python3 kmod
+          echo "pahole: $(pahole --version)"
+
+      - name: Fetch apple/containerization kernel base (pinned)
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/apple/containerization.git cz
+          git -C cz checkout "$CZ_REF"
+          # Kernel source URL is declared in their kernel Makefile.
+          KSOURCE=$(grep -E '^KSOURCE' cz/kernel/Makefile | sed 's/^[^=]*=[[:space:]]*//')
+          echo "KSOURCE=$KSOURCE" >> "$GITHUB_ENV"
+          echo "Using kernel source: $KSOURCE"
+
+      - name: Fetch and unpack kernel source
+        run: |
+          curl -SsL -o source.tar.xz "$KSOURCE"
+          mkdir -p kbuild
+          tar -xf source.tar.xz -C kbuild --strip-components=1
+
+      - name: Compose config (containerization base + BPF_LSM/BTF fragment)
+        working-directory: kbuild
+        run: |
+          cp ../cz/kernel/config-arm64 .config
+          ./scripts/kconfig/merge_config.sh -m -O . .config ../applevm/kernel/config-fragment
+          make olddefconfig
+          echo '--- resolved options ---'
+          grep -E '^(CONFIG_SECURITY=|CONFIG_BPF_LSM=|CONFIG_DEBUG_INFO_BTF=|CONFIG_LSM=)' .config
+          # Fail early if olddefconfig dropped anything we require.
+          for opt in CONFIG_SECURITY=y CONFIG_BPF_LSM=y CONFIG_DEBUG_INFO_BTF=y; do
+            grep -qx "$opt" .config || { echo "::error::missing $opt after olddefconfig"; exit 1; }
+          done
+
+      - name: Build kernel
+        working-directory: kbuild
+        run: |
+          make -j"$(nproc)" LOCALVERSION=-ac-applevm Image
+          cp arch/arm64/boot/Image ../vmlinux
+
+      - name: Verify BTF section is present in vmlinux
+        working-directory: kbuild
+        run: |
+          # The unstripped vmlinux carries a .BTF section when BTF generation
+          # (pahole) succeeded. The bootable Image embeds the same data.
+          if readelf -S vmlinux | grep -q '\.BTF'; then
+            echo "BTF section present ✓"
+          else
+            echo "::error::no .BTF section in vmlinux — BTF generation failed"; exit 1
+          fi
+
+      - name: Upload kernel + config
+        uses: actions/upload-artifact@v4
+        with:
+          name: ac-applevm-vmlinux
+          path: |
+            vmlinux
+            kbuild/.config
+          if-no-files-found: error
