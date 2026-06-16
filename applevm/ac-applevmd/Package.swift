@@ -16,9 +16,13 @@ let package = Package(
     ],
     dependencies: [
         // Apple containerization: the microVM + OCI runtime library.
-        // Pin to a tag once you settle on a version; main is used here for the
-        // initial spike.
-        .package(url: "https://github.com/apple/containerization.git", branch: "main"),
+        // Pinned to a specific revision for reproducible builds. This is the
+        // commit the daemon is built and API-verified against (dialVsock,
+        // Mount.share(options:)). Bump deliberately, not implicitly via `main`.
+        // NB: this is the *library* pin and is independent of the kernel
+        // base-config ref in .github/workflows/applevm-kernel.yml.
+        .package(url: "https://github.com/apple/containerization.git",
+                 revision: "1437c67f5a07cb39e8f5e79d0b5aeac0327932bd"),
         // SwiftNIO: robust HTTP/1 server over a unix domain socket.
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
     ],

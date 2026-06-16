@@ -1,27 +1,33 @@
 import Foundation
+import Containerization
 #if canImport(Darwin)
 import Darwin
 #endif
 
 // SocketBridge accepts connections on a host unix domain socket and proxies each
-// one to a TCP endpoint (the in-VM dockerd at <vm-ip>:2375). It is a thin,
-// dependency-free byte pump: one accept loop, two relay threads per connection.
+// one to a guest **vsock** port (the in-VM relay fronting dockerd's
+// /var/run/docker.sock). It is a thin, dependency-free byte pump: one accept
+// loop, two relay directions per connection.
 //
 // This exists because the Go client expects a `unix://` Docker endpoint
 // (SandboxRuntime dials `unix://<socketPath>`), while dockerd inside the VM is
-// reachable over TCP on the vmnet interface.
+// reachable only over the hypervisor-mediated vsock channel — never over TCP on
+// vmnet. vsock is point-to-point between this host process (which owns the
+// VZVirtualMachine) and the guest kernel: no IP, no routing, no other host
+// process can reach it. The upstream dial uses
+// LinuxContainer.dialVsock(port:), which returns a connected FileHandle.
 final class SocketBridge: @unchecked Sendable {
     private let hostSocketPath: String
-    private let targetHost: String
-    private let targetPort: Int
+    private let container: LinuxContainer
+    private let vsockPort: UInt32
     private var listenFD: Int32 = -1
     private var running = false
     private let queue = DispatchQueue(label: "ac-applevmd.bridge", attributes: .concurrent)
 
-    init(hostSocketPath: String, targetHost: String, targetPort: Int) {
+    init(hostSocketPath: String, container: LinuxContainer, vsockPort: UInt32) {
         self.hostSocketPath = hostSocketPath
-        self.targetHost = targetHost
-        self.targetPort = targetPort
+        self.container = container
+        self.vsockPort = vsockPort
     }
 
     func start() throws {
@@ -54,6 +60,10 @@ final class SocketBridge: @unchecked Sendable {
             close(fd)
             throw DaemonError.internalError("bind(\(hostSocketPath)) failed")
         }
+        // Restrict the per-VM docker socket to the daemon's user. It is a
+        // root-equivalent Docker control channel; anyone who can connect gets
+        // full API access, so deny group/other.
+        chmod(hostSocketPath, 0o600)
         guard listen(fd, 64) == 0 else {
             close(fd)
             throw DaemonError.internalError("listen() failed")
@@ -76,22 +86,37 @@ final class SocketBridge: @unchecked Sendable {
                 if running { continue }
                 break
             }
-            queue.async { [weak self] in self?.handle(clientFD: clientFD) }
+            handle(clientFD: clientFD)
         }
     }
 
     private func handle(clientFD: Int32) {
-        guard let upstreamFD = SocketBridge.dialTCP(host: targetHost, port: targetPort) else {
-            close(clientFD)
-            return
-        }
-        // Relay both directions; when either side closes, tear both down.
-        let group = DispatchGroup()
-        queue.async(group: group) { SocketBridge.relay(from: clientFD, to: upstreamFD) }
-        queue.async(group: group) { SocketBridge.relay(from: upstreamFD, to: clientFD) }
-        group.notify(queue: queue) {
-            close(clientFD)
-            close(upstreamFD)
+        // dialVsock is async; hop onto a Task to open the guest connection, then
+        // pump bytes on the concurrent queue. The FileHandle owns the connected
+        // fd and is kept alive until both relay directions finish — closing it
+        // (not a bare close()) tears the vsock connection down exactly once.
+        let container = self.container
+        let port = self.vsockPort
+        let queue = self.queue
+        Task {
+            let upstream: FileHandle
+            do {
+                upstream = try await container.dialVsock(port: port)
+            } catch {
+                close(clientFD)
+                return
+            }
+            let upstreamFD = upstream.fileDescriptor
+            let group = DispatchGroup()
+            queue.async(group: group) { SocketBridge.relay(from: clientFD, to: upstreamFD) }
+            queue.async(group: group) { SocketBridge.relay(from: upstreamFD, to: clientFD) }
+            group.notify(queue: queue) {
+                close(clientFD)
+                // Closing the FileHandle closes upstreamFD; do NOT close(upstreamFD)
+                // separately or we double-close. Capturing `upstream` here is what
+                // keeps it (and its fd) alive for the connection's lifetime.
+                try? upstream.close()
+            }
         }
     }
 
@@ -115,34 +140,5 @@ final class SocketBridge: @unchecked Sendable {
                 off += w
             }
         }
-    }
-
-    static func dialTCP(host: String, port: Int) -> Int32? {
-        var hints = addrinfo()
-        hints.ai_family = AF_UNSPEC
-        hints.ai_socktype = SOCK_STREAM
-        var res: UnsafeMutablePointer<addrinfo>?
-        guard getaddrinfo(host, String(port), &hints, &res) == 0, let info = res else { return nil }
-        defer { freeaddrinfo(res) }
-        var ai: UnsafeMutablePointer<addrinfo>? = info
-        while let cur = ai {
-            let fd = socket(cur.pointee.ai_family, cur.pointee.ai_socktype, cur.pointee.ai_protocol)
-            if fd >= 0 {
-                if connect(fd, cur.pointee.ai_addr, cur.pointee.ai_addrlen) == 0 {
-                    return fd
-                }
-                close(fd)
-            }
-            ai = cur.pointee.ai_next
-        }
-        return nil
-    }
-
-    static func canConnect(host: String, port: Int) -> Bool {
-        if let fd = dialTCP(host: host, port: port) {
-            close(fd)
-            return true
-        }
-        return false
     }
 }

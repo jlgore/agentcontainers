@@ -13,6 +13,12 @@ import Foundation
 
 let version = "0.1.0"
 
+// Fixed guest vsock port where the in-VM relay fronts /var/run/docker.sock.
+// The host dials this via LinuxContainer.dialVsock(port:); the guest side is a
+// socat VSOCK-LISTEN started by dind-enforcer/dockerd-entrypoint.sh. This value
+// MUST match the VSOCK-LISTEN port there (131072 == 0x20000).
+let dockerdVsockPort: UInt32 = 0x20000
+
 func env(_ key: String) -> String? {
     let v = ProcessInfo.processInfo.environment[key]
     return (v?.isEmpty ?? true) ? nil : v

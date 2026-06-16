@@ -16,8 +16,8 @@ agentcontainer run --runtime=applevm
         │  unix:///~/.agentcontainers/applevm/applevmd.sock
         ▼
    ac-applevmd  ──(Apple containerization)──►  Linux microVM
-        │                                          └─ dockerd (docker:dind)
-        │  per-VM host unix socket  ◄── TCP proxy ──┘   (TCP :2375 on vmnet IP)
+        │                                          └─ dockerd (unix socket only)
+        │  per-VM host unix socket  ◄── vsock proxy ──┘  (socat VSOCK-LISTEN in VM)
         ▼
    moby Docker client  ──►  agent container created inside the VM
 ```
@@ -161,10 +161,44 @@ silently worked around:
    Network egress policy is a follow-up.
 3. **Credential / service-auth injection** fields on `POST /vm` are accepted but
    not yet enforced.
-4. **Docker exposure.** dockerd is reached over TCP `:2375` on the VM's vmnet
-   interface and bridged to a host unix socket. A more locked-down design keeps
-   dockerd on a vsock port and bridges via `LinuxContainer.dialVsock(port:)`;
-   left as a follow-up.
+
+## Security model (Docker control channel)
+
+dockerd inside each VM listens **only** on its unix socket. The host reaches the
+Docker API over **vsock**, not TCP on vmnet:
+
+- In the VM, a `socat VSOCK-LISTEN:131072,fork UNIX-CONNECT:/var/run/docker.sock`
+  relay (started by `dind-enforcer/dockerd-entrypoint.sh` once dockerd is ready)
+  fronts the Docker socket on a fixed vsock port.
+- On the host, `SocketBridge` accepts on the per-VM unix socket and proxies each
+  connection over `LinuxContainer.dialVsock(port: 0x20000)`. vsock is mediated
+  by the hypervisor: no IP, no routing table, and no other host process can
+  reach it — unlike the previous unauthenticated `tcp://0.0.0.0:2375` listener
+  on the shared vmnet subnet.
+- `DOCKER_TLS_CERTDIR=""` is kept set deliberately: docker:dind defaults it to
+  `/certs` when unset and auto-adds a `tcp://0.0.0.0:2376 --tlsverify` listener
+  on vmnet. Empty disables that, keeping dockerd unix-only.
+
+Other hardening:
+
+- **Control + per-VM sockets** are `chmod 0600` after bind, inside a `0700`
+  parent directory; the control socket bind refuses to follow a planted symlink.
+- **`vm_name`** is validated against `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` before
+  it reaches any filesystem path (path-traversal guard).
+- **Request bodies** on the control API are capped at 1 MiB (413 otherwise).
+- **Read-only mounts**: `POST /vm` `mounts[].readonly` shares the host path into
+  the VM with virtiofs `options:["ro"]`. The Go runtime sets this for read-only
+  config/evidence mounts; the workspace stays read-write. Runtime-socket mounts
+  (`docker.sock`, etc.) are rejected on the Go side (ESC-2).
+
+### Remaining gaps
+
+- **No MITM egress proxy.** `/network/proxyconfig` is accepted but is a no-op,
+  and `ca_cert_data` is returned empty (the Go side then skips CA injection).
+  Network egress policy is a follow-up.
+- **`SO_PEERCRED`/`LOCAL_PEERCRED`** UID checking on accepted control-socket
+  connections is not implemented; the `0600`/`0700` permissions are the current
+  access control. Peer-credential verification is the long-term fix.
 
 ## Source layout
 
@@ -174,7 +208,7 @@ silently worked around:
 | `HTTPServer.swift`| SwiftNIO HTTP/1 server over the unix socket. |
 | `Router.swift`    | Method+path → `VMManager` dispatch, JSON encoding. |
 | `VMManager.swift` | microVM lifecycle via containerization; the host-socket bridges. |
-| `SocketBridge.swift` | host unix socket → in-VM dockerd TCP proxy. |
+| `SocketBridge.swift` | host unix socket → in-VM dockerd over vsock (`dialVsock`). |
 | `Models.swift`    | Codable wire models (mirror `internal/sandbox/types.go`). |
 
 > **Note for implementers:** lines marked `// VERIFY:` in `VMManager.swift` use

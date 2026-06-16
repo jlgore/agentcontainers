@@ -331,6 +331,114 @@ func TestSandboxRuntime_Start_DockerClientError(t *testing.T) {
 	}
 }
 
+// TestSandboxRuntime_Start_MountsWiredReadOnly verifies that configured host
+// mounts are shared into the VM via req.Mounts with the read-only flag honored
+// (bind mounts only), and named volumes are not shared into the VM. We stop the
+// flow at the docker-client step (failing factory) so no real Docker is needed;
+// req.Mounts is fully populated by then.
+func TestSandboxRuntime_Start_MountsWiredReadOnly(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+
+	var captured *sandbox.VMCreateRequest
+	mock := &mockSandboxAPI{
+		createVMFn: func(_ context.Context, req *sandbox.VMCreateRequest) (*sandbox.VMCreateResponse, error) {
+			captured = req
+			return &sandbox.VMCreateResponse{
+				VMID:     "vm-mounts",
+				VMConfig: sandbox.VMConfig{SocketPath: "/tmp/sandboxes/vm-mounts/docker.sock"},
+				Started:  true,
+			}, nil
+		},
+		deleteVMFn: func(_ context.Context, _ string) error { return nil },
+	}
+
+	rt, err := NewSandboxRuntime(
+		WithSandboxLogger(logger),
+		WithSandboxClient(mock),
+		WithDockerClientFactory(failingDockerFactory(fmt.Errorf("stop here"))),
+	)
+	if err != nil {
+		t.Fatalf("NewSandboxRuntime: %v", err)
+	}
+
+	cfg := &config.AgentContainer{
+		Name: "mounts",
+		Mounts: []string{
+			"source=/host/evidence,target=/evidence,readonly",
+			"source=/host/rw,target=/rw",
+			"type=volume,source=myvolume,target=/vol", // not a host path, must not be VM-shared
+		},
+	}
+
+	_, err = rt.Start(context.Background(), cfg, StartOptions{WorkspacePath: "/ws"})
+	if err == nil {
+		t.Fatal("expected error from failing docker factory, got nil")
+	}
+	if captured == nil {
+		t.Fatal("CreateVM was not called")
+	}
+
+	// Only the two bind mounts should be shared into the VM (identity path).
+	bySource := map[string]sandbox.SandboxMount{}
+	for _, m := range captured.Mounts {
+		bySource[m.Source] = m
+	}
+	if len(captured.Mounts) != 2 {
+		t.Fatalf("expected 2 VM-shared bind mounts, got %d: %+v", len(captured.Mounts), captured.Mounts)
+	}
+	ev, ok := bySource["/host/evidence"]
+	if !ok {
+		t.Fatal("evidence bind mount not shared into VM")
+	}
+	if ev.Target != "/host/evidence" {
+		t.Errorf("VM share should be identity path, got target %q", ev.Target)
+	}
+	if !ev.ReadOnly {
+		t.Error("evidence mount should be read-only in the VM share")
+	}
+	if rw, ok := bySource["/host/rw"]; !ok || rw.ReadOnly {
+		t.Errorf("rw mount should be present and writable, got %+v (ok=%v)", rw, ok)
+	}
+	if _, ok := bySource["myvolume"]; ok {
+		t.Error("named volume must not be shared into the VM")
+	}
+}
+
+// TestSandboxRuntime_Start_RejectsDockerSockMount verifies the ESC-2 guard:
+// mounting a runtime socket into the sandbox is refused before VM creation.
+func TestSandboxRuntime_Start_RejectsDockerSockMount(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+
+	var createVMCalled bool
+	mock := &mockSandboxAPI{
+		createVMFn: func(_ context.Context, _ *sandbox.VMCreateRequest) (*sandbox.VMCreateResponse, error) {
+			createVMCalled = true
+			return &sandbox.VMCreateResponse{Started: true}, nil
+		},
+	}
+
+	rt, err := NewSandboxRuntime(
+		WithSandboxLogger(logger),
+		WithSandboxClient(mock),
+	)
+	if err != nil {
+		t.Fatalf("NewSandboxRuntime: %v", err)
+	}
+
+	cfg := &config.AgentContainer{
+		Name:   "escape",
+		Mounts: []string{"source=/var/run/docker.sock,target=/var/run/docker.sock"},
+	}
+
+	_, err = rt.Start(context.Background(), cfg, StartOptions{})
+	if err == nil {
+		t.Fatal("expected error for docker.sock mount, got nil")
+	}
+	if createVMCalled {
+		t.Error("CreateVM must not be called when a forbidden mount is present")
+	}
+}
+
 func TestSandboxRuntime_Stop(t *testing.T) {
 	var stopCalled, deleteCalled bool
 	mock := &mockSandboxAPI{

@@ -2,6 +2,9 @@ import Foundation
 import NIOCore
 import NIOPosix
 import NIOHTTP1
+#if canImport(Darwin)
+import Darwin
+#endif
 
 // HTTPServer serves the sandboxd-shaped control API over a unix domain socket
 // using SwiftNIO. Routes are dispatched to VMManager. Responses are JSON.
@@ -37,16 +40,29 @@ final class HTTPServer {
                 }
             }
         let channel = try bootstrap.bind(unixDomainSocketPath: socketPath).wait()
+        // The control socket can create/stop/delete VMs as root. Restrict it to
+        // the daemon's user so no other local account can drive it.
+        chmod(socketPath, 0o600)
         FileHandle.standardError.write(Data("[ac-applevmd] listening on \(socketPath)\n".utf8))
         try channel.closeFuture.wait()
     }
 
     private func unlinkExisting() {
+        // Refuse to follow a symlink planted at the socket path — removing it
+        // would delete the link's target, and binding through it is a TOCTOU
+        // vector. Combined with the 0700 parent dir below, the race is closed.
+        let attrs = try? FileManager.default.attributesOfItem(atPath: socketPath)
+        if let type = attrs?[.type] as? FileAttributeType, type == .typeSymbolicLink {
+            FileHandle.standardError.write(
+                Data("[ac-applevmd] refusing to unlink symlink at \(socketPath)\n".utf8))
+            exit(1)
+        }
         try? FileManager.default.removeItem(atPath: socketPath)
+        let parent = (socketPath as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(
-            atPath: (socketPath as NSString).deletingLastPathComponent,
-            withIntermediateDirectories: true
-        )
+            atPath: parent, withIntermediateDirectories: true)
+        // Restrict the socket directory to the daemon's user.
+        chmod(parent, 0o700)
     }
 }
 
@@ -54,10 +70,15 @@ private final class RequestHandler: ChannelInboundHandler {
     typealias InboundIn = HTTPServerRequestPart
     typealias OutboundOut = HTTPServerResponsePart
 
+    // Cap accumulated request bodies so a malicious or buggy client can't OOM
+    // the daemon by streaming an unbounded POST.
+    private static let maxBodySize = 1_048_576  // 1 MiB
+
     private let manager: VMManager
     private let version: String
     private var head: HTTPRequestHead?
     private var body: ByteBuffer?
+    private var rejected = false
 
     init(manager: VMManager, version: String) {
         self.manager = manager
@@ -69,9 +90,19 @@ private final class RequestHandler: ChannelInboundHandler {
         case .head(let h):
             head = h
             body = context.channel.allocator.buffer(capacity: 0)
+            rejected = false
         case .body(var chunk):
+            if rejected { return }
             body?.writeBuffer(&chunk)
+            if let b = body, b.readableBytes > RequestHandler.maxBodySize {
+                rejected = true
+                body = nil
+                RequestHandler.write(channel: context.channel, status: .payloadTooLarge,
+                    json: Data("{\"error\":\"request body too large\"}".utf8))
+                context.close(promise: nil)
+            }
         case .end:
+            if rejected { rejected = false; return }
             guard let head else { return }
             let bodyData = body.flatMap { $0.getData(at: $0.readerIndex, length: $0.readableBytes) } ?? Data()
             let channel = context.channel

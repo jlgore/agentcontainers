@@ -5,12 +5,12 @@ import Containerization
 // host-side socket bridges that expose each VM's private Docker daemon.
 //
 // One VM == one microVM running a docker-in-docker image. dockerd inside the VM
-// listens on TCP :2375 (bound to the VM's vmnet interface). For each VM we open
-// a host unix socket and proxy every connection to <vm-ip>:2375, so the Go
-// client can talk to a normal `unix://` Docker endpoint exactly as it does with
-// sandboxd. (A more locked-down alternative is to keep dockerd on a vsock port
-// and bridge via LinuxContainer.dialVsock(port:) — see README; left as a
-// follow-up.)
+// listens only on its unix socket; an in-VM relay fronts it on a fixed vsock
+// port. For each VM we open a host unix socket and proxy every connection over
+// vsock (LinuxContainer.dialVsock), so the Go client can talk to a normal
+// `unix://` Docker endpoint exactly as it does with sandboxd. vsock is mediated
+// by the hypervisor — no IP, no routing, unreachable by any other host process,
+// unlike the previous TCP-on-vmnet exposure.
 //
 // The boot sequence mirrors the canonical example in the containerization
 // package's `cctl` RunCommand: Kernel + VmnetNetwork -> ContainerManager ->
@@ -50,12 +50,24 @@ actor VMManager {
 
     func createVM(_ req: VMCreateRequest) async throws -> VMCreateResponse {
         let name = req.vm_name ?? "acvm-\(UUID().uuidString.prefix(8))"
+        // The name flows into a filesystem path (stateDir/<name>/docker.sock) and
+        // is the VM dictionary key. Reject anything that could traverse out of
+        // stateDir or collide with shell/path semantics. The auto-generated
+        // acvm-XXXXXXXX names already satisfy this.
+        let namePattern = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/
+        guard name.wholeMatch(of: namePattern) != nil else {
+            throw DaemonError.badRequest(
+                "invalid vm_name: must be 1-64 characters of [A-Za-z0-9._-], starting alphanumeric")
+        }
         if vms[name] != nil {
             throw DaemonError.conflict("VM \(name) already exists")
         }
 
-        // Captured into the @Sendable create closure (a plain String is Sendable).
+        // Captured into the @Sendable create closure (plain String/struct values
+        // are Sendable). SandboxMount is Codable + value-typed, so the array is
+        // safe to capture.
         let workspaceDir = req.workspace_dir
+        let extraMounts = req.mounts ?? []
 
         let kernel = Kernel(path: URL(fileURLWithPath: kernelPath), platform: .linuxArm)
         let network: Network = try VmnetNetwork()
@@ -74,16 +86,19 @@ actor VMManager {
             networking: true
         ) { config in
             // dockerd as PID 1. Use the dind image's entrypoint so it performs
-            // the usual cgroup/iptables setup, then expose the API over TCP (for
-            // the host bridge) and the conventional unix socket (in-VM use).
+            // the usual cgroup/iptables setup. dockerd listens ONLY on the
+            // conventional unix socket; the host reaches it over vsock via the
+            // in-VM relay (see dind-enforcer/dockerd-entrypoint.sh). No TCP
+            // listener on vmnet — that was a root-equivalent unauth exposure.
             config.process.arguments = [
                 "dockerd-entrypoint.sh",
                 "dockerd",
-                "-H", "tcp://0.0.0.0:2375",
                 "-H", "unix:///var/run/docker.sock",
             ]
-            // DOCKER_TLS_CERTDIR="" disables docker:dind's default auto-TLS so
-            // dockerd serves plain HTTP on :2375 (what the host bridge speaks).
+            // Keep DOCKER_TLS_CERTDIR="" set: docker:dind defaults it to /certs
+            // when UNSET, which makes its entrypoint auto-add a
+            // `-H tcp://0.0.0.0:2376 --tlsverify` listener on vmnet. Setting it
+            // empty disables that auto-listener so dockerd stays unix-only.
             config.process.environmentVariables = [
                 "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                 "DOCKER_TLS_CERTDIR=",
@@ -94,10 +109,30 @@ actor VMManager {
             // Share the host workspace into the VM at the same path so the
             // in-VM dockerd can bind-mount it into the agent container (the Go
             // runtime binds workspacePath:workspacePath). Without this the bind
-            // fails with "bind source path does not exist" inside the VM.
+            // fails with "bind source path does not exist" inside the VM. The
+            // workspace is the agent's working dir, so it stays read-write.
             if !workspaceDir.isEmpty {
                 config.mounts.append(
                     Containerization.Mount.share(source: workspaceDir, destination: workspaceDir)
+                )
+            }
+
+            // Share any additional host mounts (e.g. read-only evidence dirs)
+            // into the VM at the SAME host path (identity), honoring the
+            // read-only flag. The share destination must equal the host source
+            // because the Go runtime then bind-mounts source->target into the
+            // agent container, and the in-VM dockerd resolves that bind source
+            // against the VM filesystem. The container-level remap to `target`
+            // happens on the Go side, not here. Read-only is enforced at the
+            // virtiofs share via options:["ro"] (Mount.readonly checks
+            // options.contains("ro")).
+            for m in extraMounts {
+                config.mounts.append(
+                    Containerization.Mount.share(
+                        source: m.source,
+                        destination: m.source,
+                        options: (m.readonly ?? false) ? ["ro"] : []
+                    )
                 )
             }
         }
@@ -113,21 +148,25 @@ actor VMManager {
         // successful bridge.start() can throw, so the catch need not stop it.)
         let record: VMRecord
         do {
+            // vmnet IPs are recorded for container networking/introspection, but
+            // the Docker control channel no longer depends on them — vsock is
+            // available as soon as the VM boots, before vmnet assigns an IP.
             let ips = container.interfaces.map { $0.ipv4Address.address.description }
-            guard let vmIP = ips.first else {
-                throw DaemonError.internalError("VM \(name) came up with no IP address")
-            }
 
-            // Wait for dockerd to accept connections before handing the socket back.
-            try await waitForDockerd(host: vmIP, port: 2375, timeout: 60)
+            // Wait for the in-VM vsock relay (and dockerd behind it) to accept
+            // connections before handing the socket back. The relay starts only
+            // after `docker info` succeeds inside the VM, so a successful dial
+            // means dockerd is ready.
+            try await waitForDockerd(container: container, port: dockerdVsockPort, timeout: 60)
 
-            // Stand up the host unix socket -> <vmIP>:2375 proxy.
+            // Stand up the host unix socket -> guest vsock proxy.
             let sockPath = stateDir.appendingPathComponent("\(name)/docker.sock").path
             try FileManager.default.createDirectory(
                 atPath: (sockPath as NSString).deletingLastPathComponent,
                 withIntermediateDirectories: true
             )
-            let bridge = SocketBridge(hostSocketPath: sockPath, targetHost: vmIP, targetPort: 2375)
+            let bridge = SocketBridge(
+                hostSocketPath: sockPath, container: container, vsockPort: dockerdVsockPort)
             try bridge.start()
 
             record = VMRecord(
@@ -236,13 +275,18 @@ actor VMManager {
 
     // MARK: - Helpers
 
-    private func waitForDockerd(host: String, port: Int, timeout: TimeInterval) async throws {
+    private func waitForDockerd(
+        container: LinuxContainer, port: UInt32, timeout: TimeInterval) async throws {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if SocketBridge.canConnect(host: host, port: port) { return }
+            if let fh = try? await container.dialVsock(port: port) {
+                try? fh.close()
+                return
+            }
             try await Task.sleep(nanoseconds: 500_000_000)
         }
-        throw DaemonError.internalError("dockerd did not become reachable at \(host):\(port)")
+        throw DaemonError.internalError(
+            "dockerd did not become reachable over vsock port \(port)")
     }
 }
 

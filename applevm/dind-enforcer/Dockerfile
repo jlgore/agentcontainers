@@ -7,6 +7,11 @@
 ARG DIND_BASE=docker:dind
 FROM ${DIND_BASE}
 
+# socat fronts dockerd's unix socket on a vsock port so the host (ac-applevmd)
+# can reach the Docker API over the hypervisor-mediated vsock channel instead of
+# TCP on vmnet. docker:dind is Alpine-based, so this is a single apk add.
+RUN apk add --no-cache socat
+
 # Preserve the upstream dind entrypoint and shadow it with our wrapper at the
 # same path, so the agentcontainers runtime's invocation
 # ("dockerd-entrypoint.sh dockerd -H ...") transparently loads the enforcer.

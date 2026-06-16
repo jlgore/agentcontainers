@@ -277,6 +277,30 @@ func (s *SandboxRuntime) Start(ctx context.Context, cfg *config.AgentContainer, 
 		VMName:       vmName,
 	}
 
+	// Share configured host mounts (e.g. read-only evidence dirs) into the VM so
+	// the in-VM dockerd can bind them into the agent container. Only bind mounts
+	// carry a host path that needs a virtiofs share; named volumes live inside
+	// the VM's Docker and are handled at container-create time. The share is
+	// identity (host path -> same path in the VM); the read-only flag is honored
+	// at the virtiofs layer by ac-applevmd.
+	cfgMounts := parseMounts(cfg.Mounts)
+	// ESC-2: reject runtime-socket mounts (docker.sock etc.) before they reach
+	// either the VM share or the agent container — same guard as the Docker
+	// runtime, but returned as an error rather than a panic here.
+	if err := validateMounts(cfgMounts); err != nil {
+		return nil, fmt.Errorf("sandbox runtime: %w", err)
+	}
+	for _, m := range cfgMounts {
+		if m.Type != mount.TypeBind {
+			continue
+		}
+		req.Mounts = append(req.Mounts, sandbox.SandboxMount{
+			Source:   m.Source,
+			Target:   m.Source,
+			ReadOnly: m.ReadOnly,
+		})
+	}
+
 	// Wire resolved secrets into the VM as credential sources and service auth.
 	if len(opts.ResolvedSecrets) > 0 {
 		req.CredentialSources = buildCredentialSources(opts.ResolvedSecrets)
@@ -352,6 +376,11 @@ func (s *SandboxRuntime) Start(ctx context.Context, cfg *config.AgentContainer, 
 			Target: opts.WorkspacePath,
 		})
 	}
+	// Bind the configured mounts into the agent container at their requested
+	// targets, preserving the read-only flag. For bind mounts the source path
+	// was shared into the VM above; volume mounts are resolved by the in-VM
+	// Docker daemon directly.
+	mounts = append(mounts, cfgMounts...)
 
 	// Forward proxy env vars from the VM creation response into the
 	// agent container so processes inside see HTTP_PROXY, HTTPS_PROXY, etc.
