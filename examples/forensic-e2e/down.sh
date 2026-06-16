@@ -53,12 +53,17 @@ if [ "$RELEASE_EVIDENCE" = "1" ]; then
   echo "  !! --release-evidence: clearing chattr +i (evidence becomes mutable)" >&2
   shopt -s nullglob
   released=0
+  # Unlock the evidence directory first (so its entries can be removed again),
+  # then the files. Mirrors up.sh's lock set (files + dir).
+  if [ -d "$CASE_DIR/evidence" ]; then
+    sudo chattr -i "$CASE_DIR/evidence" 2>/dev/null && released=$((released + 1)) || echo "  could not chattr -i $CASE_DIR/evidence" >&2
+  fi
   for f in "$CASE_DIR"/evidence/* "$CASES_DIR"/*.zip "$CASES_DIR"/*.E01 "$CASES_DIR"/*.dd "$CASES_DIR"/*.raw; do
     [ -f "$f" ] || continue
     if sudo chattr -i "$f" 2>/dev/null; then released=$((released + 1)); else echo "  could not chattr -i $f" >&2; fi
   done
   shopt -u nullglob
-  echo "  released immutable bit on $released evidence file(s)"
+  echo "  released immutable bit on $released evidence path(s) (files + dir)"
 fi
 
 rm -rf "$RUN_DIR"

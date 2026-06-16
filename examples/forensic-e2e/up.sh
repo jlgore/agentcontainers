@@ -70,20 +70,32 @@ fi
 # Evidence immutability. The gateway runs as the owner uid (1000) on a
 # read-write /cases (needed so case_init can create new cases), so neither the
 # mount nor DAC stops it from deleting/altering acquired evidence. Mark every
-# evidence file immutable: the gateway is launched CapDrop:["ALL"] → no
-# CAP_LINUX_IMMUTABLE → it cannot modify, delete, rename, or clear +i, even as
-# owner. This is the kernel-level evidence guarantee the proxy path relies on.
-# Idempotent (chattr +i on an already-immutable file is a no-op); needs sudo.
+# evidence file immutable AND lock the evidence directory: the gateway is
+# launched CapDrop:["ALL"] → no CAP_LINUX_IMMUTABLE → it cannot modify, delete,
+# rename, or clear +i, even as owner. Locking the dir (not just the files) also
+# blocks planting/removing files NEXT TO the evidence (chain-of-custody) — files
+# alone leave the directory writable. This is the kernel-level evidence
+# guarantee the proxy path relies on. Idempotent (+i on an already-immutable
+# path is a no-op); needs sudo. The /cases ROOT is deliberately NOT locked — it
+# must stay writable for case_init; loose evidence images there are still
+# protected as individual +i files.
 CASES_DIR="$(dirname "$CASE_DIR")"
 shopt -s nullglob
 locked=0
+# Files first (images can't be modified/deleted)...
 for f in "$CASE_DIR"/evidence/* "$CASES_DIR"/*.zip "$CASES_DIR"/*.E01 "$CASES_DIR"/*.dd "$CASES_DIR"/*.raw; do
   [ -f "$f" ] || continue
   if sudo chattr +i "$f" 2>/dev/null; then locked=$((locked + 1)); else warn "could not chattr +i $f (evidence not immutable!)"; fi
 done
+# ...then the evidence directory itself (no files can be planted next to or
+# removed from the acquired evidence). Must come AFTER the file loop.
+if [ -d "$CASE_DIR/evidence" ]; then
+  if sudo chattr +i "$CASE_DIR/evidence" 2>/dev/null; then locked=$((locked + 1)); else warn "could not chattr +i $CASE_DIR/evidence (evidence dir not locked!)"; fi
+fi
 shopt -u nullglob
-ok "evidence marked immutable (chattr +i): $locked file(s) — capless gateway cannot clear it"
-# NOTE: removing a case later needs `sudo chattr -i <evidence>` first (by design).
+ok "evidence marked immutable (chattr +i): $locked path(s) incl. the evidence dir — capless gateway cannot clear it"
+# NOTE: removing a case later needs `down.sh --release-evidence` (or `sudo
+# chattr -i`) first, on both the files and the evidence dir — by design.
 
 # The checked-in config references /cases/e2e-demo. If CASE_DIR differs, render a
 # copy with the case paths substituted so the run stays reproducible.
