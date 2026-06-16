@@ -1,0 +1,328 @@
+[
+  {
+    "id": "IOC-jgore-001",
+    "value": "SRL-Helpdesk",
+    "type": "user-account",
+    "category": "identity",
+    "description": "",
+    "status": "DRAFT",
+    "confidence": "MEDIUM",
+    "source_findings": [
+      "F-jgore-002",
+      "F-jgore-006"
+    ],
+    "sightings": [
+      {
+        "host": "WKS-WIN764BITB",
+        "finding_id": "F-jgore-002"
+      },
+      {
+        "host": "WKS-WIN764BITB",
+        "finding_id": "F-jgore-006"
+      }
+    ],
+    "mitre_techniques": [
+      "T1136.001",
+      "T1078.003",
+      "T1021.001"
+    ],
+    "tags": [],
+    "manually_reviewed": false,
+    "examiner": "jgore",
+    "created_at": "2026-06-16T02:25:07.256955+00:00",
+    "modified_at": "2026-06-16T02:39:22.701618+00:00",
+    "content_hash": "0420abcf34c6b32008116fb8af0478d447521ba63e62763ffe96b99a6fceb074"
+  },
+  {
+    "id": "IOC-jgore-002",
+    "value": "S-1-5-21-228041085-1601810819-2769380060-1001",
+    "type": "unknown",
+    "category": "unknown",
+    "description": "",
+    "status": "DRAFT",
+    "confidence": "MEDIUM",
+    "source_findings": [
+      "F-jgore-002"
+    ],
+    "sightings": [
+      {
+        "host": "WKS-WIN764BITB",
+        "finding_id": "F-jgore-002"
+      }
+    ],
+    "mitre_techniques": [
+      "T1136.001",
+      "T1078.003"
+    ],
+    "tags": [],
+    "manually_reviewed": false,
+    "examiner": "jgore",
+    "created_at": "2026-06-16T02:25:07.256955+00:00",
+    "modified_at": "2026-06-16T02:25:07.256955+00:00",
+    "content_hash": "820aad987ff5b3f345e744420e3f7cc1bc33933ccf243c9a481a64b650f06a8b"
+  },
+  {
+    "id": "IOC-jgore-003",
+    "value": "6eef2381040cd38ce5974ef954121e136bd93ec4039d49925438c92ef5f3dead",
+    "type": "file:hash:sha256",
+    "category": "host",
+    "description": "",
+    "status": "DRAFT",
+    "confidence": "HIGH",
+    "source_findings": [
+      "F-jgore-003"
+    ],
+    "sightings": [
+      {
+        "host": "WKS-WIN764BITB",
+        "finding_id": "F-jgore-003"
+      }
+    ],
+    "mitre_techniques": [
+      "T1036.005",
+      "T1070.006",
+      "T1059.006",
+      "T1053.002"
+    ],
+    "tags": [],
+    "manually_reviewed": false,
+    "examiner": "jgore",
+    "created_at": "2026-06-16T02:33:33.067729+00:00",
+    "modified_at": "2026-06-16T02:33:33.067729+00:00",
+    "content_hash": "570d992eff879a1152cd33da69e379a4af2130de19f079393034bcb6703453d6"
+  },
+  {
+    "id": "IOC-jgore-004",
+    "value": "6bff2aebb8852fc2658b9768d2166ece",
+    "type": "file:hash:md5",
+    "category": "host",
+    "description": "",
+    "status": "DRAFT",
+    "confidence": "HIGH",
+    "source_findings": [
+      "F-jgore-003"
+    ],
+    "sightings": [
+      {
+        "host": "WKS-WIN764BITB",
+        "finding_id": "F-jgore-003"
+      }
+    ],
+    "mitre_techniques": [
+      "T1036.005",
+      "T1070.006",
+      "T1059.006",
+      "T1053.002"
+    ],
+    "tags": [],
+    "manually_reviewed": false,
+    "examiner": "jgore",
+    "created_at": "2026-06-16T02:33:33.067729+00:00",
+    "modified_at": "2026-06-16T02:33:33.067729+00:00",
+    "content_hash": "ec394faa49a5e51511bd893d4342db6f68e29649c655e24819ea4157a638aab8"
+  },
+  {
+    "id": "IOC-jgore-005",
+    "value": "C:\\Windows\\System32\\spinlock.exe",
+    "type": "file:path",
+    "category": "host",
+    "description": "",
+    "status": "DRAFT",
+    "confidence": "HIGH",
+    "source_findings": [
+      "F-jgore-003",
+      "F-jgore-004"
+    ],
+    "sightings": [
+      {
+        "host": "WKS-WIN764BITB",
+        "finding_id": "F-jgore-003"
+      },
+      {
+        "host": "WKS-WIN764BITB",
+        "finding_id": "F-jgore-004"
+      }
+    ],
+    "mitre_techniques": [
+      "T1036.005",
+      "T1070.006",
+      "T1059.006",
+      "T1053.002",
+      "T1547.001"
+    ],
+    "tags": [],
+    "manually_reviewed": false,
+    "examiner": "jgore",
+    "created_at": "2026-06-16T02:33:33.067729+00:00",
+    "modified_at": "2026-06-16T02:33:55.835332+00:00",
+    "content_hash": "79112a8da20939d700cb6e6af24a4aee403380693a9a8a9367f00ce3d0c6f73e"
+  },
+  {
+    "id": "IOC-jgore-006",
+    "value": "c:\\windows\\system32\\dllhost\\svchost.exe",
+    "type": "file:path",
+    "category": "host",
+    "description": "",
+    "status": "DRAFT",
+    "confidence": "HIGH",
+    "source_findings": [
+      "F-jgore-004"
+    ],
+    "sightings": [
+      {
+        "host": "WKS-WIN764BITB",
+        "finding_id": "F-jgore-004"
+      }
+    ],
+    "mitre_techniques": [
+      "T1547.001",
+      "T1053.002",
+      "T1036.005"
+    ],
+    "tags": [],
+    "manually_reviewed": false,
+    "examiner": "jgore",
+    "created_at": "2026-06-16T02:33:55.835332+00:00",
+    "modified_at": "2026-06-16T02:33:55.835332+00:00",
+    "content_hash": "c4adf852ad787533b4c02b49480553f062827448214683efe0875ef4e4fcca63"
+  },
+  {
+    "id": "IOC-jgore-007",
+    "value": "C:\\Windows\\System32\\Tasks\\At1",
+    "type": "file:path",
+    "category": "host",
+    "description": "",
+    "status": "DRAFT",
+    "confidence": "HIGH",
+    "source_findings": [
+      "F-jgore-004"
+    ],
+    "sightings": [
+      {
+        "host": "WKS-WIN764BITB",
+        "finding_id": "F-jgore-004"
+      }
+    ],
+    "mitre_techniques": [
+      "T1547.001",
+      "T1053.002",
+      "T1036.005"
+    ],
+    "tags": [],
+    "manually_reviewed": false,
+    "examiner": "jgore",
+    "created_at": "2026-06-16T02:33:55.835332+00:00",
+    "modified_at": "2026-06-16T02:33:55.835332+00:00",
+    "content_hash": "f3855f208b2e1dfeda539fa2178046682a05e1bf2cc02d2d2a60b34f77c09074"
+  },
+  {
+    "id": "IOC-jgore-008",
+    "value": "C:\\Windows\\System32\\Tasks\\At2",
+    "type": "file:path",
+    "category": "host",
+    "description": "",
+    "status": "DRAFT",
+    "confidence": "HIGH",
+    "source_findings": [
+      "F-jgore-004"
+    ],
+    "sightings": [
+      {
+        "host": "WKS-WIN764BITB",
+        "finding_id": "F-jgore-004"
+      }
+    ],
+    "mitre_techniques": [
+      "T1547.001",
+      "T1053.002",
+      "T1036.005"
+    ],
+    "tags": [],
+    "manually_reviewed": false,
+    "examiner": "jgore",
+    "created_at": "2026-06-16T02:33:55.835332+00:00",
+    "modified_at": "2026-06-16T02:33:55.835332+00:00",
+    "content_hash": "9e4947e88140a6db9c7b114233eeb2c56d9bbf18da695930439797b134852b76"
+  },
+  {
+    "id": "IOC-jgore-009",
+    "value": "USB S/N AA951D0000007252",
+    "type": "device",
+    "category": "host",
+    "description": "",
+    "status": "DRAFT",
+    "confidence": "LOW",
+    "source_findings": [
+      "F-jgore-007"
+    ],
+    "sightings": [
+      {
+        "host": "WKS-WIN764BITB",
+        "finding_id": "F-jgore-007"
+      }
+    ],
+    "mitre_techniques": [],
+    "tags": [],
+    "manually_reviewed": false,
+    "examiner": "jgore",
+    "created_at": "2026-06-16T02:39:31.259248+00:00",
+    "modified_at": "2026-06-16T02:39:31.259248+00:00",
+    "content_hash": "c6de7200537895861ee48b01d2ee8dca6be0168d6dabbed6e195b01198500b00"
+  },
+  {
+    "id": "IOC-jgore-010",
+    "value": "C:\\Users\\nfury\\AppData\\Local\\Google\\Update\\Install\\chrome_updater.exe",
+    "type": "file:path",
+    "category": "host",
+    "description": "",
+    "status": "DRAFT",
+    "confidence": "MEDIUM",
+    "source_findings": [
+      "F-jgore-008"
+    ],
+    "sightings": [
+      {
+        "host": "WKS-WIN764BITB",
+        "finding_id": "F-jgore-008"
+      }
+    ],
+    "mitre_techniques": [
+      "T1070.004",
+      "T1036"
+    ],
+    "tags": [],
+    "manually_reviewed": false,
+    "examiner": "jgore",
+    "created_at": "2026-06-16T02:39:56.875452+00:00",
+    "modified_at": "2026-06-16T02:39:56.875452+00:00",
+    "content_hash": "c88db8a8ef0cd77e138414433aa6c0ee4452560f2cd239521483065cb2b8ea1f"
+  },
+  {
+    "id": "IOC-jgore-011",
+    "value": "C:\\Program Files (x86)\\Jetico\\BCWipe\\BCWipe.exe",
+    "type": "file:path",
+    "category": "host",
+    "description": "",
+    "status": "DRAFT",
+    "confidence": "MEDIUM",
+    "source_findings": [
+      "F-jgore-008"
+    ],
+    "sightings": [
+      {
+        "host": "WKS-WIN764BITB",
+        "finding_id": "F-jgore-008"
+      }
+    ],
+    "mitre_techniques": [
+      "T1070.004",
+      "T1036"
+    ],
+    "tags": [],
+    "manually_reviewed": false,
+    "examiner": "jgore",
+    "created_at": "2026-06-16T02:39:56.875452+00:00",
+    "modified_at": "2026-06-16T02:39:56.875452+00:00",
+    "content_hash": "5eff4d9186a24f3fdff8ecf24d2f3a3a1cc8c0abf2f1c93a0914245d92c48114"
+  }
+]

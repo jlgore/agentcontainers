@@ -1,0 +1,505 @@
+[
+  {
+    "title": "System profile and time baseline: WKS-WIN764BITB, Windows 7 Ultimate SP1 x64, US Eastern (UTC-4 EDT)",
+    "observation": "fsstat reports a single logical NTFS volume (serial 3624BAAF24BA718B, cluster 4096, no partition table). RegRipper winver on the carved SOFTWARE hive: ProductName 'Windows 7 Ultimate', CSDVersion 'Service Pack 1', BuildLabEx '7601.17727.amd64fre.win7sp1_gdr.111118-2330', InstallDate 2010-11-10 17:10:57Z, RegisteredOwner 'Windows User'. RegRipper compname (SYSTEM): ComputerName = WKS-WIN764BITB. RegRipper timezone (SYSTEM, ControlSet001): TimeZoneKeyName 'Eastern Standard Time', Bias 300 (UTC-5), ActiveTimeBias 240 (UTC-4). RegRipper shutdown (SYSTEM): ShutdownTime 2012-03-15 22:33:26Z. Registry hive $STANDARD_INFORMATION file-modified times (istat) extend to 2012-04-08 (SOFTWARE 03:52:38Z, SYSTEM 01:22:15Z), later than the recorded clean ShutdownTime.",
+    "interpretation": "Establishes the time baseline for the case: the host is the 64-bit Windows 7 Ultimate SP1 workstation 'WKS-WIN764BITB' configured to US Eastern time. All forensic tool timestamps in this case are UTC (Z); host-local time during the relevant period is EDT (UTC-4). Because hive write activity (to 2012-04-08) postdates the last clean ShutdownTime (2012-03-15), the final disk state was most likely captured by live or forced acquisition rather than after a clean shutdown. The substantive activity window for this triage is approximately 2012-03-13 through 2012-04-08.",
+    "confidence": "HIGH",
+    "confidence_justification": "OS build, hostname, timezone, install date and shutdown time are each read from independent registry keys via a validated clean hive carve, and are internally consistent; fsstat independently confirms the NTFS volume. No single-source dependency.",
+    "type": "finding",
+    "audit_ids": [
+      "shell-jgore-20260616-001",
+      "shell-jgore-20260616-002",
+      "shell-jgore-20260616-003",
+      "shell-jgore-20260616-004",
+      "shell-jgore-20260616-005"
+    ],
+    "event_timestamp": "2012-04-08",
+    "host": "WKS-WIN764BITB",
+    "iocs": [],
+    "id": "F-jgore-001",
+    "status": "DRAFT",
+    "staged": "2026-06-16T02:24:45.888940+00:00",
+    "modified_at": "2026-06-16T02:24:45.888940+00:00",
+    "created_by": "jgore",
+    "examiner": "jgore",
+    "provenance": "MCP",
+    "provenance_detail": {
+      "mcp": [
+        "shell-jgore-20260616-001",
+        "shell-jgore-20260616-002",
+        "shell-jgore-20260616-003",
+        "shell-jgore-20260616-004",
+        "shell-jgore-20260616-005"
+      ],
+      "hook": [],
+      "shell": [],
+      "none": [],
+      "summary": "MCP"
+    },
+    "provenance_grade": "PARTIAL",
+    "supporting_commands": [
+      {
+        "command": "fsstat /cases/e2e-demo/evidence-raw/ewf1",
+        "output_excerpt": "File System Type: NTFS\nVolume Serial Number: 3624BAAF24BA718B\nCluster Size: 4096\nTotal Cluster Range: 0 - 7380990",
+        "purpose": "Confirm NTFS logical volume, serial number, cluster size, no partition table"
+      },
+      {
+        "command": "rip.pl -r SOFTWARE.bin -p winver",
+        "output_excerpt": "ProductName Windows 7 Ultimate / CSDVersion Service Pack 1 / BuildLabEx 7601.17727.amd64fre.win7sp1_gdr.111118-2330 / InstallDate 2010-11-10 17:10:57Z",
+        "purpose": "OS product/build/install date"
+      },
+      {
+        "command": "rip.pl -r SYSTEM.bin -p compname",
+        "output_excerpt": "ComputerName = WKS-WIN764BITB / TCP/IP Hostname = WKS-WIN764BITB",
+        "purpose": "Hostname"
+      },
+      {
+        "command": "rip.pl -r SYSTEM.bin -p timezone",
+        "output_excerpt": "TimeZoneKeyName-> Eastern Standard Time / Bias 300 (5 hours) / ActiveTimeBias 240 (4 hours)",
+        "purpose": "Timezone / bias for time baseline"
+      },
+      {
+        "command": "rip.pl -r SYSTEM.bin -p shutdown",
+        "output_excerpt": "ControlSet001\\Control\\Windows ShutdownTime : 2012-03-15 22:33:26Z",
+        "purpose": "Last clean shutdown time"
+      }
+    ],
+    "timeline_event_id": "T-jgore-001",
+    "content_hash": "9abd16797808f5181242c51f9007f2df931d051f2f3beb9791629bb4cffa65e8"
+  },
+  {
+    "title": "Anomalous locally-created administrator account 'SRL-Helpdesk' (RID 1001) created 2012-03-13",
+    "observation": "RegRipper samparse on the carved SAM hive lists only three local accounts: Administrator[500], Guest[501, disabled], and SRL-Helpdesk[1001]. SRL-Helpdesk: Account Type 'Default Admin User', Account Created Tue 2012-03-13 23:29:25Z, Last Login 2012-04-05 22:23:21Z, Pwd Reset 2012-04-04 12:41:09Z, Login Count 6. It is a member of the local Administrators group (alongside Administrator[500] and Domain Admins S-1-5-21-2036804247-3058324640-2116585241-512), the Users group, and Remote Desktop Users. Machine SID is S-1-5-21-228041085-1601810819-2769380060, so SRL-Helpdesk SID is ...-1001. ProfileList (SOFTWARE) shows C:\\Users\\SRL-Helpdesk LastWrite 2012-04-05 22:23:33Z. The original local account Jim (S-1-5-21-228041085-1601810819-2769380060-1000) has a profile directory but no SAM entry.",
+    "interpretation": "SRL-Helpdesk is the only non-builtin local account on the host, holds local administrator rights and Remote Desktop access, and was created on 2012-03-13 \u2014 roughly 16 months after OS install (2010-11-10) \u2014 with a name impersonating IT/helpdesk. This is the profile of an attacker-created backdoor local admin account used for persistence and interactive/RDP access (MITRE T1136.001 Create Account: Local Account; T1078.003 Valid Accounts: Local Accounts). Six logons through 2012-04-05 indicate active use during the incident window. The 2012-03-13 creation is a candidate initial-foothold marker. Alternative benign explanation: a legitimately provisioned helpdesk support account; this should be corroborated against Security event log account-management events (4720 create, 4724/4723 password, 4732 add-to-Administrators) and logon events before concluding malice.",
+    "confidence": "MEDIUM",
+    "confidence_justification": "The SAM creation timestamp, admin group membership and RID are definitive primary-source facts (single hive, internally consistent). Confidence held at MEDIUM rather than HIGH because the malicious interpretation is not yet corroborated by a second independent source (event logs / logon artifacts), which is the next step.",
+    "type": "finding",
+    "audit_ids": [
+      "shell-jgore-20260616-006",
+      "shell-jgore-20260616-007"
+    ],
+    "event_timestamp": "2012-03-13T23:29:25Z",
+    "host": "WKS-WIN764BITB",
+    "affected_account": "WKS-WIN764BITB\\SRL-Helpdesk",
+    "mitre_ids": [
+      "T1136.001",
+      "T1078.003"
+    ],
+    "iocs": [
+      {
+        "value": "SRL-Helpdesk",
+        "type": "user-account"
+      },
+      "S-1-5-21-228041085-1601810819-2769380060-1001"
+    ],
+    "id": "F-jgore-002",
+    "status": "DRAFT",
+    "staged": "2026-06-16T02:25:07.230713+00:00",
+    "modified_at": "2026-06-16T02:25:07.230713+00:00",
+    "created_by": "jgore",
+    "examiner": "jgore",
+    "provenance": "MCP",
+    "provenance_detail": {
+      "mcp": [
+        "shell-jgore-20260616-006",
+        "shell-jgore-20260616-007"
+      ],
+      "hook": [],
+      "shell": [],
+      "none": [],
+      "summary": "MCP"
+    },
+    "provenance_grade": "PARTIAL",
+    "supporting_commands": [
+      {
+        "command": "rip.pl -r SAM.bin -p samparse",
+        "output_excerpt": "Username : SRL-Helpdesk [1001] / Account Type : Default Admin User / Account Created : Tue Mar 13 23:29:25 2012 Z / Last Login Date : Thu Apr 5 22:23:21 2012 Z / Login Count : 6 ... Group Name : Administrators [3] ... S-1-5-21-228041085-1601810819-2769380060-1001",
+        "purpose": "Enumerate local SAM accounts, creation/login timestamps, and group membership"
+      },
+      {
+        "command": "rip.pl -r SOFTWARE.bin -p profilelist",
+        "output_excerpt": "Path : C:\\Users\\SRL-Helpdesk / SID : S-1-5-21-228041085-1601810819-2769380060-1001 / LastWrite : 2012-04-05 22:23:33Z",
+        "purpose": "Confirm SRL-Helpdesk profile and distinguish local vs domain SIDs"
+      }
+    ],
+    "timeline_event_id": "T-jgore-002",
+    "content_hash": "fea1971c02671ecf7af1638e4f170e06fbeb6e9c9825939b30baa60aa6001bfa"
+  },
+  {
+    "title": "Planted malware C:\\Windows\\System32\\spinlock.exe (PyInstaller/Python, timestomped) deployed 2012-04-05",
+    "observation": "fls/grep located Windows/System32/spinlock.exe (MFT 540). istat 540: $DATA size 2,271,885 bytes; $STANDARD_INFORMATION Created 2012-04-05 16:54:26Z, Modified 2012-04-04 17:06:37Z, Accessed 2012-04-05 16:54:26Z; $FILE_NAME Created/Modified/Accessed all 2012-04-05 16:54:26Z; Security ID 749 = S-1-5-32-544 (Administrators). The $SI Modified time (2012-04-04 17:06:37) is earlier than both the $SI Created and the $FN Created (2012-04-05 16:54:26). A byte-exact dd carve yields: file = PE32 executable (GUI) Intel 80386, 4 sections; SHA-256 6eef2381040cd38ce5974ef954121e136bd93ec4039d49925438c92ef5f3dead; MD5 6bff2aebb8852fc2658b9768d2166ece. ASCII strings include _MEIPASS2, bpython25.dll, %spython%02d.dll, PYTHONHOME=, PYTHONPATH=, 'Error loading Python DLL' \u2014 PyInstaller-bundled Python 2.5.",
+    "interpretation": "spinlock.exe is an attacker-deployed executable: a non-Windows PyInstaller-packed Python 2.5 program placed directly in System32 during the incident window (2012-04-05). Its location masquerades as a system component (MITRE T1036.005), and the $SI Modified timestamp preceding the $FN Created time is a timestomping indicator (T1070.006). It is a Python-based tool/backdoor (T1059.006) and is the payload launched by scheduled task At1 (cmd /c c:\\windows\\system32\\spinlock.exe). Network/C2 indicators are not present in plaintext strings because the Python payload is compressed inside the PyInstaller archive \u2014 recovering them would require unpacking (evidence gap). Alternative benign explanation (a legitimately named admin utility) is refuted by the non-standard System32 placement, timestomping, and AT-job execution.",
+    "confidence": "HIGH",
+    "confidence_justification": "The binary is present and hashed; PE32 + PyInstaller/Python confirmed by file and strings; planting and timestomping are established from independent $SI vs $FN MFT timestamps; execution is corroborated by an independent artifact (At1 task XML). Multiple independent sources.",
+    "type": "finding",
+    "audit_ids": [
+      "shell-jgore-20260616-008",
+      "shell-jgore-20260616-009",
+      "shell-jgore-20260616-010"
+    ],
+    "event_timestamp": "2012-04-05T16:54:26Z",
+    "host": "WKS-WIN764BITB",
+    "mitre_ids": [
+      "T1036.005",
+      "T1070.006",
+      "T1059.006",
+      "T1053.002"
+    ],
+    "iocs": [
+      "6eef2381040cd38ce5974ef954121e136bd93ec4039d49925438c92ef5f3dead",
+      "6bff2aebb8852fc2658b9768d2166ece",
+      "C:\\Windows\\System32\\spinlock.exe"
+    ],
+    "id": "F-jgore-003",
+    "status": "DRAFT",
+    "staged": "2026-06-16T02:33:33.042092+00:00",
+    "modified_at": "2026-06-16T02:33:33.042092+00:00",
+    "created_by": "jgore",
+    "examiner": "jgore",
+    "provenance": "MCP",
+    "provenance_detail": {
+      "mcp": [
+        "shell-jgore-20260616-008",
+        "shell-jgore-20260616-009",
+        "shell-jgore-20260616-010"
+      ],
+      "hook": [],
+      "shell": [],
+      "none": [],
+      "summary": "MCP"
+    },
+    "provenance_grade": "PARTIAL",
+    "supporting_commands": [
+      {
+        "command": "istat /cases/e2e-demo/evidence-raw/ewf1 540",
+        "output_excerpt": "Name: spinlock.exe / $SI Created 2012-04-05 16:54:26 / $SI Modified 2012-04-04 17:06:37 / $FN Created 2012-04-05 16:54:26 / $DATA size 2271885 / Security ID 749 (S-1-5-32-544)",
+        "purpose": "spinlock.exe MAC times, size, owner SID, timestomping evidence"
+      },
+      {
+        "command": "dd if=ewf1 bs=1048576 iflag=skip_bytes,count_bytes skip=22842863616 count=2271885 of=spinlock.exe.bin ; sha256sum ; md5sum ; file",
+        "output_excerpt": "2271885 bytes copied; SHA-256 6eef2381040cd38ce5974ef954121e136bd93ec4039d49925438c92ef5f3dead; MD5 6bff2aebb8852fc2658b9768d2166ece; PE32 executable (GUI) Intel 80386, 4 sections",
+        "purpose": "Byte-exact carve, hash, and type-confirm spinlock.exe"
+      },
+      {
+        "command": "strings -a -n 7 spinlock.exe.bin | grep -iE python|MEIPASS",
+        "output_excerpt": "_MEIPASS2 / bpython25.dll / %spython%02d.dll / PYTHONHOME= / PYTHONPATH= / Error loading Python DLL: %s (error code %d)",
+        "purpose": "Identify PyInstaller/Python packing"
+      }
+    ],
+    "timeline_event_id": "T-jgore-003",
+    "content_hash": "27c8961347d0354198385018f4805f693d8dfe30bcf6640568e53f2b7f09a1a1"
+  },
+  {
+    "title": "Persistence + execution: malicious HKLM Run key and two AT scheduled tasks (At1/At2) created 2012-04-05",
+    "observation": "RegRipper run plugin on SOFTWARE.bin shows Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Run (LastWrite 2012-04-05 17:53:13Z) containing value 'svchost' = 'c:\\windows\\system32\\dllhost\\svchost.exe' alongside legitimate entries (Adobe ARM, McAfee, Adobe Reader SL). icat of System32\\Tasks\\At1 (MFT 15623) is a Task XML: TimeTrigger StartBoundary 2012-04-05T13:01:00, Principal UserId @AtServiceAccount, RunLevel HighestAvailable, Action Exec Command 'cmd' Arguments '/c c:\\windows\\system32\\spinlock.exe'. icat of System32\\Tasks\\At2 (MFT 92254): StartBoundary 2012-04-05T13:47:00, same principal, Action 'cmd' '/c c:\\windows\\system32\\dllhost\\svchost.exe'.",
+    "interpretation": "Three persistence/execution mechanisms created on 2012-04-05 converge on two attacker payloads. The Run key value 'svchost' pointing to c:\\windows\\system32\\dllhost\\svchost.exe is autostart persistence (MITRE T1547.001) using a binary masqueraded as svchost inside a non-standard 'dllhost' subfolder (T1036.005). At1 and At2 are 'at'-command scheduled tasks (T1053.002) that execute spinlock.exe and dllhost\\svchost.exe respectively. Together they establish reboot-surviving persistence and on-demand execution of the malware identified in F-jgore-003. Benign alternative (legitimate helpdesk/admin automation) is refuted by the masqueraded svchost path, the generic At1/At2 naming, and the link to the planted spinlock.exe.",
+    "confidence": "HIGH",
+    "confidence_justification": "Three independent artifacts of two different types (registry Run key + two scheduled-task XML files) corroborate each other and tie to the separately-confirmed malware spinlock.exe (F-003). Paths and timestamps are read verbatim from primary sources.",
+    "type": "finding",
+    "audit_ids": [
+      "shell-jgore-20260616-011",
+      "shell-jgore-20260616-012",
+      "shell-jgore-20260616-013"
+    ],
+    "event_timestamp": "2012-04-05T13:01:00Z",
+    "host": "WKS-WIN764BITB",
+    "mitre_ids": [
+      "T1547.001",
+      "T1053.002",
+      "T1036.005"
+    ],
+    "iocs": [
+      "c:\\windows\\system32\\dllhost\\svchost.exe",
+      "C:\\Windows\\System32\\spinlock.exe",
+      "C:\\Windows\\System32\\Tasks\\At1",
+      "C:\\Windows\\System32\\Tasks\\At2"
+    ],
+    "id": "F-jgore-004",
+    "status": "DRAFT",
+    "staged": "2026-06-16T02:33:55.815585+00:00",
+    "modified_at": "2026-06-16T02:33:55.815585+00:00",
+    "created_by": "jgore",
+    "examiner": "jgore",
+    "provenance": "MCP",
+    "provenance_detail": {
+      "mcp": [
+        "shell-jgore-20260616-011",
+        "shell-jgore-20260616-012",
+        "shell-jgore-20260616-013"
+      ],
+      "hook": [],
+      "shell": [],
+      "none": [],
+      "summary": "MCP"
+    },
+    "provenance_grade": "PARTIAL",
+    "supporting_commands": [
+      {
+        "command": "rip.pl -r SOFTWARE.bin -p run",
+        "output_excerpt": "Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Run LastWrite 2012-04-05 17:53:13Z : svchost - c:\\windows\\system32\\dllhost\\svchost.exe",
+        "purpose": "Enumerate HKLM Run/RunOnce persistence"
+      },
+      {
+        "command": "icat /cases/e2e-demo/evidence-raw/ewf1 15623",
+        "output_excerpt": "<StartBoundary>2012-04-05T13:01:00</StartBoundary> ... <UserId>@AtServiceAccount</UserId> <RunLevel>HighestAvailable</RunLevel> <Command>cmd</Command><Arguments>/c c:\\windows\\system32\\spinlock.exe</Arguments>",
+        "purpose": "Read At1 scheduled task definition"
+      },
+      {
+        "command": "icat /cases/e2e-demo/evidence-raw/ewf1 92254",
+        "output_excerpt": "<StartBoundary>2012-04-05T13:47:00</StartBoundary> ... <Command>cmd</Command><Arguments>/c c:\\windows\\system32\\dllhost\\svchost.exe</Arguments>",
+        "purpose": "Read At2 scheduled task definition"
+      }
+    ],
+    "timeline_event_id": "T-jgore-004",
+    "content_hash": "5c2569a5fab660565fbc72c516f06dc8dbacf7e1c9353cf3cb3163fcb8fae968"
+  },
+  {
+    "title": "Exclusion: System32 svchost.exe and dllhost.exe are legitimate; masqueraded dllhost\\svchost.exe payload is absent (deleted) \u2014 evidence gap",
+    "observation": "istat of Windows/System32/svchost.exe (MFT 25174): $SI Created 2009-07-13 23:31:13Z, $FN Created 2010-11-10 18:47:44Z, owner SID S-1-5-80-... (TrustedInstaller), $DATA 27,136 bytes. istat of Windows/System32/dllhost.exe (MFT 23430): $SI Created 2009-07-13 23:59:17Z, $FN Created 2010-11-10 18:46:27Z, TrustedInstaller, $DATA 9,728 bytes. fls of inode 23430 returns 'no $IDX_ROOT' (it is a file, not a directory). grep of the recursive fls listing for 'System32/dllhost/' (directory) returns no results; no spinlock-style payload exists at c:\\windows\\system32\\dllhost\\svchost.exe in the live filesystem.",
+    "interpretation": "The System32 svchost.exe and dllhost.exe present on disk are the genuine Windows binaries (Win7 build creation 2009-07-13, install-time $FN 2010-11-10, TrustedInstaller-owned, expected sizes) and are excluded as benign \u2014 they are NOT the malware. The malicious 'svchost' referenced by the Run key and task At2 is the distinct path c:\\windows\\system32\\dllhost\\svchost.exe (a svchost placed inside a non-standard 'dllhost' folder), which does not exist in the allocated filesystem at acquisition time. This is an evidence gap: the payload binary was deleted or never persisted to disk in the captured state, so it could not be hashed; the persistence/task references (F-jgore-004) nonetheless prove it existed and was scheduled to run. Recovery could be attempted from unallocated space / USN journal (not yet performed).",
+    "confidence": "HIGH",
+    "confidence_justification": "Legitimacy of svchost.exe/dllhost.exe is established by independent $SI/$FN timestamps, TrustedInstaller ownership and original sizes. Absence of the dllhost\\svchost.exe payload is confirmed by both targeted fls (no directory) and grep over the full recursive listing. Stated as exclusion + explicit gap per framework guidance.",
+    "type": "exclusion",
+    "audit_ids": [
+      "shell-jgore-20260616-014",
+      "shell-jgore-20260616-015",
+      "shell-jgore-20260616-016"
+    ],
+    "event_timestamp": "2012-04-08",
+    "host": "WKS-WIN764BITB",
+    "iocs": [],
+    "id": "F-jgore-005",
+    "status": "DRAFT",
+    "staged": "2026-06-16T02:34:14.372720+00:00",
+    "modified_at": "2026-06-16T02:34:14.372720+00:00",
+    "created_by": "jgore",
+    "examiner": "jgore",
+    "provenance": "MCP",
+    "provenance_detail": {
+      "mcp": [
+        "shell-jgore-20260616-014",
+        "shell-jgore-20260616-015",
+        "shell-jgore-20260616-016"
+      ],
+      "hook": [],
+      "shell": [],
+      "none": [],
+      "summary": "MCP"
+    },
+    "provenance_grade": "PARTIAL",
+    "supporting_commands": [
+      {
+        "command": "istat /cases/e2e-demo/evidence-raw/ewf1 25174",
+        "output_excerpt": "Name: svchost.exe / $SI Created 2009-07-13 23:31:13 / $FN Created 2010-11-10 18:47:44 / Security ID 451 (S-1-5-80 TrustedInstaller) / $DATA size 27136",
+        "purpose": "Confirm System32 svchost.exe is the legitimate Windows binary"
+      },
+      {
+        "command": "istat /cases/e2e-demo/evidence-raw/ewf1 23430",
+        "output_excerpt": "Name: dllhost.exe / $SI Created 2009-07-13 23:59:17 / $FN Created 2010-11-10 18:46:27 / Security ID 451 (TrustedInstaller) / $DATA size 9728",
+        "purpose": "Confirm System32 dllhost.exe is the legitimate Windows binary"
+      },
+      {
+        "command": "fls -r -p /cases/e2e-demo/evidence-raw/ewf1 23430 ; grep -iE 'System32/dllhost/' fls.txt",
+        "output_excerpt": "fls 23430: 'Attribute 144 not found ... $IDX_ROOT not found' (dllhost.exe is a file); grep for System32/dllhost/ directory: no matches",
+        "purpose": "Confirm no dllhost directory / no dllhost\\svchost.exe payload present"
+      }
+    ],
+    "content_hash": "449fced61b16cc664bf05fbaa9d694ee49261e6229c50797d97687115540a79f"
+  },
+  {
+    "title": "SRL-Helpdesk backdoor account interactive use: Computer Management, Remote Desktop, cmd (UserAssist ~2012-04-04)",
+    "observation": "RegRipper userassist on the reconstructed SRL-Helpdesk NTUSER.DAT (dd-carved from MFT 90723, fragmented runs 1204252-1204379 + 3063109-3063119) shows UserAssist key LastWrite 2012-04-04 05:41:21Z. GUI execution entries (GUID {CEBFF5CD-...}) include: CompMgmtLauncher.exe (2012-04-04 20:00:47Z), and under 2012-04-04 05:39:34Z: calc.exe, SnippingTool.exe, mspaint.exe, magnify.exe, solitaire.exe, Microsoft.Windows.RemoteDesktop, Microsoft.Windows.GettingStarted; value names without timestamps include cmd.exe and SystemPropertiesProtection.exe. The NTUSER.DAT $SI Created 2012-03-15 21:20:10Z (profile first created), File Modified 2012-04-06 13:43:16Z.",
+    "interpretation": "The SRL-Helpdesk local admin account (F-jgore-002) was used interactively (hands-on-keyboard) on 2012-04-04: it launched Computer Management (CompMgmtLauncher.exe \u2014 the console used to create/modify local users and group memberships), the Remote Desktop client, and cmd.exe. This corroborates that SRL-Helpdesk is an actively-operated account rather than a dormant provisioned one, and is consistent with an attacker using it for account management and lateral movement over RDP (MITRE T1078.003, T1021.001). The profile creation (2012-03-15) and SAM account creation (2012-03-13, F-002) are close in time. Alternative benign explanation (a real helpdesk technician performing support) remains possible but is weakened by the account's anomalous creation and the surrounding malware/persistence findings.",
+    "confidence": "MEDIUM",
+    "confidence_justification": "UserAssist entries are primary-source facts from a validated hive reconstruction and independently corroborate the SAM-derived account finding (F-002), raising overall confidence in active use. Held at MEDIUM (not HIGH) for the malicious-intent inference, which still lacks Security event-log logon-type corroboration (parser unavailable).",
+    "type": "finding",
+    "audit_ids": [
+      "shell-jgore-20260616-017"
+    ],
+    "event_timestamp": "2012-04-04T20:00:47Z",
+    "host": "WKS-WIN764BITB",
+    "affected_account": "WKS-WIN764BITB\\SRL-Helpdesk",
+    "mitre_ids": [
+      "T1078.003",
+      "T1021.001"
+    ],
+    "iocs": [
+      {
+        "value": "SRL-Helpdesk",
+        "type": "user-account"
+      }
+    ],
+    "id": "F-jgore-006",
+    "status": "DRAFT",
+    "staged": "2026-06-16T02:39:22.689624+00:00",
+    "modified_at": "2026-06-16T02:39:22.689624+00:00",
+    "created_by": "jgore",
+    "examiner": "jgore",
+    "provenance": "MCP",
+    "provenance_detail": {
+      "mcp": [
+        "shell-jgore-20260616-017"
+      ],
+      "hook": [],
+      "shell": [],
+      "none": [],
+      "summary": "MCP"
+    },
+    "provenance_grade": "PARTIAL",
+    "supporting_commands": [
+      {
+        "command": "dd ...skip=1204252 count=128 ; dd ...skip=3063109 count=11 oflag=append ; rip.pl -r NTUSER_SRL.bin -p userassist",
+        "output_excerpt": "UserAssist LastWrite 2012-04-04 05:41:21Z; {CEBFF5CD...} 2012-04-04 20:00:47Z CompMgmtLauncher.exe (1); Microsoft.Windows.RemoteDesktop (8); cmd.exe (no timestamp)",
+        "purpose": "Reconstruct SRL-Helpdesk NTUSER.DAT and parse UserAssist GUI execution"
+      }
+    ],
+    "timeline_event_id": "T-jgore-007",
+    "content_hash": "4b3e12030b02bca132686c34bfaf11a54dbe7acea7ce9f14568b6a7ccef3b39c"
+  },
+  {
+    "title": "USB mass-storage device (HP v100w) connected 2012-04-07, day before acquisition",
+    "observation": "RegRipper usbstor on SYSTEM.bin: ControlSet001\\Enum\\USBStor contains a single device Disk&Ven_HP&Prod_v100w&Rev_1024, S/N AA951D0000007252&0, FriendlyName 'HP v100w USB Device', with first-insert and all key LastWrite timestamps 2012-04-07 18:50:55Z. Image acquisition occurred ~2012-04-08 (hive file-modified times).",
+    "interpretation": "Exactly one USB mass-storage device has ever been enumerated on this host, an HP v100w flash drive connected 2012-04-07 18:50:55Z \u2014 less than a day before acquisition. This could be (a) responder/acquisition media used during collection, or (b) attacker-staging/exfiltration media. The single timestamp does not by itself indicate data transfer. Drive-letter/volume correlation (MountedDevices / MountPoints2) and file-access artifacts would be needed to determine usage; not yet performed. Recorded as a neutral observation pending that correlation.",
+    "confidence": "LOW",
+    "confidence_justification": "The device record and timestamp are definitive from USBSTOR, but the purpose (benign responder media vs malicious staging) is undetermined without further correlation; confidence reflects interpretation uncertainty, not the fact of connection.",
+    "type": "finding",
+    "audit_ids": [
+      "shell-jgore-20260616-018"
+    ],
+    "event_timestamp": "2012-04-07T18:50:55Z",
+    "host": "WKS-WIN764BITB",
+    "iocs": [
+      {
+        "value": "USB S/N AA951D0000007252",
+        "type": "device"
+      }
+    ],
+    "id": "F-jgore-007",
+    "status": "DRAFT",
+    "staged": "2026-06-16T02:39:31.245540+00:00",
+    "modified_at": "2026-06-16T02:39:31.245540+00:00",
+    "created_by": "jgore",
+    "examiner": "jgore",
+    "provenance": "MCP",
+    "provenance_detail": {
+      "mcp": [
+        "shell-jgore-20260616-018"
+      ],
+      "hook": [],
+      "shell": [],
+      "none": [],
+      "summary": "MCP"
+    },
+    "provenance_grade": "PARTIAL",
+    "supporting_commands": [
+      {
+        "command": "rip.pl -r SYSTEM.bin -p usbstor",
+        "output_excerpt": "Disk&Ven_HP&Prod_v100w&Rev_1024 [2012-04-07 18:50:55] S/N: AA951D0000007252&0 FriendlyName: HP v100w USB Device",
+        "purpose": "Enumerate USB storage device history"
+      }
+    ],
+    "timeline_event_id": "T-jgore-008",
+    "content_hash": "2cb5bfb66c92adacce5b4f02657ed9c7a9379a5f887fe69bbebd380a8735e569"
+  },
+  {
+    "title": "IOC sweep: custom YARA rule detects spinlock.exe; anti-forensics (BCWipe) present; chrome_updater.exe initial-access lead",
+    "observation": "A custom YARA rule (SRL_spinlock_pyinstaller) authored at /cases/e2e-demo/extractions/rules/spinlock_iocs.yar matched the carved spinlock.exe.bin, with string hits: $mz 4D5A at 0x0, $mei _MEIPASS2 at 0x14400/0x14468, $py bpython25.dll at 0x22aa16, $pyver %spython%02d.dll at 0x14e3c, $pyhome PYTHONHOME= at 0x14f10, $err 'Error loading Python DLL' at 0x14e0c. AppCompatCache (ShimCache, SYSTEM.bin) has LastWrite 2012-03-15 22:33:26Z (equal to last clean ShutdownTime); spinlock.exe is absent from ShimCache (cache not flushed after the 2012-03-15 shutdown, so the 2012-04 malware activity post-dates it). ShimCache contains the Jetico BCWipe suite executed: C:\\Program Files (x86)\\Jetico\\BCWipe\\{BCWipe.exe, BCWipeSvc.exe, BCResident.exe, BCWipeTM.exe, bcupdt.exe} and an install via C:\\Users\\rsydow\\AppData\\Local\\Temp\\~bcwipe5.TMP\\Setup.exe. ShimCache also shows repeated C:\\Users\\nfury\\AppData\\Local\\Google\\Update\\Install\\{GUID}\\chrome_updater.exe executions (2011-2012).",
+    "interpretation": "The custom YARA rule provides a reusable detection signature for the spinlock.exe PyInstaller backdoor (F-jgore-003) and confirms its PyInstaller/Python characteristics by content. The ShimCache LastWrite equalling the last clean shutdown explains why spinlock.exe is not listed there \u2014 a temporal artifact, not exculpatory. The presence and execution of Jetico BCWipe (secure-deletion / anti-forensics software, MITRE T1070.004 / T1485) provides a plausible mechanism for the deleted dllhost\\svchost.exe payload (F-005) and wiped Prefetch entries, though the recorded BCWipe exec timestamps are 2011 and do not themselves prove wiping during the incident. chrome_updater.exe running from nfury's per-user Google Update GUID folders is suspicious because Google's genuine updater is GoogleUpdate.exe, not chrome_updater.exe; this is a candidate initial-access/masquerading artifact (T1036) in the primary user's profile that warrants deeper analysis (carve + hash + YARA), not yet performed.",
+    "confidence": "MEDIUM",
+    "confidence_justification": "The YARA match and ShimCache entries are deterministic primary-source facts. BCWipe-as-anti-forensics and chrome_updater.exe-as-malicious are interpretive leads with circumstantial support (naming, location, timing) and are explicitly flagged for follow-up; hence MEDIUM overall.",
+    "type": "finding",
+    "audit_ids": [
+      "shell-jgore-20260616-019",
+      "shell-jgore-20260616-020"
+    ],
+    "event_timestamp": "2012-04-05T16:54:26Z",
+    "host": "WKS-WIN764BITB",
+    "mitre_ids": [
+      "T1070.004",
+      "T1036"
+    ],
+    "iocs": [
+      "C:\\Users\\nfury\\AppData\\Local\\Google\\Update\\Install\\chrome_updater.exe",
+      "C:\\Program Files (x86)\\Jetico\\BCWipe\\BCWipe.exe"
+    ],
+    "id": "F-jgore-008",
+    "status": "DRAFT",
+    "staged": "2026-06-16T02:39:56.857795+00:00",
+    "modified_at": "2026-06-16T02:39:56.857795+00:00",
+    "created_by": "jgore",
+    "examiner": "jgore",
+    "provenance": "MCP",
+    "provenance_detail": {
+      "mcp": [
+        "shell-jgore-20260616-019",
+        "shell-jgore-20260616-020"
+      ],
+      "hook": [],
+      "shell": [],
+      "none": [],
+      "summary": "MCP"
+    },
+    "provenance_grade": "PARTIAL",
+    "supporting_commands": [
+      {
+        "command": "yara -s /cases/e2e-demo/extractions/rules/spinlock_iocs.yar spinlock.exe.bin",
+        "output_excerpt": "SRL_spinlock_pyinstaller spinlock.exe.bin; 0x14400:$mei: _MEIPASS2; 0x22aa16:$py: bpython25.dll; SRL_spinlock_known_hash (filesize==2271885)",
+        "purpose": "Detection signature for the PyInstaller backdoor"
+      },
+      {
+        "command": "rip.pl -r SYSTEM.bin -p appcompatcache | grep -iE 'BCWipe|chrome_updater|spinlock'",
+        "output_excerpt": "ShimCache LastWrite 2012-03-15 22:33:26Z; C:\\Program Files (x86)\\Jetico\\BCWipe\\BCWipe.exe Executed; C:\\Users\\nfury\\AppData\\Local\\Google\\Update\\Install\\{GUID}\\chrome_updater.exe Executed; (no spinlock.exe entry)",
+        "purpose": "Anti-forensics tooling and initial-access lead from ShimCache"
+      }
+    ],
+    "timeline_event_id": "T-jgore-009",
+    "content_hash": "92fb4934904b3c6f2f7eff71cf7e4edf9a0ff2879b7b4851c537548333e8934f"
+  },
+  {
+    "title": "Evidence/tooling gaps: Windows event logs unparsed (no EVTX parser); Security.evtx small; C2 packed",
+    "observation": "Security.evtx (MFT 57679), System.evtx (57677) and Application.evtx (57678) are present in Windows\\System32\\winevt\\Logs. No EVTX parser is installed in this environment (EvtxECmd, plaso/log2timeline, and hayabusa all report unavailable; only RegRipper/SleuthKit/yara/strings/Volatility3 are present). Security.evtx istat shows $DATA logical size 1,118,208 bytes but initialized size only 80,896 bytes (most of the file is sparse/zero), and is fragmented (runs 173571-173587 + 5338408-5338410). spinlock.exe (F-003) is PyInstaller-packed, so its Python payload and any C2 indicators are zlib-compressed and not recoverable via strings without unpacking.",
+    "interpretation": "Three evidence gaps are recorded explicitly (absence of evidence is not evidence of absence): (1) Windows Security/System/Application event logs could not be parsed for account-management (4720/4722/4732), logon (4624/4625, RDP type 10) or log-clearing (1102) events because no EVTX parser exists in this toolset \u2014 a tooling limitation; these events would be the primary corroboration for SRL-Helpdesk creation/logons (F-002/F-006) and should be parsed on a workstation with EvtxECmd/plaso. (2) The small initialized size of Security.evtx (~80 KB) is consistent with either a low-activity workstation or log truncation/clearing and warrants review once parseable. (3) spinlock.exe network/C2 indicators require PyInstaller unpacking (e.g., on REMnux) to recover. None of these gaps contradict the staged findings; they bound what remains unverified.",
+    "confidence": "HIGH",
+    "confidence_justification": "The presence of the event-log files and the absence of a parser are directly observed (fls + check_tools), as is the Security.evtx initialized-size from istat. This finding states verified facts about gaps, not an interpretive conclusion.",
+    "type": "finding",
+    "audit_ids": [
+      "shell-jgore-20260616-021",
+      "shell-jgore-20260616-022"
+    ],
+    "event_timestamp": "2012-04-08",
+    "host": "WKS-WIN764BITB",
+    "iocs": [],
+    "id": "F-jgore-009",
+    "status": "DRAFT",
+    "staged": "2026-06-16T02:40:10.260546+00:00",
+    "modified_at": "2026-06-16T02:40:10.260546+00:00",
+    "created_by": "jgore",
+    "examiner": "jgore",
+    "provenance": "MCP",
+    "provenance_detail": {
+      "mcp": [
+        "shell-jgore-20260616-021",
+        "shell-jgore-20260616-022"
+      ],
+      "hook": [],
+      "shell": [],
+      "none": [],
+      "summary": "MCP"
+    },
+    "provenance_grade": "PARTIAL",
+    "supporting_commands": [
+      {
+        "command": "grep winevt/Logs fls.txt ; check_tools EvtxECmd/log2timeline/hayabusa",
+        "output_excerpt": "Security.evtx (57679), System.evtx (57677), Application.evtx (57678) present; EvtxECmd/log2timeline/hayabusa: available=false",
+        "purpose": "Confirm event logs present but no parser available"
+      },
+      {
+        "command": "istat /cases/e2e-demo/evidence-raw/ewf1 57679",
+        "output_excerpt": "$DATA size 1118208 init_size 80896; runs 173571-173587 + 5338408-5338410 then sparse",
+        "purpose": "Security.evtx size/initialized-size/fragmentation"
+      }
+    ],
+    "timeline_event_id": "T-jgore-010",
+    "content_hash": "56bbae2cd1dc403cbe8a02b9bc6aba703a339f9d9684d8a4da101b7c816d36ac"
+  }
+]
