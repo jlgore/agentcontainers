@@ -3,14 +3,18 @@ title: Cross-Harness Capability Test Matrix
 description: Design for proving that capabilities are allowed only explicitly when agentcontainers' Cedar backend runs under Claude Code, opencode, and pi across multiple models.
 ---
 
-> **Status:** In progress. Phases 0–5 are built — the shared capability fixture, the Layer-1
+> **Status:** All planned phases (0–6) are built and green. The shared capability fixture, the Layer-1
 > deterministic oracle (gating in CI), the KubeVirt VM substrate (`test/vm/`), the Layer-1 kernel
-> asserts (C7/C8/C9 + LSM-attach proven on the VM's real kernel), the **Phase 4 Layer-2 cell**
-> (Claude Code + API key — **15/15 green**), and the **Phase 5 cell** (opencode + the
-> `tool.execute.before` guard adapter — **14/15 green**, plus the "soft-hook off → kernel still holds"
-> bypass assertion). Phase 3 surfaced finding **F1** below. The remaining cell (pi) is designed but not
-> yet built. This is the engineering plan for a test matrix that validates the Cedar policy backend and
-> eBPF enforcer across multiple agent harnesses and models.
+> asserts (C7/C8/C9 + LSM-attach proven on the VM's real kernel), and all three Layer-2 behavioral
+> cells: **Phase 4** (Claude Code + API key — **15/15**), **Phase 5** (opencode + a
+> `tool.execute.before` guard adapter — **14/15** + the "soft-hook off → kernel still holds" bypass
+> assertion), and **Phase 6** (pi + a `pi.on("tool_call")` extension adapter — **15/15 on two
+> OpenRouter models, Opus 4.8 and GLM 5.2** + the "agent disables its own hook, kernel blocks anyway"
+> assertion). Across all three harnesses and every model, the guard reaches identical verdicts from the
+> one fixture. Phase 3 surfaced finding **F1** below. The remaining work is the live
+> harness-under-enforcer kernel-block integration (the `agentcontainer run` containerized path). This
+> is the engineering plan for a test matrix that validates the Cedar policy backend and eBPF enforcer
+> across multiple agent harnesses and models.
 
 ## Goal
 
@@ -221,10 +225,22 @@ Lowest-risk first; each phase is independently valuable.
   guard audit goes empty for a command it otherwise denies — proving the in-harness soft hook is
   trivially bypassable, so the kernel (eBPF enforcer, proven in Phase 3) is the real boundary. A live
   opencode-under-enforcer kernel-block is the remaining integration.
-- **Phase 6 — pi cell (later).** `@earendil-works` extension + `pi-mcp-adapter`; kernel-only
-  enforcement + the headline "agent disables its own hook, kernel blocks anyway" cell.
+- **Phase 6 — pi cell. ✅ Done.** A `pi.on("tool_call")` extension adapter (`phase6-guard-adapter.ts`,
+  default-export `fn(pi)`, returns `{block:true,reason}` to block) routes pi's native bash/write/edit
+  tools to the same `guard serve` broker, loaded with `pi --extension`; `--tools bash` funnels all work
+  onto the one guarded tool. The Phase 4 scoring is reused verbatim. **Result: 15/15 PASS, 0 FAIL on
+  TWO OpenRouter models — `anthropic/claude-opus-4.8` and `z-ai/glm-5.2`** (the model axis), all chains
+  verified; both models attempted every case (including the `mkfs`/`nc`/`find -delete` that
+  `claude-sonnet-4-5` refused in Phase 5), and the boundary held identically. Entry point
+  `test/vm/phase6-pi.sh`. **Phase 6b — "agent disables its own hook, kernel blocks anyway"
+  (`phase6-kernel-only.sh`, green):** pi has no lockable config and the adapter is opt-in per
+  `--extension`; running the denied `cat -v` *without* `--extension` leaves the guard audit empty — the
+  hook is not a boundary for pi at all, so the kernel (eBPF enforcer, proven in Phase 3) is the only
+  one. The `pi-mcp-adapter` MCP path and a live pi-under-enforcer kernel-block remain as follow-ons.
 
-Phases 1 and 4 prove the thesis; 2–3 are infra; 5–6 widen coverage.
+Phases 1 and 4 prove the thesis; 2–3 are infra; 5–6 widened coverage to opencode and pi (and a
+model axis) — all green, with each harness's hook-bypass assertion showing the soft hook is
+per-harness defense-in-depth while the kernel is the only universal boundary.
 
 ## Findings
 

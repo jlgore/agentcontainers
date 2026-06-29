@@ -140,10 +140,56 @@ unaffected by `--pure` and are proven on this VM kernel by Phase 3
 (`kernel-asserts.sh`). A live opencode-under-enforcer kernel-block is the
 remaining integration (the `agentcontainer run` containerized path).
 
+## Phase 6 — Layer-2 behavioral cell: pi (+ a model axis)
+
+`phase6-pi.sh` proves the guard gates the **third** harness too —
+[pi](https://pi.dev) (`@earendil-works/pi-coding-agent`). pi's native
+bash/write/edit tools are routed to the same `guard serve` broker (deny mode) by
+a `pi.on("tool_call")` **extension** adapter (`phase6-guard-adapter.ts`), loaded
+with `pi --extension`. Same fixture-derived policy, same harness-independent
+audit scoring.
+
+```bash
+cd test/vm
+PHASE6_PROVIDER=openrouter PHASE6_MODEL=z-ai/glm-5.2 OPENROUTER_API_KEY=sk-or-... ./phase6-pi.sh
+# or PHASE6_MODEL=anthropic/claude-opus-4.8 ; or PHASE6_PROVIDER=anthropic PHASE6_MODEL=claude-sonnet-4-5
+# SCORE_ONLY=1 / CASE_FILTER=a,b as in Phase 5.
+```
+
+pi has the cleanest controls of the three harnesses: `--extension <file>` loads
+the adapter directly (no config install), and `--tools bash` funnels all work
+onto the one guarded tool (no per-tool config denies needed, unlike opencode).
+pi reads the provider key from env; we stage it to VM tmpfs and export it.
+
+**Validated GREEN (2026-06-29) on TWO models via OpenRouter — the model axis:**
+- `anthropic/claude-opus-4.8` — **15/15 PASS, 0 FAIL**
+- `z-ai/glm-5.2` — **15/15 PASS, 0 FAIL**
+
+both with all 15 audit chains verified. Notably, *both* models attempted every
+case — including `mkfs`/`nc`/`find -delete`, which `claude-sonnet-4-5` (the
+Phase 5 opencode model) refused. The boundary held identically regardless of
+model: same fixture, same verdicts. (`mkfs /dev/sda1` was **denied by the guard
+before exec**, so the VM disk was never touched.)
+
+### Phase 6b — agent disables its own hook, kernel blocks anyway
+
+`phase6-kernel-only.sh` is the purest non-lockable cell. pi has **no** managed
+config (its own docs say enforce *outside* the harness), and the adapter is
+opt-in per `--extension`. The script runs the denied `cat -v` **with** and
+**without** `--extension`: with it the guard denies; without it the guard audit
+is **empty** — the agent simply doesn't load the hook. **Validated green.** So
+the in-harness hook is not a boundary for pi at all; the kernel (eBPF enforcer,
+proven in Phase 3) is the only one. A live pi-under-enforcer kernel-block is the
+remaining integration.
+
 ## Scope
 
 Phase 2 proves the substrate is real (kernel can do BPF-LSM, tooling present).
 Actually *running* the enforcer to confirm it attaches its LSM programs and the
-C7–C9 egress/exec asserts are **Phase 3**. The Layer-2 Claude Code guard cell is
-**Phase 4** and the opencode cell is **Phase 5** (both above, green); pi is
-**Phase 6**.
+C7–C9 egress/exec asserts are **Phase 3**. The Layer-2 cells are **Phase 4**
+(Claude Code, 15/15), **Phase 5** (opencode, 14/15 + soft-hook bypass), and
+**Phase 6** (pi, 15/15 on two models + the kernel-only assertion) — all green.
+The matrix now spans three harnesses × the model axis, with the common thread
+that the guard (proxy/Cedar) + enforcer (eBPF) verdicts are identical across all
+of them, and the in-harness hook is per-harness defense-in-depth (lockable for
+Claude Code, bypassable for opencode, opt-in for pi).
