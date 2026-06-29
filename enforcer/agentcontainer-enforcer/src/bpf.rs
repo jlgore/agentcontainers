@@ -234,8 +234,8 @@ mod linux {
     };
     use agentcontainer_common::events as bpf_events;
     use agentcontainer_common::maps::{
-        tool_identity, ActiveTool, CgroupStats, FsInodeKey, LpmDataV4, LpmDataV6, PortKeyV4,
-        PortKeyV6, SecretAclKey, SecretAclValue, SecretToolKey, CGROUP_FLAG_ENFORCED,
+        tool_identity, ActiveTool, CgroupStats, FsInodeKey, KernelOffsets, LpmDataV4, LpmDataV6,
+        PortKeyV4, PortKeyV6, SecretAclKey, SecretAclValue, SecretToolKey, CGROUP_FLAG_ENFORCED,
         CGROUP_FLAG_EXEC_ENFORCED, FS_PERM_READ, FS_PERM_WRITE, LPM_CGROUP_PREFIX,
     };
     use anyhow::Context as _;
@@ -542,6 +542,13 @@ mod linux {
             let elf_bytes = Self::load_bpf_elf()?;
             let mut bpf = Ebpf::load(&elf_bytes)
                 .map_err(|e| anyhow::anyhow!("failed to load BPF programs: {e}"))?;
+
+            // Resolve kernel struct field offsets from BTF and publish them into
+            // KERNEL_OFFSETS BEFORE attaching any program, so the LSM hooks read
+            // correct offsets from their first invocation. The Rust eBPF toolchain
+            // emits no CO-RE relocations, so hardcoded offsets break across kernel
+            // versions; this is the portable substitute. Fail closed at startup.
+            Self::populate_kernel_offsets(&mut bpf)?;
 
             // Initialize BPF logging (non-fatal — tracing may not be wired yet).
             if let Err(e) = aya_log::EbpfLogger::init(&mut bpf) {
@@ -1010,6 +1017,67 @@ mod linux {
                  Searched paths: {:?}",
                 BPF_ELF_PATHS,
             )
+        }
+
+        /// Resolve the kernel struct field byte-offsets the LSM hooks need from
+        /// the running kernel's BTF. Portable across kernel versions — the Rust
+        /// eBPF toolchain emits no CO-RE relocations, so the eBPF side reads
+        /// `base + offset` using these instead of hardcoded `#[repr(C)]` mirrors.
+        fn resolve_kernel_offsets() -> anyhow::Result<KernelOffsets> {
+            use btf_rs::Type;
+            let btf = btf_rs::Btf::from_file("/sys/kernel/btf/vmlinux").map_err(|e| {
+                anyhow::anyhow!("loading kernel BTF (/sys/kernel/btf/vmlinux): {e}")
+            })?;
+            let byte_off = |strct: &str, field: &str| -> anyhow::Result<u32> {
+                let types = btf
+                    .resolve_types_by_name(strct)
+                    .map_err(|e| anyhow::anyhow!("BTF lookup for struct {strct}: {e}"))?;
+                for t in types {
+                    let s = match t {
+                        Type::Struct(s) | Type::Union(s) => s,
+                        _ => continue,
+                    };
+                    for m in &s.members {
+                        let name = btf
+                            .resolve_name(m)
+                            .map_err(|e| anyhow::anyhow!("BTF member name in {strct}: {e}"))?;
+                        if name == field {
+                            if m.bitfield_size().unwrap_or(0) != 0 {
+                                anyhow::bail!("{strct}.{field} is a bitfield (unsupported)");
+                            }
+                            return Ok(m.bit_offset() / 8);
+                        }
+                    }
+                }
+                anyhow::bail!("{strct}.{field} not found in kernel BTF")
+            };
+            Ok(KernelOffsets {
+                binprm_file: byte_off("linux_binprm", "file")?,
+                file_f_inode: byte_off("file", "f_inode")?,
+                file_f_path: byte_off("file", "f_path")?,
+                file_f_flags: byte_off("file", "f_flags")?,
+                path_dentry: byte_off("path", "dentry")?,
+                dentry_d_name: byte_off("dentry", "d_name")?,
+                qstr_name: byte_off("qstr", "name")?,
+                inode_i_ino: byte_off("inode", "i_ino")?,
+                inode_i_sb: byte_off("inode", "i_sb")?,
+                sb_s_dev: byte_off("super_block", "s_dev")?,
+                sb_s_magic: byte_off("super_block", "s_magic")?,
+            })
+        }
+
+        /// Populate the single-entry KERNEL_OFFSETS array map from BTF, before
+        /// any program is attached. A failure here is fatal: without correct
+        /// offsets the LSM hooks cannot verify executable/file identity.
+        fn populate_kernel_offsets(bpf: &mut Ebpf) -> anyhow::Result<()> {
+            let offsets = Self::resolve_kernel_offsets()?;
+            let map = bpf
+                .map_mut("KERNEL_OFFSETS")
+                .ok_or_else(|| anyhow::anyhow!("BPF map KERNEL_OFFSETS not found"))?;
+            let mut arr: aya::maps::Array<_, KernelOffsets> = aya::maps::Array::try_from(map)?;
+            arr.set(0, offsets, 0)?;
+            info!(?offsets, "resolved kernel struct offsets from BTF");
+            Ok(())
         }
 
         /// Resolve a cgroup filesystem path to a cgroup ID (inode number).

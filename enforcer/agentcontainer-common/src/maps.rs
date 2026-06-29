@@ -220,6 +220,33 @@ pub const LSM_DENY: i32 = -13; // -EACCES
 pub const PROC_SUPER_MAGIC: u64 = 0x9fa0;
 pub const DENTRY_NAME_LEN: usize = 32;
 
+// --- Kernel struct field offsets (CO-RE substitute) ---
+
+/// Byte offsets of the kernel struct fields the LSM hooks walk, resolved from
+/// the running kernel's BTF in userspace at startup and published to the eBPF
+/// programs via the single-entry `KERNEL_OFFSETS` array map.
+///
+/// The Rust eBPF toolchain emits no CO-RE field relocations (aya-ebpf 0.1.x),
+/// so hardcoded `#[repr(C)]` mirror offsets silently break across kernel
+/// versions — e.g. `linux_binprm`'s first field is `vma`, not `file`, on 6.x.
+/// Resolving offsets from BTF and reading `base + offset` is portable across
+/// 5.15–6.x. All values are byte offsets.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KernelOffsets {
+    pub binprm_file: u32,   // linux_binprm.file       (*file)
+    pub file_f_inode: u32,  // file.f_inode            (*inode)  — stable since v3.9
+    pub file_f_path: u32,   // file.f_path             (struct path, embedded)
+    pub file_f_flags: u32,  // file.f_flags            (u32)
+    pub path_dentry: u32,   // path.dentry             (*dentry)
+    pub dentry_d_name: u32, // dentry.d_name          (struct qstr, embedded)
+    pub qstr_name: u32,     // qstr.name               (*u8)
+    pub inode_i_ino: u32,   // inode.i_ino             (unsigned long)
+    pub inode_i_sb: u32,    // inode.i_sb              (*super_block)
+    pub sb_s_dev: u32,      // super_block.s_dev       (dev_t / u32)
+    pub sb_s_magic: u32,    // super_block.s_magic     (unsigned long)
+}
+
 // --- aya Pod impls (userspace only) ---
 
 // SAFETY: All types are #[repr(C)], Copy, and 'static — they satisfy Pod requirements.
@@ -237,6 +264,7 @@ mod pod_impls {
     unsafe impl aya::Pod for super::LpmDataV6 {}
     unsafe impl aya::Pod for super::DomainKey {}
     unsafe impl aya::Pod for super::CgroupStats {}
+    unsafe impl aya::Pod for super::KernelOffsets {}
     unsafe impl aya::Pod for crate::siphash::SipHashKey {}
 }
 

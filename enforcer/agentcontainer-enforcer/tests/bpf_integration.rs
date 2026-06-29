@@ -732,9 +732,9 @@ async fn test_apply_to_unregistered_container_errors() {
 /// shape Docker init has). The parent registers the cgroup with the child's
 /// PID and applies a deny on the *container* path `/secret.txt`, which must
 /// resolve through `/proc/<pid>/root` to the overlay inode. The child then
-/// opens the file: EPERM proves registration-time stat and the in-kernel
-/// `d_inode` agree on overlayfs. A sibling `/allowed.txt` must still open,
-/// proving the deny is inode-exact.
+/// opens the file: an EACCES deny (the enforcer's `LSM_DENY`) proves
+/// registration-time stat and the in-kernel `d_inode` agree on overlayfs. A
+/// sibling `/allowed.txt` must still open, proving the deny is inode-exact.
 ///
 /// Requires root (mounts an overlay) on top of the usual BPF capabilities —
 /// skipped (not failed) when not root, since plain CAP_BPF runners can't
@@ -835,8 +835,8 @@ async fn test_overlayfs_deny_resolves_via_proc_root() {
             if denied >= 0 {
                 libc::_exit(1); // deny did not fire: inode key mismatch
             }
-            if denied_errno != libc::EPERM {
-                libc::_exit(2); // failed for the wrong reason
+            if denied_errno != libc::EACCES {
+                libc::_exit(2); // failed for the wrong reason (deny is LSM_DENY = -EACCES)
             }
             if allowed < 0 {
                 libc::_exit(3); // collateral damage: deny was not inode-exact
@@ -1496,4 +1496,196 @@ async fn test_unrestricted_secret_allows_overlapping_calls() {
         .unwrap();
 
     mgr.unregister("test-unrestricted").await.unwrap();
+}
+
+// ===========================================================================
+// Tier 10: Capability-matrix kernel asserts (C7/C8/C9)
+//
+// The hard-boundary classes from the cross-harness test matrix (docs:
+// project/test-matrix) that are enforced at the KERNEL, not by the Cedar policy
+// engine: declared-egress allow (C7), undeclared-egress deny (C8), and
+// non-allowlisted exec deny (C9). The Layer-1 oracle proves C1-C6 in pure Go;
+// these prove what only a real kernel can.
+// ===========================================================================
+
+/// C7 + C8: an enforced cgroup with a network policy is default-deny — a
+/// connection to a DECLARED host is allowed (C7); an UNDECLARED host is blocked
+/// at the connect4 hook (C8). UDP connect() drives the hook without emitting
+/// packets; both addresses are documentation-range (never routed).
+#[tokio::test]
+#[serial]
+async fn test_egress_allowlist_allows_declared_denies_undeclared() {
+    let mgr = BpfPolicyManager::new().unwrap();
+    let cgroup = own_cgroup_path();
+    mgr.register("test-cap-egress", &cgroup, 0).await.unwrap();
+
+    // Only 198.51.100.5 (TEST-NET-2) is declared.
+    let policy = NetworkPolicy {
+        allowed_hosts: vec!["198.51.100.5".into()],
+        egress_rules: vec![],
+        dns_servers: vec![],
+        blocked_cidrs: vec![],
+    };
+    mgr.apply_network("test-cap-egress", &policy).await.unwrap();
+
+    let udp_connect =
+        |dst: &str| -> std::io::Result<()> { std::net::UdpSocket::bind("0.0.0.0:0")?.connect(dst) };
+
+    let declared = udp_connect("198.51.100.5:443"); // C7
+    let undeclared = udp_connect("203.0.113.7:443"); // C8 (TEST-NET-3, not declared)
+
+    mgr.unregister("test-cap-egress").await.unwrap();
+
+    assert!(
+        declared.is_ok(),
+        "C7: declared egress host was denied: {declared:?}"
+    );
+    assert!(
+        matches!(&undeclared, Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+        "C8: undeclared egress host was NOT denied: {undeclared:?}"
+    );
+}
+
+// Shared by the C9 exec tests: skip unless root + bpf LSM active (mirrors the
+// overlayfs LSM test); resolve true/false binaries; fork+execve a path and
+// report the outcome as an exit code (0 = exec succeeded, 42 = denied EACCES,
+// 43 = some other errno).
+fn skip_unless_lsm(name: &str) -> bool {
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("skipping {name}: requires root");
+        return true;
+    }
+    let active = std::fs::read_to_string("/sys/kernel/security/lsm").unwrap_or_default();
+    if !active.trim_end().split(',').any(|l| l == "bpf") {
+        eprintln!("skipping {name}: BPF LSM not active (lsm={active})");
+        return true;
+    }
+    false
+}
+
+fn resolve_bin(a: &str, b: &str) -> String {
+    if std::path::Path::new(a).exists() {
+        a.into()
+    } else {
+        b.into()
+    }
+}
+
+fn exec_in_child(path: &std::ffi::CStr) -> i32 {
+    let argv = [path.as_ptr(), std::ptr::null()];
+    let envp = [std::ptr::null()];
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0, "fork failed");
+    if child == 0 {
+        unsafe {
+            libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+            let e = *libc::__errno_location(); // only reached if execve failed
+            libc::_exit(if e == libc::EACCES { 42 } else { 43 });
+        }
+    }
+    let mut wstatus = 0i32;
+    unsafe { libc::waitpid(child, &mut wstatus, 0) };
+    if libc::WIFEXITED(wstatus) {
+        libc::WEXITSTATUS(wstatus)
+    } else {
+        -1
+    }
+}
+
+/// C9 (hard boundary): with a non-empty exec allowlist applied, an execve of a
+/// NON-allowlisted binary is denied (EACCES) at the bprm_check LSM hook. Also
+/// asserts the BPF LSM actually attached (`lsm_status().active`) — the
+/// "not self-skipped" proof the connect/sendmsg hooks can't make. This is the
+/// security-critical direction (default-deny) and is the gating C9 assert.
+#[tokio::test]
+#[serial]
+async fn test_exec_allowlist_denies_nonlisted_binary() {
+    if skip_unless_lsm("test_exec_allowlist_denies_nonlisted_binary") {
+        return;
+    }
+    let true_bin = resolve_bin("/bin/true", "/usr/bin/true");
+    let false_bin = resolve_bin("/bin/false", "/usr/bin/false");
+
+    let mgr = BpfPolicyManager::new().expect("BPF programs should load");
+    let cgroup = own_cgroup_path();
+    let handle = mgr
+        .register("test-cap-exec-deny", &cgroup, 0)
+        .await
+        .unwrap();
+
+    let status = mgr.lsm_status();
+    assert!(
+        status.active,
+        "BPF LSM not attached — exec enforcement would be a no-op: {}",
+        status.detail
+    );
+
+    mgr.apply_process(
+        "test-cap-exec-deny",
+        &ProcessPolicy {
+            allowed_binaries: vec![true_bin],
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        mgr.exec_enforced(handle.cgroup_id),
+        "a non-empty exec allowlist must opt the cgroup into exec enforcement"
+    );
+
+    let false_c = std::ffi::CString::new(false_bin.as_str()).unwrap();
+    let forbidden = exec_in_child(&false_c);
+
+    mgr.unregister("test-cap-exec-deny").await.unwrap();
+
+    assert_eq!(
+        forbidden, 42,
+        "C9: non-allowlisted exec was not denied with EACCES \
+         (got exit {forbidden}; 0 = it RAN, 43 = wrong errno)"
+    );
+}
+
+/// C9 allow-path control: an ALLOWLISTED binary must still run (and the kernel
+/// must reach this verdict via the allowlist, not by failing closed on a bad
+/// struct read). This regresses finding F1: `bprm_check` previously read the
+/// executable inode through hand-rolled `#[repr(C)]` mirrors whose offsets are
+/// wrong on 6.x (`linux_binprm`'s first field is `vma`, not `file`), so every
+/// exec was denied. The fix resolves field offsets from the kernel's BTF at
+/// startup (KERNEL_OFFSETS) and reads `base + offset` — portable across kernel
+/// versions. Requires root + an active bpf LSM; skips otherwise.
+#[tokio::test]
+#[serial]
+async fn test_exec_allowlist_permits_listed_binary() {
+    if skip_unless_lsm("test_exec_allowlist_permits_listed_binary") {
+        return;
+    }
+    let true_bin = resolve_bin("/bin/true", "/usr/bin/true");
+
+    let mgr = BpfPolicyManager::new().expect("BPF programs should load");
+    let cgroup = own_cgroup_path();
+    let handle = mgr
+        .register("test-cap-exec-allow", &cgroup, 0)
+        .await
+        .unwrap();
+    assert!(mgr.lsm_status().active);
+
+    mgr.apply_process(
+        "test-cap-exec-allow",
+        &ProcessPolicy {
+            allowed_binaries: vec![true_bin.clone()],
+        },
+    )
+    .await
+    .unwrap();
+    assert!(mgr.exec_enforced(handle.cgroup_id));
+
+    let true_c = std::ffi::CString::new(true_bin.as_str()).unwrap();
+    let allowed = exec_in_child(&true_c);
+
+    mgr.unregister("test-cap-exec-allow").await.unwrap();
+
+    assert_eq!(
+        allowed, 0,
+        "control: allowlisted binary failed to exec (exit {allowed})"
+    );
 }

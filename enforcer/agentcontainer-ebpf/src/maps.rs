@@ -7,11 +7,11 @@
 //! Map layout must match the C definitions in internal/ebpf/bpf/headers/.
 
 use aya_ebpf::macros::map;
-use aya_ebpf::maps::{HashMap, LpmTrie, PerCpuArray, PerCpuHashMap, RingBuf};
+use aya_ebpf::maps::{Array, HashMap, LpmTrie, PerCpuArray, PerCpuHashMap, RingBuf};
 
 use agentcontainer_common::maps::{
-    ActiveTool, CgroupStats, FsInodeKey, LpmDataV4, LpmDataV6, PortKeyV4, PortKeyV6, SecretAclKey,
-    SecretAclValue, SecretToolKey,
+    ActiveTool, CgroupStats, FsInodeKey, KernelOffsets, LpmDataV4, LpmDataV6, PortKeyV4, PortKeyV6,
+    SecretAclKey, SecretAclValue, SecretToolKey,
 };
 
 // --- Cgroup scoping ---
@@ -20,6 +20,13 @@ use agentcontainer_common::maps::{
 /// All BPF programs check this map first and skip non-registered cgroups.
 #[map]
 pub static ENFORCED_CGROUPS: HashMap<u64, u8> = HashMap::with_max_entries(256, 0);
+
+/// Kernel struct field byte-offsets, resolved from BTF and populated by
+/// userspace at startup (before any program is attached). The LSM hooks read
+/// index 0 to walk `linux_binprm`/`file`/`inode`/`super_block` portably across
+/// kernel versions instead of via hardcoded offsets. See [`KernelOffsets`].
+#[map]
+pub static KERNEL_OFFSETS: Array<KernelOffsets> = Array::with_max_entries(1, 0);
 
 // --- Network maps ---
 

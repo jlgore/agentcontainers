@@ -24,44 +24,22 @@ use agentcontainer_common::maps::{FsInodeKey, CGROUP_FLAG_EXEC_ENFORCED, LSM_ALL
 
 use crate::maps::{
     bump_cgroup_stat, ALLOWED_EXECS, CGROUP_STAT_PROC_ALLOWED, CGROUP_STAT_PROC_BLOCKED,
-    ENFORCED_CGROUPS, PROC_EVENTS, PROC_STATS,
+    ENFORCED_CGROUPS, KERNEL_OFFSETS, PROC_EVENTS, PROC_STATS,
 };
 
 // ---------------------------------------------------------------------------
-// Kernel struct definitions for reading linux_binprm fields via bpf_probe_read_kernel.
-// These must match the kernel's in-memory layout.
+// Kernel struct fields are read at BTF-resolved byte offsets (KERNEL_OFFSETS),
+// not via hardcoded `#[repr(C)]` mirrors: the Rust eBPF toolchain emits no CO-RE
+// relocations, so fixed offsets break across kernel versions (6.x reorders
+// `linux_binprm`/`file`). The executable inode comes from `file->f_inode`
+// (stable since v3.9), avoiding the f_path/dentry walk entirely.
 // ---------------------------------------------------------------------------
 
-#[repr(C)]
-struct LinuxBinprm {
-    file: *const File,
-}
-
-#[repr(C)]
-struct File {
-    f_path: Path,
-}
-
-#[repr(C)]
-struct Path {
-    mnt: *const u8,
-    dentry: *const Dentry,
-}
-
-#[repr(C)]
-struct Dentry {
-    d_inode: *const Inode,
-}
-
-#[repr(C)]
-struct Inode {
-    i_ino: u64,
-    i_sb: *const SuperBlock,
-}
-
-#[repr(C)]
-struct SuperBlock {
-    s_dev: u32,
+/// Read a `T` from `base + off` in kernel memory. `off` is a BTF-resolved byte
+/// offset from KERNEL_OFFSETS.
+#[inline(always)]
+unsafe fn read_at<T>(base: *const u8, off: u32) -> Result<T, i64> {
+    bpf_probe_read_kernel(base.add(off as usize) as *const T)
 }
 
 // ---------------------------------------------------------------------------
@@ -155,49 +133,36 @@ fn try_bprm_check(ctx: &LsmContext) -> Result<i32, i64> {
         return Ok(LSM_ALLOW);
     }
 
-    // Read the linux_binprm pointer from the LSM hook's first argument.
-    let bprm_ptr: *const LinuxBinprm = unsafe { ctx.arg(0) };
+    // BTF-resolved field offsets. Absent (userspace failed to populate) means we
+    // cannot verify the executable identity — fail closed.
+    let offs = match KERNEL_OFFSETS.get(0) {
+        Some(o) => o,
+        None => return Ok(deny_exec(cgroup_id, 0)),
+    };
 
-    // Read the executable file pointer from linux_binprm. A missing file or
-    // dentry/inode/superblock means the executable identity cannot be verified;
-    // for an enforced process that is a denial, not an allowance.
-    let file_ptr: *const File =
-        unsafe { bpf_probe_read_kernel(&(*bprm_ptr).file as *const _ as *const _).map_err(|e| e)? };
+    // linux_binprm* (LSM arg 0) → file* → inode* (via file->f_inode, stable
+    // since v3.9) → (i_ino, i_sb->s_dev). A missing file/inode/superblock means
+    // the identity cannot be verified; for an enforced process that is a denial.
+    let bprm_ptr: *const u8 = unsafe { ctx.arg(0) };
+
+    let file_ptr: *const u8 = unsafe { read_at(bprm_ptr, offs.binprm_file)? };
     if file_ptr.is_null() {
         return Ok(deny_exec(cgroup_id, 0));
     }
 
-    // Read the dentry pointer from file->f_path.dentry.
-    let dentry_ptr: *const Dentry = unsafe {
-        bpf_probe_read_kernel(&(*file_ptr).f_path.dentry as *const _ as *const _).map_err(|e| e)?
-    };
-    if dentry_ptr.is_null() {
-        return Ok(deny_exec(cgroup_id, 0));
-    }
-
-    // Read the inode pointer from dentry->d_inode.
-    let inode_ptr: *const Inode = unsafe {
-        bpf_probe_read_kernel(&(*dentry_ptr).d_inode as *const _ as *const _).map_err(|e| e)?
-    };
+    let inode_ptr: *const u8 = unsafe { read_at(file_ptr, offs.file_f_inode)? };
     if inode_ptr.is_null() {
         return Ok(deny_exec(cgroup_id, 0));
     }
 
-    // Read the inode number.
-    let ino: u64 = unsafe {
-        bpf_probe_read_kernel(&(*inode_ptr).i_ino as *const _ as *const _).map_err(|e| e)?
-    };
+    let ino: u64 = unsafe { read_at(inode_ptr, offs.inode_i_ino)? };
 
-    // Read the superblock pointer to get the device number.
-    let sb_ptr: *const SuperBlock = unsafe {
-        bpf_probe_read_kernel(&(*inode_ptr).i_sb as *const _ as *const _).map_err(|e| e)?
-    };
+    let sb_ptr: *const u8 = unsafe { read_at(inode_ptr, offs.inode_i_sb)? };
     if sb_ptr.is_null() {
         return Ok(deny_exec(cgroup_id, ino));
     }
 
-    let s_dev: u32 =
-        unsafe { bpf_probe_read_kernel(&(*sb_ptr).s_dev as *const _ as *const _).map_err(|e| e)? };
+    let s_dev: u32 = unsafe { read_at(sb_ptr, offs.sb_s_dev)? };
 
     // Build lookup key with device major/minor numbers.
     // Linux dev_t: MAJOR = (dev >> 20) & 0xfff, MINOR = dev & 0xfffff.
