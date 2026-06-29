@@ -1,0 +1,74 @@
+# KubeVirt substrate for the cross-harness capability test matrix (Phase 2).
+# cloud-init lives in the Secret ac-matrix-cloudinit (created by up.sh from
+# cloud-init.yaml) because inline userData exceeds KubeVirt's 2048-byte limit.
+#
+# A real guest kernel — unlike the privileged BPF-integration Job that shares the
+# node kernel — so the eBPF-LSM (bprm_check) and egress hooks arm for real. The
+# guest is pinned to talos-node (the only node exposing /dev/kvm).
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ac-matrix
+---
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: ac-matrix-vm
+  namespace: ac-matrix
+  labels:
+    app: ac-matrix
+spec:
+  runStrategy: RerunOnFailure
+  dataVolumeTemplates:
+    - metadata:
+        name: ac-matrix-vm-root
+      spec:
+        storage:
+          accessModes: ["ReadWriteOnce"]
+          storageClassName: local-path
+          resources:
+            requests:
+              storage: 20Gi
+        source:
+          http:
+            # Ubuntu 24.04 LTS (noble) cloud image — qcow2; CDI converts to raw.
+            url: "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+  template:
+    metadata:
+      labels:
+        kubevirt.io/domain: ac-matrix-vm
+        app: ac-matrix
+    spec:
+      # talos-node-2 is unreachable; pin to the KVM-capable node explicitly.
+      nodeSelector:
+        kubernetes.io/hostname: talos-node
+      domain:
+        cpu:
+          cores: 4
+        resources:
+          requests:
+            memory: 6Gi
+        devices:
+          disks:
+            - name: root
+              disk:
+                bus: virtio
+            - name: cloudinit
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              masquerade: {}
+          rng: {}
+      networks:
+        - name: default
+          pod: {}
+      volumes:
+        - name: root
+          dataVolume:
+            name: ac-matrix-vm-root
+        - name: cloudinit
+          cloudInitNoCloud:
+            secretRef:
+              name: ac-matrix-cloudinit

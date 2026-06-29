@@ -1,0 +1,75 @@
+#cloud-config
+# Capability-matrix VM first-boot setup. up.sh substitutes __SSH_PUBKEY__ and
+# loads this into the Secret ac-matrix-cloudinit (key: userdata), referenced by
+# the VM's cloudInitNoCloud.userDataSecretRef.
+hostname: ac-matrix-vm
+ssh_pwauth: false
+users:
+  - name: ubuntu
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    shell: /bin/bash
+    groups: [sudo]
+    ssh_authorized_keys:
+      - __SSH_PUBKEY__
+write_files:
+  - path: /usr/local/sbin/ac-matrix-setup.sh
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/bin/bash
+      # Idempotent first-boot setup: arm the bpf LSM (reboot once if needed),
+      # then install the substrate tooling. Re-run safely on every boot by the
+      # systemd unit until the sentinel is written.
+      set -uo pipefail
+      LSM=/sys/kernel/security/lsm
+      SENTINEL=/var/lib/ac-matrix-ready
+      log() { echo "ac-matrix-setup: $*"; }
+      [ -f "$SENTINEL" ] && { log "already ready"; exit 0; }
+
+      # 1) Ensure 'bpf' is in the active LSM list.
+      if ! grep -qw bpf "$LSM"; then
+        cur=$(cat "$LSM")
+        log "arming bpf LSM (current: $cur) — appending and rebooting"
+        if grep -q '^GRUB_CMDLINE_LINUX=' /etc/default/grub; then
+          sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"lsm=${cur},bpf\"|" /etc/default/grub
+        else
+          echo "GRUB_CMDLINE_LINUX=\"lsm=${cur},bpf\"" >> /etc/default/grub
+        fi
+        update-grub
+        systemctl reboot
+        exit 0
+      fi
+      log "bpf LSM active: $(cat $LSM)"
+
+      # 2) Substrate tooling (agent CLIs best-effort; the kernel substrate above
+      #    is the hard requirement).
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -y
+      apt-get install -y curl jq ca-certificates git \
+        linux-tools-common "linux-tools-$(uname -r)" || true
+      if ! command -v node >/dev/null 2>&1; then
+        curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+          apt-get install -y nodejs || true
+      fi
+      npm install -g @anthropic-ai/claude-code || log "claude-code install failed (non-fatal)"
+      npm install -g opencode-ai || log "opencode install failed (non-fatal)"
+
+      touch "$SENTINEL"
+      log "setup complete"
+  - path: /etc/systemd/system/ac-matrix-setup.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=ac-matrix substrate setup (bpf LSM + tooling)
+      After=network-online.target
+      Wants=network-online.target
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/ac-matrix-setup.sh
+      RemainAfterExit=yes
+      [Install]
+      WantedBy=multi-user.target
+runcmd:
+  - [ systemctl, daemon-reload ]
+  - [ systemctl, enable, --now, ac-matrix-setup.service ]

@@ -1,0 +1,2 @@
+# Rendered cloud-init (contains the injected SSH public key)
+.userdata.rendered
