@@ -7,6 +7,8 @@
 
 # Test binaries
 *.test
+# ...but not the enforcer's BPF integration-test Dockerfile (source, not a binary).
+!enforcer/Dockerfile.test
 
 # Coverage
 *.out
