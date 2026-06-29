@@ -47,6 +47,26 @@ pub struct PortKeyV4 {
     pub _pad: u8,
 }
 
+/// Key for the transient-egress hash map (IPv6), scoped per-cgroup. The IPv6
+/// analogue of `PortKeyV4` for URI-scoped egress (G4). `addr` is the 128-bit
+/// destination in the same `[u32; 4]` network-byte-order representation the
+/// connect6 hook reads from `user_ip6` (and that `LpmDataV6` uses).
+///
+/// Size = 32 bytes. ALL padding is explicit (`_pad`/`_pad2`) and MUST be zeroed
+/// by every producer: the BPF hash map keys on the full 32 bytes, so an
+/// uninitialized pad byte on either side would make a lookup miss. There is no
+/// implicit padding (8 + 16 + 2 + 1 + 1 + 4 = 32, u64-aligned).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PortKeyV6 {
+    pub cgroup_id: u64,
+    pub addr: [u32; 4],
+    pub port: u16,
+    pub protocol: u8,
+    pub _pad: u8,
+    pub _pad2: u32,
+}
+
 /// Key for the tracked-domains DNS observation map, scoped per-cgroup.
 /// `hash` is the SipHash-2-4 128-bit digest of the lowercased dotted
 /// domain name (see `siphash::DomainHasher`). Size = 24 bytes, no padding.
@@ -207,6 +227,7 @@ pub const DENTRY_NAME_LEN: usize = 32;
 #[cfg(target_os = "linux")]
 mod pod_impls {
     unsafe impl aya::Pod for super::PortKeyV4 {}
+    unsafe impl aya::Pod for super::PortKeyV6 {}
     unsafe impl aya::Pod for super::FsInodeKey {}
     unsafe impl aya::Pod for super::SecretAclKey {}
     unsafe impl aya::Pod for super::SecretAclValue {}

@@ -10,7 +10,7 @@ use aya_ebpf::macros::map;
 use aya_ebpf::maps::{HashMap, LpmTrie, PerCpuArray, PerCpuHashMap, RingBuf};
 
 use agentcontainer_common::maps::{
-    ActiveTool, CgroupStats, FsInodeKey, LpmDataV4, LpmDataV6, PortKeyV4, SecretAclKey,
+    ActiveTool, CgroupStats, FsInodeKey, LpmDataV4, LpmDataV6, PortKeyV4, PortKeyV6, SecretAclKey,
     SecretAclValue, SecretToolKey,
 };
 
@@ -57,6 +57,13 @@ pub static ALLOWED_PORTS: HashMap<PortKeyV4, u8> = HashMap::with_max_entries(102
 /// lost CompleteToolCall, mirroring the ACTIVE_TOOL window.
 #[map]
 pub static TRANSIENT_PORTS: HashMap<PortKeyV4, u64> = HashMap::with_max_entries(256, 0);
+
+/// IPv6 analogue of TRANSIENT_PORTS (G4: URI-scoped egress). Keyed by
+/// (cgroup+128-bit addr+port+proto); value is the `CLOCK_MONOTONIC` expiry.
+/// connect6 consults it (native-v6 path) for port-scoped transient egress —
+/// the only port-scoped v6 map (ALLOWED_V6 is CIDR-only).
+#[map]
+pub static TRANSIENT_PORTS_V6: HashMap<PortKeyV6, u64> = HashMap::with_max_entries(256, 0);
 
 /// Ring buffer for network enforcement events.
 #[map]

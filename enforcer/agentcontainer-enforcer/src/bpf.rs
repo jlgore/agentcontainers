@@ -235,7 +235,7 @@ mod linux {
     use agentcontainer_common::events as bpf_events;
     use agentcontainer_common::maps::{
         tool_identity, ActiveTool, CgroupStats, FsInodeKey, LpmDataV4, LpmDataV6, PortKeyV4,
-        SecretAclKey, SecretAclValue, SecretToolKey, CGROUP_FLAG_ENFORCED,
+        PortKeyV6, SecretAclKey, SecretAclValue, SecretToolKey, CGROUP_FLAG_ENFORCED,
         CGROUP_FLAG_EXEC_ENFORCED, FS_PERM_READ, FS_PERM_WRITE, LPM_CGROUP_PREFIX,
     };
     use anyhow::Context as _;
@@ -302,6 +302,14 @@ mod linux {
         })
     }
 
+    /// The transient-egress (G4) keys one correlation opened, split by address
+    /// family so CompleteToolCall removes them from the correct BPF map.
+    #[derive(Default)]
+    struct TransientKeys {
+        v4: Vec<PortKeyV4>,
+        v6: Vec<PortKeyV6>,
+    }
+
     /// Real BPF-backed policy manager for Linux.
     ///
     /// Holds the loaded BPF programs and typed map handles. Methods translate
@@ -355,7 +363,7 @@ mod linux {
         /// (G4), keyed by correlation_id so CompleteToolCall can remove exactly
         /// the entries this call opened. The kernel-side expiry is the safety
         /// net; this map makes the common (clean-complete) path precise.
-        transient_egress: RwLock<HashMap<String, Vec<PortKeyV4>>>,
+        transient_egress: RwLock<HashMap<String, TransientKeys>>,
 
         /// Whether the BPF LSM hooks (file_open, bprm_check) actually attached.
         /// Captured once at program-attach time and reported via lsm_status();
@@ -1823,7 +1831,7 @@ mod linux {
                     TRANSIENT_EGRESS_DEFAULT_TTL_NS
                 };
                 let expires_at_ns = monotonic_ns().saturating_add(ttl_ns);
-                let mut keys: Vec<PortKeyV4> = Vec::new();
+                let mut keys = TransientKeys::default();
                 for rule in transient_egress {
                     let proto: u8 = match rule.protocol.as_str() {
                         "tcp" | "" => 6u8,
@@ -1833,41 +1841,67 @@ mod linux {
                             continue;
                         }
                     };
-                    match tokio::net::lookup_host(format!("{}:0", rule.host)).await {
-                        Ok(addrs) => {
-                            for addr in addrs {
-                                match addr.ip() {
-                                    std::net::IpAddr::V4(ip) => keys.push(PortKeyV4 {
-                                        cgroup_id,
-                                        ip: u32::from(ip).to_be(),
-                                        port: rule.port,
-                                        protocol: proto,
-                                        _pad: 0,
-                                    }),
-                                    // No per-port IPv6 map (parity with
-                                    // apply_network / ALLOWED_PORTS); the v6
-                                    // address stays denied.
-                                    std::net::IpAddr::V6(ip) => warn!(
-                                        host = %rule.host, ip = %ip,
-                                        "transient egress host resolved to IPv6 — port-scoped v6 unsupported, address remains denied"
-                                    ),
-                                }
+                    // Resolve the host to IP(s). An IP literal (including a
+                    // bracket-free IPv6 host, which is what the proxy's URI
+                    // parser emits) is used directly — `lookup_host` would need
+                    // it bracketed. Hostnames go through async DNS.
+                    let resolved: Vec<std::net::IpAddr> = match rule
+                        .host
+                        .parse::<std::net::IpAddr>()
+                    {
+                        Ok(ip) => vec![ip],
+                        Err(_) => match tokio::net::lookup_host(format!("{}:0", rule.host)).await {
+                            Ok(addrs) => addrs.map(|a| a.ip()).collect(),
+                            Err(e) => {
+                                warn!(
+                                    host = %rule.host, error = %e,
+                                    "DNS resolution failed for transient egress host, skipping"
+                                );
+                                continue;
                             }
+                        },
+                    };
+                    for ip in resolved {
+                        match ip {
+                            std::net::IpAddr::V4(ip) => keys.v4.push(PortKeyV4 {
+                                cgroup_id,
+                                ip: u32::from(ip).to_be(),
+                                port: rule.port,
+                                protocol: proto,
+                                _pad: 0,
+                            }),
+                            std::net::IpAddr::V6(ip) => keys.v6.push(PortKeyV6 {
+                                cgroup_id,
+                                addr: ipv6_words(ip),
+                                port: rule.port,
+                                protocol: proto,
+                                _pad: 0,
+                                _pad2: 0,
+                            }),
                         }
-                        Err(e) => warn!(
-                            host = %rule.host, error = %e,
-                            "DNS resolution failed for transient egress host, skipping"
-                        ),
                     }
                 }
-                if !keys.is_empty() {
+                if !keys.v4.is_empty() || !keys.v6.is_empty() {
                     let mut bpf = self.programs.lock().unwrap();
-                    let map_data = bpf
-                        .map_mut("TRANSIENT_PORTS")
-                        .ok_or_else(|| anyhow::anyhow!("BPF map TRANSIENT_PORTS not found"))?;
-                    let mut map: AyaHashMap<_, PortKeyV4, u64> = AyaHashMap::try_from(map_data)?;
-                    for k in &keys {
-                        map.insert(k, expires_at_ns, 0)?;
+                    if !keys.v4.is_empty() {
+                        let map_data = bpf
+                            .map_mut("TRANSIENT_PORTS")
+                            .ok_or_else(|| anyhow::anyhow!("BPF map TRANSIENT_PORTS not found"))?;
+                        let mut map: AyaHashMap<_, PortKeyV4, u64> =
+                            AyaHashMap::try_from(map_data)?;
+                        for k in &keys.v4 {
+                            map.insert(k, expires_at_ns, 0)?;
+                        }
+                    }
+                    if !keys.v6.is_empty() {
+                        let map_data = bpf.map_mut("TRANSIENT_PORTS_V6").ok_or_else(|| {
+                            anyhow::anyhow!("BPF map TRANSIENT_PORTS_V6 not found")
+                        })?;
+                        let mut map: AyaHashMap<_, PortKeyV6, u64> =
+                            AyaHashMap::try_from(map_data)?;
+                        for k in &keys.v6 {
+                            map.insert(k, expires_at_ns, 0)?;
+                        }
                     }
                     drop(bpf);
                     self.transient_egress
@@ -1946,10 +1980,22 @@ mod linux {
                 .remove(correlation_id);
             if let Some(keys) = transient_keys {
                 let mut bpf = self.programs.lock().unwrap();
-                if let Some(map_data) = bpf.map_mut("TRANSIENT_PORTS") {
-                    let mut map: AyaHashMap<_, PortKeyV4, u64> = AyaHashMap::try_from(map_data)?;
-                    for k in &keys {
-                        let _ = map.remove(k);
+                if !keys.v4.is_empty() {
+                    if let Some(map_data) = bpf.map_mut("TRANSIENT_PORTS") {
+                        let mut map: AyaHashMap<_, PortKeyV4, u64> =
+                            AyaHashMap::try_from(map_data)?;
+                        for k in &keys.v4 {
+                            let _ = map.remove(k);
+                        }
+                    }
+                }
+                if !keys.v6.is_empty() {
+                    if let Some(map_data) = bpf.map_mut("TRANSIENT_PORTS_V6") {
+                        let mut map: AyaHashMap<_, PortKeyV6, u64> =
+                            AyaHashMap::try_from(map_data)?;
+                        for k in &keys.v6 {
+                            let _ = map.remove(k);
+                        }
                     }
                 }
             }
@@ -2006,6 +2052,22 @@ mod linux {
             let bpf = self.programs.lock().unwrap();
             if let Some(map) = bpf.map("TRANSIENT_PORTS") {
                 if let Ok(map) = AyaHashMap::<_, PortKeyV4, u64>::try_from(map) {
+                    return map
+                        .keys()
+                        .filter_map(|k| k.ok())
+                        .filter(|k| k.cgroup_id == cgroup_id)
+                        .count();
+                }
+            }
+            0
+        }
+
+        /// Test/diagnostic helper: count the IPv6 transient egress entries (G4)
+        /// installed for a cgroup in TRANSIENT_PORTS_V6.
+        pub fn transient_egress_v6_count(&self, cgroup_id: u64) -> usize {
+            let bpf = self.programs.lock().unwrap();
+            if let Some(map) = bpf.map("TRANSIENT_PORTS_V6") {
+                if let Ok(map) = AyaHashMap::<_, PortKeyV6, u64>::try_from(map) {
                     return map
                         .keys()
                         .filter_map(|k| k.ok())

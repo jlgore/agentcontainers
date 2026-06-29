@@ -33,12 +33,12 @@ use agentcontainer_common::events::{NetworkEvent, STAT_NET_ALLOWED, STAT_NET_BLO
 use agentcontainer_common::helpers::{
     extract_v4_from_mapped, is_loopback_v4, is_loopback_v6, is_v4_mapped_v6,
 };
-use agentcontainer_common::maps::{LpmDataV4, LpmDataV6, PortKeyV4, LPM_CGROUP_PREFIX};
+use agentcontainer_common::maps::{LpmDataV4, LpmDataV6, PortKeyV4, PortKeyV6, LPM_CGROUP_PREFIX};
 
 use crate::maps::{
     bump_cgroup_stat, ALLOWED_PORTS, ALLOWED_V4, ALLOWED_V6, BLOCKED_CIDRS_V4, BLOCKED_CIDRS_V6,
     CGROUP_STAT_NET_ALLOWED, CGROUP_STAT_NET_BLOCKED, ENFORCED_CGROUPS, NET_EVENTS, NET_STATS,
-    TRANSIENT_PORTS,
+    TRANSIENT_PORTS, TRANSIENT_PORTS_V6,
 };
 
 // --- Inline helpers ---
@@ -297,6 +297,17 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
             return Ok(1);
         }
 
+        // Check IPv4 transient per-tool-call egress (G4) — a dual-stack/v4-mapped
+        // socket must honor the same transient window as a native-v4 connect.
+        if let Some(&expires_at_ns) = unsafe { TRANSIENT_PORTS.get(&pk) } {
+            let now_ns = unsafe { bpf_ktime_get_ns() };
+            if expires_at_ns == 0 || now_ns <= expires_at_ns {
+                bump_stat(STAT_NET_ALLOWED);
+                bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_ALLOWED);
+                return Ok(1);
+            }
+        }
+
         // Check IPv4 allowed CIDRs.
         if unsafe { ALLOWED_V4.get(&lpm4) }.is_some() {
             bump_stat(STAT_NET_ALLOWED);
@@ -328,6 +339,27 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
         bump_stat(STAT_NET_ALLOWED);
         bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_ALLOWED);
         return Ok(1);
+    }
+
+    // 5b. Check IPv6 transient per-tool-call egress (G4: URI-scoped egress).
+    // The only port-scoped v6 check; keyed like TRANSIENT_PORTS but on the full
+    // 128-bit address. A non-expired entry grants egress for this window only;
+    // an expired one (lost CompleteToolCall) falls through to deny.
+    let pk6 = PortKeyV6 {
+        cgroup_id,
+        addr: dst6,
+        port,
+        protocol: proto,
+        _pad: 0,
+        _pad2: 0,
+    };
+    if let Some(&expires_at_ns) = unsafe { TRANSIENT_PORTS_V6.get(&pk6) } {
+        let now_ns = unsafe { bpf_ktime_get_ns() };
+        if expires_at_ns == 0 || now_ns <= expires_at_ns {
+            bump_stat(STAT_NET_ALLOWED);
+            bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_ALLOWED);
+            return Ok(1);
+        }
     }
 
     // 6. Default deny.

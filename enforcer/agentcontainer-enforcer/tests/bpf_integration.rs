@@ -1290,6 +1290,106 @@ async fn test_transient_egress_enforces_connect() {
     );
 }
 
+/// G4 (IPv6): a transient egress rule resolving to an IPv6 literal installs one
+/// TRANSIENT_PORTS_V6 entry, and CompleteToolCall removes it. Count-based, so it
+/// validates the v6 key construction + insert/remove without needing IPv6
+/// networking on the host.
+#[tokio::test]
+#[serial]
+async fn test_transient_egress_v6_window_lifecycle() {
+    let mgr = BpfPolicyManager::new().unwrap();
+    let cgroup = own_cgroup_path();
+    let handle = mgr.register("test-transient-v6", &cgroup, 0).await.unwrap();
+
+    assert_eq!(mgr.transient_egress_v6_count(handle.cgroup_id), 0);
+
+    // 2001:db8::/32 is the documentation range (RFC 3849) — never routed.
+    mgr.prepare_tool_call(
+        "test-transient-v6",
+        "corr-v6",
+        "fetch",
+        &[EgressRule {
+            host: "2001:db8::7".into(),
+            port: 443,
+            protocol: "udp".into(),
+        }],
+        30_000,
+    )
+    .await
+    .expect("prepare with an IPv6 transient rule should succeed");
+    assert_eq!(
+        mgr.transient_egress_v6_count(handle.cgroup_id),
+        1,
+        "prepare should install one IPv6 transient entry"
+    );
+
+    mgr.complete_tool_call("test-transient-v6", "corr-v6")
+        .await
+        .unwrap();
+    assert_eq!(
+        mgr.transient_egress_v6_count(handle.cgroup_id),
+        0,
+        "complete should remove the IPv6 transient entry"
+    );
+
+    mgr.unregister("test-transient-v6").await.unwrap();
+}
+
+/// G4 (IPv6): prove the native-v6 transient path ENFORCES at connect6. Skips
+/// gracefully when the host has no IPv6 (the UDP `[::]` bind fails).
+#[tokio::test]
+#[serial]
+async fn test_transient_egress_v6_enforces_connect() {
+    if std::net::UdpSocket::bind("[::]:0").is_err() {
+        eprintln!("host has no IPv6 — skipping v6 connect enforcement test");
+        return;
+    }
+    let mgr = BpfPolicyManager::new().unwrap();
+    let cgroup = own_cgroup_path();
+    mgr.register("test-transient-v6-enf", &cgroup, 0)
+        .await
+        .unwrap();
+
+    let udp6_connect =
+        |dst: &str| -> std::io::Result<()> { std::net::UdpSocket::bind("[::]:0")?.connect(dst) };
+    let target = "[2001:db8::7]:443";
+
+    let deny_before = udp6_connect(target);
+    mgr.prepare_tool_call(
+        "test-transient-v6-enf",
+        "corr-v6-enf",
+        "fetch",
+        &[EgressRule {
+            host: "2001:db8::7".into(),
+            port: 443,
+            protocol: "udp".into(),
+        }],
+        30_000,
+    )
+    .await
+    .expect("prepare with an IPv6 transient rule should succeed");
+    let allow_during = udp6_connect(target);
+    mgr.complete_tool_call("test-transient-v6-enf", "corr-v6-enf")
+        .await
+        .unwrap();
+    let deny_after = udp6_connect(target);
+
+    mgr.unregister("test-transient-v6-enf").await.unwrap();
+
+    assert!(
+        matches!(&deny_before, Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+        "v6 target should be default-denied before prepare: {deny_before:?}"
+    );
+    assert!(
+        allow_during.is_ok(),
+        "v6 transient rule should ALLOW the connect during the window: {allow_during:?}"
+    );
+    assert!(
+        matches!(&deny_after, Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+        "v6 target should be denied again after complete: {deny_after:?}"
+    );
+}
+
 /// A container with only unrestricted secrets (empty allowed_tools) keeps
 /// container-wide access: tool calls are not serialized, so overlapping
 /// PrepareToolCall calls are accepted (the active-tool map is not used).
