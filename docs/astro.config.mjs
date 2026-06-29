@@ -53,6 +53,7 @@ export default defineConfig({
           label: 'Project',
           items: [
             { label: 'Roadmap', slug: 'project/roadmap' },
+            { label: 'Test Matrix', slug: 'project/test-matrix' },
             { label: 'Contributing', slug: 'project/contributing' },
             { label: 'Security', slug: 'project/security' },
           ],
