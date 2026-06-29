@@ -18,8 +18,8 @@ use tracing::warn;
 
 use crate::events::{ContainerRegistry, EventBus};
 use crate::policy::{
-    ContainerHandle, CredentialPolicy, EnforcementEvent, EnforcementStats, FilesystemPolicy,
-    LsmStatus, NetworkPolicy, PolicyManager, ProcessPolicy,
+    ContainerHandle, CredentialPolicy, EgressRule, EnforcementEvent, EnforcementStats,
+    FilesystemPolicy, LsmStatus, NetworkPolicy, PolicyManager, ProcessPolicy,
 };
 
 #[derive(Clone, Debug)]
@@ -244,6 +244,10 @@ mod linux {
     /// leave a restricted secret readable indefinitely. Generous enough for long
     /// forensic tool runs; matched against `bpf_ktime_get_ns` (CLOCK_MONOTONIC).
     const ACTIVE_TOOL_TTL_NS: u64 = 60 * 60 * 1_000_000_000; // 1 hour
+    /// Default lifetime for a URI-scoped transient egress entry (G4) when the
+    /// caller passes window_timeout_ms == 0. Bounds a lost CompleteToolCall to
+    /// a short window — egress is meant to last a single tool call.
+    const TRANSIENT_EGRESS_DEFAULT_TTL_NS: u64 = 30 * 1_000_000_000; // 30 seconds
     use aya::maps::lpm_trie::Key as LpmKey;
     use aya::maps::{HashMap as AyaHashMap, LpmTrie, PerCpuHashMap, RingBuf};
     use aya::programs::{CgroupAttachMode, CgroupSkb, CgroupSkbAttachType, CgroupSockAddr, Lsm};
@@ -347,6 +351,12 @@ mod linux {
         /// for these cgroups; non-restricted cgroups keep container-wide access.
         restricted_cgroups: RwLock<HashMap<u64, ()>>,
 
+        /// URI-scoped transient egress keys inserted for an in-flight tool call
+        /// (G4), keyed by correlation_id so CompleteToolCall can remove exactly
+        /// the entries this call opened. The kernel-side expiry is the safety
+        /// net; this map makes the common (clean-complete) path precise.
+        transient_egress: RwLock<HashMap<String, Vec<PortKeyV4>>>,
+
         /// Whether the BPF LSM hooks (file_open, bprm_check) actually attached.
         /// Captured once at program-attach time and reported via lsm_status();
         /// the proxy gates kernel-primary startup on it.
@@ -400,6 +410,7 @@ mod linux {
                 correlations: std::sync::Arc::new(RwLock::new(HashMap::new())),
                 tracked_domains: std::sync::Arc::new(RwLock::new(HashMap::new())),
                 restricted_cgroups: RwLock::new(HashMap::new()),
+                transient_egress: RwLock::new(HashMap::new()),
                 lsm_status,
             };
 
@@ -1786,6 +1797,8 @@ mod linux {
             container_id: &str,
             correlation_id: &str,
             tool_name: &str,
+            transient_egress: &[EgressRule],
+            window_timeout_ms: u64,
         ) -> anyhow::Result<()> {
             let cgroup_id = self.lookup_cgroup(container_id)?;
 
@@ -1796,6 +1809,73 @@ mod linux {
                 correlation_id,
                 monotonic_ns(),
             );
+
+            // G4: URI-scoped transient egress. Resolve target hosts to IPv4
+            // addresses up front (async DNS — must not be held across the std
+            // programs lock), then insert one TRANSIENT_PORTS entry per
+            // (cgroup, ip, port, proto) with a CLOCK_MONOTONIC expiry. The
+            // connect4 hook allows these targets only while unexpired; the
+            // expiry bounds a lost CompleteToolCall (parity with ACTIVE_TOOL).
+            if !transient_egress.is_empty() {
+                let ttl_ns = if window_timeout_ms > 0 {
+                    window_timeout_ms.saturating_mul(1_000_000)
+                } else {
+                    TRANSIENT_EGRESS_DEFAULT_TTL_NS
+                };
+                let expires_at_ns = monotonic_ns().saturating_add(ttl_ns);
+                let mut keys: Vec<PortKeyV4> = Vec::new();
+                for rule in transient_egress {
+                    let proto: u8 = match rule.protocol.as_str() {
+                        "tcp" | "" => 6u8,
+                        "udp" => 17u8,
+                        other => {
+                            warn!(protocol = %other, "unknown protocol in transient egress rule, skipping");
+                            continue;
+                        }
+                    };
+                    match tokio::net::lookup_host(format!("{}:0", rule.host)).await {
+                        Ok(addrs) => {
+                            for addr in addrs {
+                                match addr.ip() {
+                                    std::net::IpAddr::V4(ip) => keys.push(PortKeyV4 {
+                                        cgroup_id,
+                                        ip: u32::from(ip).to_be(),
+                                        port: rule.port,
+                                        protocol: proto,
+                                        _pad: 0,
+                                    }),
+                                    // No per-port IPv6 map (parity with
+                                    // apply_network / ALLOWED_PORTS); the v6
+                                    // address stays denied.
+                                    std::net::IpAddr::V6(ip) => warn!(
+                                        host = %rule.host, ip = %ip,
+                                        "transient egress host resolved to IPv6 — port-scoped v6 unsupported, address remains denied"
+                                    ),
+                                }
+                            }
+                        }
+                        Err(e) => warn!(
+                            host = %rule.host, error = %e,
+                            "DNS resolution failed for transient egress host, skipping"
+                        ),
+                    }
+                }
+                if !keys.is_empty() {
+                    let mut bpf = self.programs.lock().unwrap();
+                    let map_data = bpf
+                        .map_mut("TRANSIENT_PORTS")
+                        .ok_or_else(|| anyhow::anyhow!("BPF map TRANSIENT_PORTS not found"))?;
+                    let mut map: AyaHashMap<_, PortKeyV4, u64> = AyaHashMap::try_from(map_data)?;
+                    for k in &keys {
+                        map.insert(k, expires_at_ns, 0)?;
+                    }
+                    drop(bpf);
+                    self.transient_egress
+                        .write()
+                        .unwrap()
+                        .insert(correlation_id.to_string(), keys);
+                }
+            }
 
             // Per-tool secret enforcement only applies to cgroups that hold a
             // restricted secret. For those, serialize tool calls (one active
@@ -1855,6 +1935,25 @@ mod linux {
                 }
             }
 
+            // G4: remove the transient egress entries this correlation opened,
+            // closing the kernel egress window immediately. The kernel-side
+            // expiry already bounds a missed Complete; this makes the clean
+            // path precise. Removing an absent key is not an error.
+            let transient_keys = self
+                .transient_egress
+                .write()
+                .unwrap()
+                .remove(correlation_id);
+            if let Some(keys) = transient_keys {
+                let mut bpf = self.programs.lock().unwrap();
+                if let Some(map_data) = bpf.map_mut("TRANSIENT_PORTS") {
+                    let mut map: AyaHashMap<_, PortKeyV4, u64> = AyaHashMap::try_from(map_data)?;
+                    for k in &keys {
+                        let _ = map.remove(k);
+                    }
+                }
+            }
+
             if !close_tool_window(
                 &self.correlations,
                 cgroup_id,
@@ -1898,6 +1997,23 @@ mod linux {
                 }
             }
             false
+        }
+
+        /// Test/diagnostic helper: count the URI-scoped transient egress
+        /// entries (G4) currently installed for a cgroup in TRANSIENT_PORTS.
+        /// Used to assert the prepare/complete window lifecycle.
+        pub fn transient_egress_count(&self, cgroup_id: u64) -> usize {
+            let bpf = self.programs.lock().unwrap();
+            if let Some(map) = bpf.map("TRANSIENT_PORTS") {
+                if let Ok(map) = AyaHashMap::<_, PortKeyV4, u64>::try_from(map) {
+                    return map
+                        .keys()
+                        .filter_map(|k| k.ok())
+                        .filter(|k| k.cgroup_id == cgroup_id)
+                        .count();
+                }
+            }
+            0
         }
     }
 }
@@ -2054,6 +2170,8 @@ mod stub {
             container_id: &str,
             correlation_id: &str,
             _tool_name: &str,
+            _transient_egress: &[EgressRule],
+            _window_timeout_ms: u64,
         ) -> anyhow::Result<()> {
             let cgroup_id = self.lookup_cgroup(container_id)?;
             open_tool_window(

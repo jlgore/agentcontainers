@@ -14,7 +14,8 @@
 
 use agentcontainer_enforcer::bpf::BpfPolicyManager;
 use agentcontainer_enforcer::policy::{
-    CredentialPolicy, FilesystemPolicy, NetworkPolicy, PolicyManager, ProcessPolicy, SecretAcl,
+    CredentialPolicy, EgressRule, FilesystemPolicy, NetworkPolicy, PolicyManager, ProcessPolicy,
+    SecretAcl,
 };
 use serial_test::serial;
 
@@ -1148,13 +1149,13 @@ async fn test_per_tool_restriction_serializes_calls() {
     .unwrap();
 
     // First tool call opens the window.
-    mgr.prepare_tool_call("test-per-tool", "corr-1", "allowed_tool")
+    mgr.prepare_tool_call("test-per-tool", "corr-1", "allowed_tool", &[], 0)
         .await
         .expect("first prepare should succeed");
 
     // A second, overlapping call on the restricted container is rejected.
     let overlap = mgr
-        .prepare_tool_call("test-per-tool", "corr-2", "allowed_tool")
+        .prepare_tool_call("test-per-tool", "corr-2", "allowed_tool", &[], 0)
         .await;
     assert!(
         overlap.is_err(),
@@ -1165,7 +1166,7 @@ async fn test_per_tool_restriction_serializes_calls() {
     mgr.complete_tool_call("test-per-tool", "corr-1")
         .await
         .unwrap();
-    mgr.prepare_tool_call("test-per-tool", "corr-3", "another_tool")
+    mgr.prepare_tool_call("test-per-tool", "corr-3", "another_tool", &[], 0)
         .await
         .expect("prepare after complete should succeed");
     mgr.complete_tool_call("test-per-tool", "corr-3")
@@ -1173,6 +1174,120 @@ async fn test_per_tool_restriction_serializes_calls() {
         .unwrap();
 
     mgr.unregister("test-per-tool").await.unwrap();
+}
+
+/// G4: PrepareToolCall with transient egress installs one TRANSIENT_PORTS
+/// entry per resolved IPv4 target, scoped to the cgroup, and CompleteToolCall
+/// removes them — the kernel egress window opens for exactly the tool call.
+#[tokio::test]
+#[serial]
+async fn test_transient_egress_window_lifecycle() {
+    let mgr = BpfPolicyManager::new().unwrap();
+    let cgroup = own_cgroup_path();
+    let handle = mgr.register("test-transient", &cgroup, 0).await.unwrap();
+
+    // No transient egress before any tool call.
+    assert_eq!(
+        mgr.transient_egress_count(handle.cgroup_id),
+        0,
+        "no transient egress entries before prepare"
+    );
+
+    // Prepare opens egress to a literal IPv4 (a documentation-range address,
+    // resolved without DNS) for this call window.
+    mgr.prepare_tool_call(
+        "test-transient",
+        "corr-egress",
+        "fetch",
+        &[EgressRule {
+            host: "203.0.113.7".into(),
+            port: 443,
+            protocol: "tcp".into(),
+        }],
+        30_000,
+    )
+    .await
+    .expect("prepare with transient egress should succeed");
+    assert_eq!(
+        mgr.transient_egress_count(handle.cgroup_id),
+        1,
+        "prepare should install one transient egress entry"
+    );
+
+    // Complete closes the window, removing the transient entry.
+    mgr.complete_tool_call("test-transient", "corr-egress")
+        .await
+        .unwrap();
+    assert_eq!(
+        mgr.transient_egress_count(handle.cgroup_id),
+        0,
+        "complete should remove the transient egress entry"
+    );
+
+    mgr.unregister("test-transient").await.unwrap();
+}
+
+/// G4: prove the transient egress window actually ENFORCES at the connect4
+/// hook (not just that map entries appear): a target is default-denied, ALLOWED
+/// while the prepare/complete window is open, and DENIED again after complete.
+/// Drives the hook with a UDP `connect()` (sends no packets, returns
+/// immediately) to a TEST-NET-3 literal so no traffic leaves and no DNS runs.
+/// The rule protocol MUST be "udp" to match the UDP probe's proto (17) in the
+/// PortKeyV4 — a "tcp" rule would key proto 6 and not match.
+#[tokio::test]
+#[serial]
+async fn test_transient_egress_enforces_connect() {
+    let mgr = BpfPolicyManager::new().unwrap();
+    let cgroup = own_cgroup_path();
+    mgr.register("test-transient-enf", &cgroup, 0)
+        .await
+        .unwrap();
+
+    let udp_connect =
+        |dst: &str| -> std::io::Result<()> { std::net::UdpSocket::bind("0.0.0.0:0")?.connect(dst) };
+    let target = "203.0.113.7:443";
+
+    // 1. Default-deny before any window is open.
+    let deny_before = udp_connect(target);
+
+    // 2. Open the transient window — the target should now be allowed.
+    mgr.prepare_tool_call(
+        "test-transient-enf",
+        "corr-enf",
+        "fetch",
+        &[EgressRule {
+            host: "203.0.113.7".into(),
+            port: 443,
+            protocol: "udp".into(),
+        }],
+        30_000,
+    )
+    .await
+    .expect("prepare with transient egress should succeed");
+    let allow_during = udp_connect(target);
+
+    // 3. Close the window — the target should be denied again.
+    mgr.complete_tool_call("test-transient-enf", "corr-enf")
+        .await
+        .unwrap();
+    let deny_after = udp_connect(target);
+
+    // Capture-then-unregister-then-assert so a failed assertion never leaves
+    // the cgroup registered/attached (mirrors the blocked-cidr test).
+    mgr.unregister("test-transient-enf").await.unwrap();
+
+    assert!(
+        matches!(&deny_before, Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+        "target should be default-denied before prepare: {deny_before:?}"
+    );
+    assert!(
+        allow_during.is_ok(),
+        "transient rule should ALLOW the connect during the window: {allow_during:?}"
+    );
+    assert!(
+        matches!(&deny_after, Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+        "target should be denied again after complete: {deny_after:?}"
+    );
 }
 
 /// A container with only unrestricted secrets (empty allowed_tools) keeps
@@ -1201,11 +1316,11 @@ async fn test_unrestricted_secret_allows_overlapping_calls() {
     .await
     .unwrap();
 
-    mgr.prepare_tool_call("test-unrestricted", "c1", "t1")
+    mgr.prepare_tool_call("test-unrestricted", "c1", "t1", &[], 0)
         .await
         .unwrap();
     // No serialization for unrestricted containers.
-    mgr.prepare_tool_call("test-unrestricted", "c2", "t2")
+    mgr.prepare_tool_call("test-unrestricted", "c2", "t2", &[], 0)
         .await
         .expect("unrestricted container must not serialize tool calls");
     mgr.complete_tool_call("test-unrestricted", "c1")

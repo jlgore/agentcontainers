@@ -207,12 +207,18 @@ pub trait PolicyManager: Send + Sync + 'static {
         container_id: &str,
     ) -> anyhow::Result<tokio::sync::mpsc::Receiver<EnforcementEvent>>;
 
-    /// Mark the start of a proxied MCP tool call for event correlation.
+    /// Mark the start of a proxied MCP tool call for event correlation, and
+    /// optionally open URI-scoped transient egress (G4): the `transient_egress`
+    /// host:port targets are allowed at the kernel for the duration of this
+    /// tool-call window, removed on `complete_tool_call` or after
+    /// `window_timeout_ms` (0 = enforcer default horizon).
     async fn prepare_tool_call(
         &self,
         container_id: &str,
         correlation_id: &str,
         tool_name: &str,
+        transient_egress: &[EgressRule],
+        window_timeout_ms: u64,
     ) -> anyhow::Result<()>;
 
     /// Mark the end of a proxied MCP tool call for event correlation.
@@ -297,6 +303,8 @@ impl PolicyManager for StubPolicyManager {
         _container_id: &str,
         _correlation_id: &str,
         _tool_name: &str,
+        _transient_egress: &[EgressRule],
+        _window_timeout_ms: u64,
     ) -> anyhow::Result<()> {
         Ok(())
     }

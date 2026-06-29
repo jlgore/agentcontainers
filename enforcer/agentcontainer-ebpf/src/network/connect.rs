@@ -38,6 +38,7 @@ use agentcontainer_common::maps::{LpmDataV4, LpmDataV6, PortKeyV4, LPM_CGROUP_PR
 use crate::maps::{
     bump_cgroup_stat, ALLOWED_PORTS, ALLOWED_V4, ALLOWED_V6, BLOCKED_CIDRS_V4, BLOCKED_CIDRS_V6,
     CGROUP_STAT_NET_ALLOWED, CGROUP_STAT_NET_BLOCKED, ENFORCED_CGROUPS, NET_EVENTS, NET_STATS,
+    TRANSIENT_PORTS,
 };
 
 // --- Inline helpers ---
@@ -203,6 +204,19 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
         bump_stat(STAT_NET_ALLOWED);
         bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_ALLOWED);
         return Ok(1);
+    }
+
+    // 5b. Check transient per-tool-call egress (G4: URI-scoped egress). The
+    // entry is keyed like ALLOWED_PORTS; the value is a CLOCK_MONOTONIC
+    // expiry. A non-expired entry grants egress only for this tool-call
+    // window; an expired one (lost CompleteToolCall) falls through to deny.
+    if let Some(&expires_at_ns) = unsafe { TRANSIENT_PORTS.get(&pk) } {
+        let now_ns = unsafe { bpf_ktime_get_ns() };
+        if expires_at_ns == 0 || now_ns <= expires_at_ns {
+            bump_stat(STAT_NET_ALLOWED);
+            bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_ALLOWED);
+            return Ok(1);
+        }
     }
 
     // 6. Default deny.

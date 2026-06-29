@@ -186,10 +186,27 @@ impl Enforcer for EnforcerService {
             container_id = %req.container_id,
             correlation_id = %req.correlation_id,
             tool = %req.tool_name,
+            transient_egress = req.transient_egress.len(),
             "preparing tool-call correlation window"
         );
+        // G4: convert proto transient egress rules to the policy type.
+        let transient_egress: Vec<policy::EgressRule> = req
+            .transient_egress
+            .into_iter()
+            .map(|r| policy::EgressRule {
+                host: r.host,
+                port: r.port as u16,
+                protocol: r.protocol,
+            })
+            .collect();
         self.manager
-            .prepare_tool_call(&req.container_id, &req.correlation_id, &req.tool_name)
+            .prepare_tool_call(
+                &req.container_id,
+                &req.correlation_id,
+                &req.tool_name,
+                &transient_egress,
+                req.window_timeout_ms,
+            )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(PrepareToolCallResponse {}))

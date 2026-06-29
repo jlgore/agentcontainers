@@ -62,6 +62,15 @@ message PrepareToolCallRequest {
   string correlation_id = 1;
   string container_id = 2;
   string tool_name = 3;
+  // transient_egress opens kernel egress to exactly these host:port targets
+  // for the duration of this tool-call window (G4: URI-scoped egress). The
+  // entries are removed on CompleteToolCall, or expire after
+  // window_timeout_ms — whichever comes first. Empty = no transient egress
+  // (unchanged behavior).
+  repeated EgressRule transient_egress = 4;
+  // window_timeout_ms bounds the transient egress entries as a safety net
+  // against a lost CompleteToolCall. 0 = use the enforcer default horizon.
+  uint64 window_timeout_ms = 5;
 }
 
 message PrepareToolCallResponse {}

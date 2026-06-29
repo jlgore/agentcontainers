@@ -49,6 +49,15 @@ pub static BLOCKED_CIDRS_V6: LpmTrie<LpmDataV6, u8> = LpmTrie::with_max_entries(
 #[map]
 pub static ALLOWED_PORTS: HashMap<PortKeyV4, u8> = HashMap::with_max_entries(1024, 0);
 
+/// Transient per-tool-call egress allowlist (G4: URI-scoped egress). Keyed
+/// exactly like ALLOWED_PORTS (cgroup+ip+port+proto); the value is the
+/// `CLOCK_MONOTONIC` (`bpf_ktime_get_ns`) expiry after which the entry no
+/// longer grants egress. Userspace inserts entries on PrepareToolCall and
+/// removes them on CompleteToolCall; the expiry bounds the blast radius of a
+/// lost CompleteToolCall, mirroring the ACTIVE_TOOL window.
+#[map]
+pub static TRANSIENT_PORTS: HashMap<PortKeyV4, u64> = HashMap::with_max_entries(256, 0);
+
 /// Ring buffer for network enforcement events.
 #[map]
 pub static NET_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
