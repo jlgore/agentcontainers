@@ -3,13 +3,14 @@ title: Cross-Harness Capability Test Matrix
 description: Design for proving that capabilities are allowed only explicitly when agentcontainers' Cedar backend runs under Claude Code, opencode, and pi across multiple models.
 ---
 
-> **Status:** In progress. Phases 0–4 are built — the shared capability fixture, the Layer-1
+> **Status:** In progress. Phases 0–5 are built — the shared capability fixture, the Layer-1
 > deterministic oracle (gating in CI), the KubeVirt VM substrate (`test/vm/`), the Layer-1 kernel
-> asserts (C7/C8/C9 + LSM-attach proven on the VM's real kernel), and the **Phase 4 Layer-2
-> behavioral cell** (Claude Code + API key, driven live against the guard in deny mode and scored
-> from the audit trail — **15/15 green**). Phase 3 surfaced finding **F1** below. The remaining cells
-> (opencode, pi) are designed but not yet built. This is the engineering plan for a test matrix that
-> validates the Cedar policy backend and eBPF enforcer across multiple agent harnesses and models.
+> asserts (C7/C8/C9 + LSM-attach proven on the VM's real kernel), the **Phase 4 Layer-2 cell**
+> (Claude Code + API key — **15/15 green**), and the **Phase 5 cell** (opencode + the
+> `tool.execute.before` guard adapter — **14/15 green**, plus the "soft-hook off → kernel still holds"
+> bypass assertion). Phase 3 surfaced finding **F1** below. The remaining cell (pi) is designed but not
+> yet built. This is the engineering plan for a test matrix that validates the Cedar policy backend and
+> eBPF enforcer across multiple agent harnesses and models.
 
 ## Goal
 
@@ -204,8 +205,22 @@ Lowest-risk first; each phase is independently valuable.
   instead of `mkfs`), the literal `denied_binaries` rule didn't match, but the **default-deny
   allowlist still blocked it** — the action was denied either way; pinning the prompt to the literal
   `mkfs` exercises the intended "cannot be overridden" mechanism.
-- **Phase 5 — opencode cell.** The plugin (guard socket) + managed `/etc/opencode` lockdown + FS
-  control + OpenRouter key via `{file:}`. Same suite + the "soft-hook off → kernel still holds" assertion.
+- **Phase 5 — opencode cell. ✅ Done.** A ~40-line `tool.execute.before` plugin adapter
+  (`phase5-guard-adapter.js`) routes opencode's native bash/write/edit tools to the *same*
+  `guard serve` broker as Claude Code, by synthesizing the guard's PreToolUse payload and spawning
+  `agentcontainer guard hook` (a deny throws → opencode blocks the tool). Because the guard logs its
+  `exec` audit record server-side regardless of harness, the **Phase 4 scoring is reused verbatim**.
+  The managed `/etc/opencode/opencode.json` allows bash/edit/write (the guard plugin is the gate) and
+  **denies opencode's native read/grep/glob/webfetch** so file/search/fetch work is funnelled onto the
+  one guarded path. **Result: 14/15 PASS, 0 FAIL** (driving `claude-sonnet-4-5` via opencode 1.17.11),
+  all classes covered with allow *and* deny verdicts; the lone NOT-EXERCISED is `mkfs /dev/sda1` (the
+  model prudently refuses to format the VM's real disk — a non-gating model-soft-defense; the C3
+  "cannot be overridden" mechanism is exercised by `dd`/`nc`). Entry point `test/vm/phase5-opencode.sh`.
+  **Phase 5b — "soft-hook off → kernel still holds" (`phase5-softhook-bypass.sh`, green):** running
+  opencode `--pure` (or deleting the plugin from its writable config) removes the guard adapter — the
+  guard audit goes empty for a command it otherwise denies — proving the in-harness soft hook is
+  trivially bypassable, so the kernel (eBPF enforcer, proven in Phase 3) is the real boundary. A live
+  opencode-under-enforcer kernel-block is the remaining integration.
 - **Phase 6 — pi cell (later).** `@earendil-works` extension + `pi-mcp-adapter`; kernel-only
   enforcement + the headline "agent disables its own hook, kernel blocks anyway" cell.
 

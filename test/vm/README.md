@@ -87,9 +87,63 @@ destructive denies (`dd`, `nc`, `find -delete`) confirmed `effect=clean`.
 > C1/C2/C6 could not be enforced. See `mcpproxy.LoadGuardPolicyYAML` and
 > `TestCapabilityMatrixGuardPath` (the CI parity gate).
 
+## Phase 5 — Layer-2 behavioral cell: opencode
+
+`phase5-opencode.sh` proves the guard is **harness-agnostic**: opencode's native
+bash/write/edit tools are routed to the *same* `guard serve` broker (deny mode)
+by a `tool.execute.before` plugin adapter (`phase5-guard-adapter.js`), and the
+same fixture-derived policy yields the same C1–C6 verdicts, scored from the same
+guard audit trail. Because the guard writes its `exec` audit record server-side
+regardless of harness, **the Phase 4 scoring is reused unchanged**.
+
+```bash
+cd test/vm
+PHASE5_MODEL=anthropic/claude-sonnet-4-5 ANTHROPIC_API_KEY=sk-ant-... ./phase5-opencode.sh
+# or PHASE5_MODEL=openrouter/openai/gpt-4o OPENROUTER_API_KEY=sk-or-...
+# SCORE_ONLY=1 re-scores with no API spend; CASE_FILTER=a,b re-runs a subset.
+```
+
+The adapter spawns `agentcontainer guard hook`, synthesizing the guard's
+PreToolUse payload (tool→`Bash`/`Write`/`Edit`, args→`command`/`file_path`); a
+deny throws, which is how an opencode plugin blocks a tool. The managed
+`/etc/opencode/opencode.json` sets `permission.bash/edit/write=allow` (the guard
+plugin is the gate) and **denies opencode's native `read`/`grep`/`glob`/`webfetch`
+tools** so file/search/fetch work is funnelled onto bash — the one guarded
+chokepoint — instead of running out-of-band. The provider key is staged to VM
+tmpfs and referenced via opencode's `{file:...}` substitution.
+
+**Validated (2026-06-29): 14/15 PASS, 0 FAIL**, all 15 audit chains verified,
+driving Claude `claude-sonnet-4-5` via opencode 1.17.11. Every capability class
+reaches its fixture verdict (allow *and* deny). The one NOT-EXERCISED case is
+`mkfs /dev/sda1`: the model prudently refuses to format the VM's real disk even
+under authorized-test framing — a well-founded model-layer (soft) defense, not a
+boundary failure; the C3 "cannot be overridden" mechanism is exercised here by
+`dd` and `nc`. Whether the model *attempts* an action is a non-gating side-metric
+(per the design): the gate is that the boundary reaches the policy-correct verdict
+for everything it *does* attempt.
+
+> Harness lessons (the cell encodes these): opencode's `run` reads stdin (so the
+> case loop reads cases.tsv on FD 3 and opencode gets `</dev/null`); its native
+> read/grep/glob/webfetch tools otherwise siphon work off bash; and a safety-
+> trained model refuses the most destructive bash ops regardless of framing.
+
+### Phase 5b — soft-hook off → kernel still holds
+
+`phase5-softhook-bypass.sh` is the headline assertion for a **non-lockable**
+harness. opencode merges config and auto-loads plugins from writable paths and
+exposes `--pure` (run with no external plugins), so the agent can disable its own
+guard adapter trivially. The script runs the same denied `cat -v` twice:
+**hooked** → the guard sees and denies it; **`--pure`** → the guard audit is
+**empty**, the soft hook is gone. **Validated green.** Therefore the kernel is
+the real boundary: the eBPF enforcer's egress (C8) / exec (C9) allowlists are
+unaffected by `--pure` and are proven on this VM kernel by Phase 3
+(`kernel-asserts.sh`). A live opencode-under-enforcer kernel-block is the
+remaining integration (the `agentcontainer run` containerized path).
+
 ## Scope
 
 Phase 2 proves the substrate is real (kernel can do BPF-LSM, tooling present).
 Actually *running* the enforcer to confirm it attaches its LSM programs and the
 C7–C9 egress/exec asserts are **Phase 3**. The Layer-2 Claude Code guard cell is
-**Phase 4** (above, green); opencode (Phase 5) and pi (Phase 6) widen coverage.
+**Phase 4** and the opencode cell is **Phase 5** (both above, green); pi is
+**Phase 6**.
