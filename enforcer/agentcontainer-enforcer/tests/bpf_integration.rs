@@ -1376,16 +1376,24 @@ async fn test_transient_egress_v6_enforces_connect() {
 
     mgr.unregister("test-transient-v6-enf").await.unwrap();
 
+    // The enforcement boundary is the BPF hook: a deny surfaces as EPERM
+    // (PermissionDenied). "Allowed" means the hook did NOT deny — the connect
+    // then proceeds to the OS networking layer, which on a node without an IPv6
+    // route returns NetworkUnreachable. That non-EPERM result still proves the
+    // transient rule let the connect past the hook.
+    let denied = |r: &std::io::Result<()>| {
+        matches!(r, Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied)
+    };
     assert!(
-        matches!(&deny_before, Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+        denied(&deny_before),
         "v6 target should be default-denied before prepare: {deny_before:?}"
     );
     assert!(
-        allow_during.is_ok(),
-        "v6 transient rule should ALLOW the connect during the window: {allow_during:?}"
+        !denied(&allow_during),
+        "v6 transient rule should ALLOW (not EPERM-deny) the connect during the window: {allow_during:?}"
     );
     assert!(
-        matches!(&deny_after, Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+        denied(&deny_after),
         "v6 target should be denied again after complete: {deny_after:?}"
     );
 }

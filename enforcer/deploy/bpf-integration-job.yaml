@@ -37,6 +37,7 @@ spec:
       containers:
         - name: bpf-integration
           image: REPLACE_WITH_IMAGE
+          imagePullPolicy: Always # re-pull when a tag is rebuilt (test iteration)
           securityContext:
             privileged: true # BPF map/program load + attach are root+CAP_BPF/SYS_ADMIN
             # If --privileged is disallowed by policy, drop it and grant explicitly:
@@ -61,5 +62,5 @@ spec:
             type: Directory
         - name: btf
           hostPath:
-            path: /sys/kernel/btf
-            type: File
+            path: /sys/kernel/btf # directory of vmlinux + per-module BTF
+            type: Directory
