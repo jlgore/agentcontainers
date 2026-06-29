@@ -2,6 +2,7 @@ package mcpproxy
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -141,6 +142,69 @@ func TestCapabilityMatrixOracle(t *testing.T) {
 		if !seen[class] {
 			t.Errorf("capability matrix is missing class %s", class)
 		}
+	}
+}
+
+// TestCapabilityMatrixGuardPath proves the guard's policy loader
+// (LoadGuardPolicyYAML, the engine behind `agentcontainer guard serve
+// --security-yaml`) compiles the SAME decisions as the Layer-1 oracle when fed
+// the fixture's `policy` block alone — the exact file the on-VM Phase 4 runner
+// derives via `yq '.policy' capability-matrix.yaml`. This is the CI guarantee
+// that the live guard cell cannot drift from the oracle: same fixture, same
+// verdicts, through the production guard code path (Cedar) rather than the
+// test's own compile() helper.
+func TestCapabilityMatrixGuardPath(t *testing.T) {
+	raw, err := os.ReadFile("testdata/capability-matrix.yaml")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	// Extract just the `policy:` block, exactly like `yq '.policy'` does on the VM.
+	var whole map[string]any
+	if err := yaml.Unmarshal(raw, &whole); err != nil {
+		t.Fatalf("parse fixture: %v", err)
+	}
+	policyOnly, err := yaml.Marshal(whole["policy"])
+	if err != nil {
+		t.Fatalf("marshal policy block: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "guard-policy.yaml")
+	if err := os.WriteFile(path, policyOnly, 0o644); err != nil {
+		t.Fatalf("write guard policy: %v", err)
+	}
+
+	sec, cfg, err := LoadGuardPolicyYAML(path)
+	if err != nil {
+		t.Fatalf("LoadGuardPolicyYAML: %v", err)
+	}
+	if cfg == nil || cfg.Shell == nil || len(cfg.Shell.Commands) == 0 {
+		t.Fatalf("guard policy carried no shell allowlist (cfg=%+v) — C1/C2/C6 would not enforce", cfg)
+	}
+	cp, err := Compile(sec, cfg)
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	cedar, err := NewCedarEvaluator(t.Context(), "guard", cp)
+	if err != nil {
+		t.Fatalf("NewCedarEvaluator: %v", err)
+	}
+
+	fx := loadCapabilityFixture(t)
+	cwd, _ := os.Getwd()
+	for _, tc := range fx.Cases {
+		wantAllow := tc.Expect == "allow"
+		t.Run(tc.Class+"/"+tc.Name, func(t *testing.T) {
+			input := buildTestInput(DecomposeCommand(tc.Command, defaultOutputFlags), "", cwd)
+			dec, err := cedar.Evaluate(t.Context(), input)
+			if err != nil {
+				t.Fatalf("cedar Evaluate: %v", err)
+			}
+			if dec.Allowed != wantAllow {
+				t.Errorf("guard-path allowed=%v want %v (reasons %v)", dec.Allowed, wantAllow, dec.Reasons)
+			}
+			if !wantAllow && tc.ReasonContains != "" && !anyReasonContains(dec.Reasons, tc.ReasonContains) {
+				t.Errorf("guard-path missing expected reason %q in %v", tc.ReasonContains, dec.Reasons)
+			}
+		})
 	}
 }
 

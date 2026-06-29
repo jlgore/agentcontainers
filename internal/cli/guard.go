@@ -18,6 +18,7 @@ import (
 
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/approval"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/audit"
+	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/config"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/guard"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/mcpproxy"
 )
@@ -101,7 +102,7 @@ func newGuardServeCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&socket, "socket", "", "Guard socket path (default: $AC_GUARD_SOCKET or ~/.ac/guard.sock)")
-	cmd.Flags().StringVar(&securityYAML, "security-yaml", "", "Policy file (default: sift-mcp built-in defaults)")
+	cmd.Flags().StringVar(&securityYAML, "security-yaml", "", "Policy file (default: sift-mcp built-in defaults). A superset of security.yaml: an optional top-level `shell:` allowlist ([{binary, denyArgs}]) makes the agent's native shell default-deny")
 	cmd.Flags().BoolVar(&noApproval, "no-approval", false, "Policy-only: a denial is final, never escalated to a human (alias for --escalation deny)")
 	cmd.Flags().StringVar(&escalation, "escalation", "prompt", "Escalation mode: 'prompt' (block for a human via the broker), 'inline' (return Claude Code 'ask' so it prompts in the agent's own TUI; host audits via a ledger), or 'deny' (policy-only)")
 	cmd.Flags().DurationVar(&timeout, "approval-timeout", approval.DefaultToolCallTimeout, "prompt mode: how long a denial waits for a human; inline mode: ledger grace before an unconfirmed escalation is reaped as denied-inferred")
@@ -136,16 +137,21 @@ func runGuardServe(cmd *cobra.Command, o guardServeOpts) error {
 	// dangerous flags, shell metacharacters, rm protection), or a custom
 	// security.yaml.
 	sec := mcpproxy.DefaultSecurityPolicy()
+	var shellCaps *config.MCPServerPolicy
 	policyDesc := "sift-mcp built-in defaults"
 	if o.securityYAML != "" {
-		loaded, err := mcpproxy.LoadSecurityYAML(o.securityYAML)
+		loadedSec, loadedCaps, err := mcpproxy.LoadGuardPolicyYAML(o.securityYAML)
 		if err != nil {
 			return fmt.Errorf("guard serve: %w", err)
 		}
-		sec = loaded
+		sec = loadedSec
+		shellCaps = loadedCaps
 		policyDesc = o.securityYAML
 	}
-	cp, err := mcpproxy.Compile(sec, nil)
+	// shellCaps carries the optional default-deny binary allowlist (+ per-binary
+	// denyArgs). A nil cfg keeps the legacy behaviour: deny-list only, every
+	// binary otherwise permitted.
+	cp, err := mcpproxy.Compile(sec, shellCaps)
 	if err != nil {
 		return fmt.Errorf("guard serve: compiling policy: %w", err)
 	}

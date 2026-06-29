@@ -111,6 +111,56 @@ func LoadSecurityYAML(path string) (*SecurityPolicy, error) {
 	return &p, nil
 }
 
+// GuardPolicyFile is the agent-tool policy the guard compiles: a security.yaml
+// (SecurityPolicy, inlined) optionally extended with a `shell:` allowlist. It
+// is a strict superset of the security.yaml schema — a file with no `shell:`
+// block parses identically to LoadSecurityYAML — so the guard can additionally
+// enforce a default-deny binary allowlist (and per-binary denyArgs) over the
+// agent's native shell, which a plain SecurityPolicy cannot express. The yaml
+// tags mirror the capability-matrix fixture's `policy` block so that block can
+// drive the guard verbatim (single source of truth with the Layer-1 oracle).
+type GuardPolicyFile struct {
+	SecurityPolicy `yaml:",inline"`
+	Shell          []struct {
+		Binary   string   `yaml:"binary"`
+		DenyArgs []string `yaml:"denyArgs"`
+	} `yaml:"shell"`
+}
+
+// LoadGuardPolicyYAML reads a guard policy file (a security.yaml optionally
+// extended with a `shell:` allowlist) and returns the SecurityPolicy plus the
+// shell caps wrapped as an MCPServerPolicy, ready for Compile. When the file
+// declares no `shell:` block the returned cfg is nil and the result matches
+// LoadSecurityYAML.
+func LoadGuardPolicyYAML(path string) (*SecurityPolicy, *config.MCPServerPolicy, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("mcpproxy: reading guard policy %s: %w", path, err)
+	}
+	var gp GuardPolicyFile
+	dec := yaml.NewDecoder(strings.NewReader(string(raw)))
+	dec.KnownFields(true) // fail loudly on unknown fields, like security.yaml
+	if err := dec.Decode(&gp); err != nil {
+		// An empty file decodes to EOF; treat as defaults-only.
+		if strings.Contains(err.Error(), "EOF") {
+			return DefaultSecurityPolicy(), nil, nil
+		}
+		return nil, nil, fmt.Errorf("mcpproxy: invalid guard policy %s: %w", path, err)
+	}
+	sec := &gp.SecurityPolicy
+	sec.applyDefaults()
+
+	var cfg *config.MCPServerPolicy
+	if len(gp.Shell) > 0 {
+		cmds := make([]config.ShellCommand, len(gp.Shell))
+		for i, s := range gp.Shell {
+			cmds[i] = config.ShellCommand{Binary: s.Binary, DenyArgs: s.DenyArgs}
+		}
+		cfg = &config.MCPServerPolicy{Shell: &config.ShellCaps{Commands: cmds}}
+	}
+	return sec, cfg, nil
+}
+
 // expandPath expands ~ and makes the path absolute (lexically — host
 // symlinks are deliberately not resolved; see decompose.go).
 func expandPath(path string) string {

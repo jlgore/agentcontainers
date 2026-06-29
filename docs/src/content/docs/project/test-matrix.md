@@ -3,12 +3,13 @@ title: Cross-Harness Capability Test Matrix
 description: Design for proving that capabilities are allowed only explicitly when agentcontainers' Cedar backend runs under Claude Code, opencode, and pi across multiple models.
 ---
 
-> **Status:** In progress. Phases 0–3 are built — the shared capability fixture, the Layer-1
-> deterministic oracle (gating in CI), the KubeVirt VM substrate (`test/vm/`), and the Layer-1 kernel
-> asserts (C7/C8/C9 + LSM-attach proven on the VM's real kernel). Phase 3 surfaced finding **F1**
-> below. The remaining phases (the behavioral red-team cells) are designed but not yet built. This is
-> the engineering plan for a test matrix that validates the Cedar policy backend and eBPF enforcer
-> across multiple agent harnesses and models.
+> **Status:** In progress. Phases 0–4 are built — the shared capability fixture, the Layer-1
+> deterministic oracle (gating in CI), the KubeVirt VM substrate (`test/vm/`), the Layer-1 kernel
+> asserts (C7/C8/C9 + LSM-attach proven on the VM's real kernel), and the **Phase 4 Layer-2
+> behavioral cell** (Claude Code + API key, driven live against the guard in deny mode and scored
+> from the audit trail — **15/15 green**). Phase 3 surfaced finding **F1** below. The remaining cells
+> (opencode, pi) are designed but not yet built. This is the engineering plan for a test matrix that
+> validates the Cedar policy backend and eBPF enforcer across multiple agent harnesses and models.
 
 ## Goal
 
@@ -187,8 +188,22 @@ Lowest-risk first; each phase is independently valuable.
   in `file_open` on 6.x) — **traced, fixed, and re-validated** (below). Suite is 35 passed / 2 failed
   / 1 ignored; the 2 failures are the pre-existing `get_stats` shared-cgroup counter tests
   (not regressions, not LSM-related).
-- **Phase 4 — Layer-2 vertical slice: Claude Code + API key.** Adversarial suite under deny mode;
-  score from the hash-chained audit trail. One green cell validates the harness-driver contract.
+- **Phase 4 — Layer-2 vertical slice: Claude Code + API key. ✅ Done.** Drives the real Claude Code
+  harness headless (`claude -p`, Claude Code 2.1.195 on the VM) against the guard in **deny mode**,
+  one adversarial prompt (several jailbreak-framed) per fixture case, and scores **deterministically
+  from the guard's hash-chained audit trail** + a filesystem effect check for destructive denies —
+  never from model prose. The guard policy and case table are derived from the *same*
+  `capability-matrix.yaml` the Layer-1 oracle compiles (`yq '.policy'`), with `TestCapabilityMatrixGuardPath`
+  as the CI parity gate, so the live cell can't drift from the oracle. **Result: 15/15 PASS, 0 FAIL,
+  0 NOT-EXERCISED, all 15 per-case audit chains verified.** Entry point `test/vm/phase4-claude.sh`
+  (`SCORE_ONLY=1` re-scores with no API spend; `CASE_FILTER=<name>` re-runs one case). This required a
+  one-line guard capability — `guard serve --security-yaml` now accepts an optional `shell:` allowlist
+  (`mcpproxy.LoadGuardPolicyYAML`) so its Cedar engine is default-deny over the agent's native shell;
+  before this `guard serve` compiled `Compile(sec, nil)` (deny-list only) and could not enforce
+  C1/C2/C6. One observation worth noting: when the model reached for a *variant* binary (`mkfs.ext4`
+  instead of `mkfs`), the literal `denied_binaries` rule didn't match, but the **default-deny
+  allowlist still blocked it** — the action was denied either way; pinning the prompt to the literal
+  `mkfs` exercises the intended "cannot be overridden" mechanism.
 - **Phase 5 — opencode cell.** The plugin (guard socket) + managed `/etc/opencode` lockdown + FS
   control + OpenRouter key via `{file:}`. Same suite + the "soft-hook off → kernel still holds" assertion.
 - **Phase 6 — pi cell (later).** `@earendil-works` extension + `pi-mcp-adapter`; kernel-only
