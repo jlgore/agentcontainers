@@ -248,8 +248,14 @@ mod linux {
     /// caller passes window_timeout_ms == 0. Bounds a lost CompleteToolCall to
     /// a short window — egress is meant to last a single tool call.
     const TRANSIENT_EGRESS_DEFAULT_TTL_NS: u64 = 30 * 1_000_000_000; // 30 seconds
+    /// How often the background resolver re-resolves active transient-egress
+    /// windows' hosts and reconciles the BPF maps (DNS rotation / CDN churn
+    /// within a long window). The loop wakes every TRANSIENT_TICK to stay
+    /// responsive to shutdown; it re-resolves every TRANSIENT_RESOLVE_EVERY ticks.
+    const TRANSIENT_TICK: std::time::Duration = std::time::Duration::from_millis(500);
+    const TRANSIENT_RESOLVE_EVERY: u32 = 20; // 20 * 500ms = 10s
     use aya::maps::lpm_trie::Key as LpmKey;
-    use aya::maps::{HashMap as AyaHashMap, LpmTrie, PerCpuHashMap, RingBuf};
+    use aya::maps::{HashMap as AyaHashMap, LpmTrie, MapData, PerCpuHashMap, RingBuf};
     use aya::programs::{CgroupAttachMode, CgroupSkb, CgroupSkbAttachType, CgroupSockAddr, Lsm};
     use aya::{Btf, Ebpf};
     use std::os::unix::fs::MetadataExt;
@@ -302,12 +308,150 @@ mod linux {
         })
     }
 
-    /// The transient-egress (G4) keys one correlation opened, split by address
-    /// family so CompleteToolCall removes them from the correct BPF map.
+    /// Owned, shared handle to a transient-egress BPF hash map. Taken OUT of the
+    /// Ebpf at startup (like the ring buffers) so the background resolver thread
+    /// can mutate it without holding the programs lock — and so it does NOT keep
+    /// the BPF programs attached past manager drop. The kernel map persists (the
+    /// connect hooks hold their own reference); only the userspace handle moves.
+    type TransientMapV4 = std::sync::Arc<std::sync::Mutex<AyaHashMap<MapData, PortKeyV4, u64>>>;
+    type TransientMapV6 = std::sync::Arc<std::sync::Mutex<AyaHashMap<MapData, PortKeyV6, u64>>>;
+
+    /// One in-flight transient-egress (G4) window, keyed by correlation_id in
+    /// `TransientState::windows`. Retains the original rules + cgroup so the
+    /// background resolver can re-resolve the hosts and refresh the resolved keys
+    /// within the window. `expires_at_ns` is the fixed safety-net deadline.
+    struct TransientWindow {
+        rules: Vec<EgressRule>,
+        cgroup_id: u64,
+        expires_at_ns: u64,
+        keys_v4: Vec<PortKeyV4>,
+        keys_v6: Vec<PortKeyV6>,
+    }
+
+    /// All transient-egress book-keeping under one lock. The BPF maps are a
+    /// projection of `windows`: `reconcile` folds every window's keys into the
+    /// desired map state (union, max expiry across windows sharing a key) and
+    /// diffs it against `installed_*`. This makes overlap (two windows sharing a
+    /// key), re-resolution (a window's keys change), and completion (a window is
+    /// removed) all fall out of one declarative pass — no per-key refcounting.
     #[derive(Default)]
-    struct TransientKeys {
-        v4: Vec<PortKeyV4>,
-        v6: Vec<PortKeyV6>,
+    struct TransientState {
+        windows: HashMap<String, TransientWindow>,
+        installed_v4: HashMap<PortKeyV4, u64>,
+        installed_v6: HashMap<PortKeyV6, u64>,
+    }
+
+    /// Resolve a set of egress rules to BPF map keys for a cgroup. Async DNS —
+    /// call this BEFORE taking the transient state / map locks. An IP literal
+    /// (including a bracket-free IPv6 host, which is what the proxy's URI parser
+    /// emits) is used directly; `lookup_host` would need it bracketed. A failed
+    /// resolution or unknown protocol skips that rule (fail-closed: no key, no
+    /// egress).
+    async fn resolve_transient_keys(
+        rules: &[EgressRule],
+        cgroup_id: u64,
+    ) -> (Vec<PortKeyV4>, Vec<PortKeyV6>) {
+        let mut v4 = Vec::new();
+        let mut v6 = Vec::new();
+        for rule in rules {
+            let proto: u8 = match rule.protocol.as_str() {
+                "tcp" | "" => 6u8,
+                "udp" => 17u8,
+                other => {
+                    warn!(protocol = %other, "unknown protocol in transient egress rule, skipping");
+                    continue;
+                }
+            };
+            let resolved: Vec<std::net::IpAddr> = match rule.host.parse::<std::net::IpAddr>() {
+                Ok(ip) => vec![ip],
+                Err(_) => match tokio::net::lookup_host(format!("{}:0", rule.host)).await {
+                    Ok(addrs) => addrs.map(|a| a.ip()).collect(),
+                    Err(e) => {
+                        warn!(
+                            host = %rule.host, error = %e,
+                            "DNS resolution failed for transient egress host, skipping"
+                        );
+                        continue;
+                    }
+                },
+            };
+            for ip in resolved {
+                match ip {
+                    std::net::IpAddr::V4(ip) => v4.push(PortKeyV4 {
+                        cgroup_id,
+                        ip: u32::from(ip).to_be(),
+                        port: rule.port,
+                        protocol: proto,
+                        _pad: 0,
+                    }),
+                    std::net::IpAddr::V6(ip) => v6.push(PortKeyV6 {
+                        cgroup_id,
+                        addr: ipv6_words(ip),
+                        port: rule.port,
+                        protocol: proto,
+                        _pad: 0,
+                        _pad2: 0,
+                    }),
+                }
+            }
+        }
+        (v4, v6)
+    }
+
+    /// Reconcile the transient-egress BPF maps to the desired state derived from
+    /// `state.windows`: the union of every window's keys, each valued at the max
+    /// expiry among windows that contributed it. Inserts/updates changed keys and
+    /// removes keys no longer desired, then updates the installed snapshot. The
+    /// caller must hold the `transient` write lock. Takes the map locks in a
+    /// fixed order (v4 then v6); does NOT await.
+    fn reconcile(
+        state: &mut TransientState,
+        map_v4: &TransientMapV4,
+        map_v6: &TransientMapV6,
+    ) -> anyhow::Result<()> {
+        let mut desired_v4: HashMap<PortKeyV4, u64> = HashMap::new();
+        let mut desired_v6: HashMap<PortKeyV6, u64> = HashMap::new();
+        for w in state.windows.values() {
+            for k in &w.keys_v4 {
+                let e = desired_v4.entry(*k).or_insert(0);
+                *e = (*e).max(w.expires_at_ns);
+            }
+            for k in &w.keys_v6 {
+                let e = desired_v6.entry(*k).or_insert(0);
+                *e = (*e).max(w.expires_at_ns);
+            }
+        }
+
+        {
+            let mut map = map_v4.lock().unwrap();
+            for (k, &exp) in &desired_v4 {
+                if state.installed_v4.get(k) != Some(&exp) {
+                    map.insert(k, exp, 0)?;
+                }
+            }
+            for k in state.installed_v4.keys() {
+                if !desired_v4.contains_key(k) {
+                    let _ = map.remove(k);
+                }
+            }
+        }
+        {
+            let mut map = map_v6.lock().unwrap();
+            for (k, &exp) in &desired_v6 {
+                if state.installed_v6.get(k) != Some(&exp) {
+                    map.insert(k, exp, 0)?;
+                }
+            }
+            for k in state.installed_v6.keys() {
+                if !desired_v6.contains_key(k) {
+                    let _ = map.remove(k);
+                }
+            }
+        }
+
+        state.installed_v4 = desired_v4;
+        state.installed_v6 = desired_v6;
+        Ok(())
     }
 
     /// Real BPF-backed policy manager for Linux.
@@ -359,11 +503,17 @@ mod linux {
         /// for these cgroups; non-restricted cgroups keep container-wide access.
         restricted_cgroups: RwLock<HashMap<u64, ()>>,
 
-        /// URI-scoped transient egress keys inserted for an in-flight tool call
-        /// (G4), keyed by correlation_id so CompleteToolCall can remove exactly
-        /// the entries this call opened. The kernel-side expiry is the safety
-        /// net; this map makes the common (clean-complete) path precise.
-        transient_egress: RwLock<HashMap<String, TransientKeys>>,
+        /// URI-scoped transient egress (G4) book-keeping: the in-flight windows
+        /// and the projected BPF map state. Shared (Arc) with the background
+        /// resolver thread. The kernel-side expiry is the safety net; this state
+        /// drives precise insert/refresh/remove via `reconcile`.
+        transient: std::sync::Arc<RwLock<TransientState>>,
+        /// Shared handles to the transient-egress BPF maps (taken out of the
+        /// Ebpf at startup), used by prepare/complete and the resolver thread.
+        transient_v4: TransientMapV4,
+        transient_v6: TransientMapV6,
+        /// Set on Drop to stop the background resolver thread.
+        transient_shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
         /// Whether the BPF LSM hooks (file_open, bprm_check) actually attached.
         /// Captured once at program-attach time and reported via lsm_status();
@@ -409,6 +559,22 @@ mod linux {
             let registry = ContainerRegistry::new();
             let event_bus = EventBus::new();
 
+            // Take the transient-egress maps OUT of the Ebpf into shared handles
+            // (same rationale as the ring buffers): the resolver thread mutates
+            // them without the programs lock and without pinning the programs.
+            let take_transient = |bpf: &mut Ebpf, name: &str| -> anyhow::Result<aya::maps::Map> {
+                bpf.take_map(name)
+                    .ok_or_else(|| anyhow::anyhow!("BPF map {name} not found"))
+            };
+            let transient_v4: TransientMapV4 = std::sync::Arc::new(std::sync::Mutex::new(
+                AyaHashMap::try_from(take_transient(&mut bpf, "TRANSIENT_PORTS")?)?,
+            ));
+            let transient_v6: TransientMapV6 = std::sync::Arc::new(std::sync::Mutex::new(
+                AyaHashMap::try_from(take_transient(&mut bpf, "TRANSIENT_PORTS_V6")?)?,
+            ));
+            let transient = std::sync::Arc::new(RwLock::new(TransientState::default()));
+            let transient_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
             let mgr = Self {
                 programs: std::sync::Mutex::new(bpf),
                 registry,
@@ -418,12 +584,17 @@ mod linux {
                 correlations: std::sync::Arc::new(RwLock::new(HashMap::new())),
                 tracked_domains: std::sync::Arc::new(RwLock::new(HashMap::new())),
                 restricted_cgroups: RwLock::new(HashMap::new()),
-                transient_egress: RwLock::new(HashMap::new()),
+                transient,
+                transient_v4,
+                transient_v6,
+                transient_shutdown,
                 lsm_status,
             };
 
             // Spawn background ring buffer readers for all event sources.
             mgr.spawn_event_readers();
+            // Spawn the transient-egress re-resolution loop.
+            mgr.spawn_transient_resolver();
 
             Ok(mgr)
         }
@@ -1818,12 +1989,12 @@ mod linux {
                 monotonic_ns(),
             );
 
-            // G4: URI-scoped transient egress. Resolve target hosts to IPv4
-            // addresses up front (async DNS — must not be held across the std
-            // programs lock), then insert one TRANSIENT_PORTS entry per
-            // (cgroup, ip, port, proto) with a CLOCK_MONOTONIC expiry. The
-            // connect4 hook allows these targets only while unexpired; the
-            // expiry bounds a lost CompleteToolCall (parity with ACTIVE_TOOL).
+            // G4: URI-scoped transient egress. Resolve target hosts up front
+            // (async DNS — must not be held across the state/map locks), record
+            // the window, then reconcile the BPF maps to the windows' union. The
+            // connect hooks allow these targets only while unexpired; the expiry
+            // bounds a lost CompleteToolCall (parity with ACTIVE_TOOL), and the
+            // background resolver re-resolves the hosts within the window.
             if !transient_egress.is_empty() {
                 let ttl_ns = if window_timeout_ms > 0 {
                     window_timeout_ms.saturating_mul(1_000_000)
@@ -1831,84 +2002,20 @@ mod linux {
                     TRANSIENT_EGRESS_DEFAULT_TTL_NS
                 };
                 let expires_at_ns = monotonic_ns().saturating_add(ttl_ns);
-                let mut keys = TransientKeys::default();
-                for rule in transient_egress {
-                    let proto: u8 = match rule.protocol.as_str() {
-                        "tcp" | "" => 6u8,
-                        "udp" => 17u8,
-                        other => {
-                            warn!(protocol = %other, "unknown protocol in transient egress rule, skipping");
-                            continue;
-                        }
-                    };
-                    // Resolve the host to IP(s). An IP literal (including a
-                    // bracket-free IPv6 host, which is what the proxy's URI
-                    // parser emits) is used directly — `lookup_host` would need
-                    // it bracketed. Hostnames go through async DNS.
-                    let resolved: Vec<std::net::IpAddr> = match rule
-                        .host
-                        .parse::<std::net::IpAddr>()
-                    {
-                        Ok(ip) => vec![ip],
-                        Err(_) => match tokio::net::lookup_host(format!("{}:0", rule.host)).await {
-                            Ok(addrs) => addrs.map(|a| a.ip()).collect(),
-                            Err(e) => {
-                                warn!(
-                                    host = %rule.host, error = %e,
-                                    "DNS resolution failed for transient egress host, skipping"
-                                );
-                                continue;
-                            }
-                        },
-                    };
-                    for ip in resolved {
-                        match ip {
-                            std::net::IpAddr::V4(ip) => keys.v4.push(PortKeyV4 {
-                                cgroup_id,
-                                ip: u32::from(ip).to_be(),
-                                port: rule.port,
-                                protocol: proto,
-                                _pad: 0,
-                            }),
-                            std::net::IpAddr::V6(ip) => keys.v6.push(PortKeyV6 {
-                                cgroup_id,
-                                addr: ipv6_words(ip),
-                                port: rule.port,
-                                protocol: proto,
-                                _pad: 0,
-                                _pad2: 0,
-                            }),
-                        }
-                    }
-                }
-                if !keys.v4.is_empty() || !keys.v6.is_empty() {
-                    let mut bpf = self.programs.lock().unwrap();
-                    if !keys.v4.is_empty() {
-                        let map_data = bpf
-                            .map_mut("TRANSIENT_PORTS")
-                            .ok_or_else(|| anyhow::anyhow!("BPF map TRANSIENT_PORTS not found"))?;
-                        let mut map: AyaHashMap<_, PortKeyV4, u64> =
-                            AyaHashMap::try_from(map_data)?;
-                        for k in &keys.v4 {
-                            map.insert(k, expires_at_ns, 0)?;
-                        }
-                    }
-                    if !keys.v6.is_empty() {
-                        let map_data = bpf.map_mut("TRANSIENT_PORTS_V6").ok_or_else(|| {
-                            anyhow::anyhow!("BPF map TRANSIENT_PORTS_V6 not found")
-                        })?;
-                        let mut map: AyaHashMap<_, PortKeyV6, u64> =
-                            AyaHashMap::try_from(map_data)?;
-                        for k in &keys.v6 {
-                            map.insert(k, expires_at_ns, 0)?;
-                        }
-                    }
-                    drop(bpf);
-                    self.transient_egress
-                        .write()
-                        .unwrap()
-                        .insert(correlation_id.to_string(), keys);
-                }
+                let (keys_v4, keys_v6) = resolve_transient_keys(transient_egress, cgroup_id).await;
+
+                let mut state = self.transient.write().unwrap();
+                state.windows.insert(
+                    correlation_id.to_string(),
+                    TransientWindow {
+                        rules: transient_egress.to_vec(),
+                        cgroup_id,
+                        expires_at_ns,
+                        keys_v4,
+                        keys_v6,
+                    },
+                );
+                reconcile(&mut state, &self.transient_v4, &self.transient_v6)?;
             }
 
             // Per-tool secret enforcement only applies to cgroups that hold a
@@ -1969,34 +2076,14 @@ mod linux {
                 }
             }
 
-            // G4: remove the transient egress entries this correlation opened,
-            // closing the kernel egress window immediately. The kernel-side
-            // expiry already bounds a missed Complete; this makes the clean
-            // path precise. Removing an absent key is not an error.
-            let transient_keys = self
-                .transient_egress
-                .write()
-                .unwrap()
-                .remove(correlation_id);
-            if let Some(keys) = transient_keys {
-                let mut bpf = self.programs.lock().unwrap();
-                if !keys.v4.is_empty() {
-                    if let Some(map_data) = bpf.map_mut("TRANSIENT_PORTS") {
-                        let mut map: AyaHashMap<_, PortKeyV4, u64> =
-                            AyaHashMap::try_from(map_data)?;
-                        for k in &keys.v4 {
-                            let _ = map.remove(k);
-                        }
-                    }
-                }
-                if !keys.v6.is_empty() {
-                    if let Some(map_data) = bpf.map_mut("TRANSIENT_PORTS_V6") {
-                        let mut map: AyaHashMap<_, PortKeyV6, u64> =
-                            AyaHashMap::try_from(map_data)?;
-                        for k in &keys.v6 {
-                            let _ = map.remove(k);
-                        }
-                    }
+            // G4: drop this correlation's window and reconcile — the keys it
+            // contributed are removed from the BPF maps unless another in-flight
+            // window still references them (overlap-safe). The kernel-side expiry
+            // already bounds a missed Complete; this makes the clean path precise.
+            {
+                let mut state = self.transient.write().unwrap();
+                if state.windows.remove(correlation_id).is_some() {
+                    reconcile(&mut state, &self.transient_v4, &self.transient_v6)?;
                 }
             }
 
@@ -2049,33 +2136,124 @@ mod linux {
         /// entries (G4) currently installed for a cgroup in TRANSIENT_PORTS.
         /// Used to assert the prepare/complete window lifecycle.
         pub fn transient_egress_count(&self, cgroup_id: u64) -> usize {
-            let bpf = self.programs.lock().unwrap();
-            if let Some(map) = bpf.map("TRANSIENT_PORTS") {
-                if let Ok(map) = AyaHashMap::<_, PortKeyV4, u64>::try_from(map) {
-                    return map
-                        .keys()
-                        .filter_map(|k| k.ok())
-                        .filter(|k| k.cgroup_id == cgroup_id)
-                        .count();
-                }
-            }
-            0
+            self.transient_v4
+                .lock()
+                .unwrap()
+                .keys()
+                .filter_map(|k| k.ok())
+                .filter(|k| k.cgroup_id == cgroup_id)
+                .count()
         }
 
         /// Test/diagnostic helper: count the IPv6 transient egress entries (G4)
         /// installed for a cgroup in TRANSIENT_PORTS_V6.
         pub fn transient_egress_v6_count(&self, cgroup_id: u64) -> usize {
-            let bpf = self.programs.lock().unwrap();
-            if let Some(map) = bpf.map("TRANSIENT_PORTS_V6") {
-                if let Ok(map) = AyaHashMap::<_, PortKeyV6, u64>::try_from(map) {
-                    return map
-                        .keys()
-                        .filter_map(|k| k.ok())
-                        .filter(|k| k.cgroup_id == cgroup_id)
-                        .count();
-                }
-            }
-            0
+            self.transient_v6
+                .lock()
+                .unwrap()
+                .keys()
+                .filter_map(|k| k.ok())
+                .filter(|k| k.cgroup_id == cgroup_id)
+                .count()
+        }
+
+        /// Background loop: periodically re-resolve the hosts of every in-flight
+        /// transient-egress window and reconcile the BPF maps, so DNS rotation /
+        /// CDN churn within a window keeps the allowed IPs current. Also GCs
+        /// windows past their expiry (a lost CompleteToolCall), bounding the
+        /// userspace book-keeping. Runs on its own thread + runtime (mirrors
+        /// spawn_event_readers) and holds only the transient state + map handles,
+        /// so it never pins the BPF programs; it exits when `transient_shutdown`
+        /// is set (on Drop).
+        fn spawn_transient_resolver(&self) {
+            let transient = self.transient.clone();
+            let map_v4 = self.transient_v4.clone();
+            let map_v6 = self.transient_v6.clone();
+            let shutdown = self.transient_shutdown.clone();
+
+            let _ = std::thread::Builder::new()
+                .name("transient-resolver".into())
+                .spawn(move || {
+                    let rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            warn!(error = %e, "transient resolver runtime failed to start");
+                            return;
+                        }
+                    };
+                    rt.block_on(async move {
+                        let mut ticks: u32 = 0;
+                        loop {
+                            tokio::time::sleep(TRANSIENT_TICK).await;
+                            if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                                return;
+                            }
+                            ticks = ticks.wrapping_add(1);
+                            if !ticks.is_multiple_of(TRANSIENT_RESOLVE_EVERY) {
+                                continue;
+                            }
+
+                            // Snapshot active windows (and find expired ones) under a
+                            // read lock, then resolve OUTSIDE any lock.
+                            let now = monotonic_ns();
+                            let (active, expired) = {
+                                let st = transient.read().unwrap();
+                                // (correlation_id, cgroup_id, rules) per active window.
+                                let mut active: Vec<(String, u64, Vec<EgressRule>)> = Vec::new();
+                                let mut expired: Vec<String> = Vec::new();
+                                for (cid, w) in st.windows.iter() {
+                                    if w.expires_at_ns != 0 && now > w.expires_at_ns {
+                                        expired.push(cid.clone());
+                                    } else {
+                                        active.push((cid.clone(), w.cgroup_id, w.rules.clone()));
+                                    }
+                                }
+                                (active, expired)
+                            };
+                            if active.is_empty() && expired.is_empty() {
+                                continue;
+                            }
+
+                            let mut refreshed: HashMap<String, (Vec<PortKeyV4>, Vec<PortKeyV6>)> =
+                                HashMap::new();
+                            for (cid, cgid, rules) in &active {
+                                refreshed.insert(
+                                    cid.clone(),
+                                    resolve_transient_keys(rules, *cgid).await,
+                                );
+                            }
+
+                            // Apply: drop expired windows, refresh still-present
+                            // windows' keys, reconcile. A window completed between
+                            // snapshot and now is simply absent — skip it.
+                            let mut st = transient.write().unwrap();
+                            for cid in &expired {
+                                st.windows.remove(cid);
+                            }
+                            for (cid, keys) in refreshed {
+                                if let Some(w) = st.windows.get_mut(&cid) {
+                                    w.keys_v4 = keys.0;
+                                    w.keys_v6 = keys.1;
+                                }
+                            }
+                            if let Err(e) = reconcile(&mut st, &map_v4, &map_v6) {
+                                warn!(error = %e, "transient resolver reconcile failed");
+                            }
+                        }
+                    });
+                });
+        }
+    }
+
+    impl Drop for BpfPolicyManager {
+        fn drop(&mut self) {
+            // Signal the background resolver to stop; it checks each tick and
+            // exits within TRANSIENT_TICK, releasing its map-handle clones.
+            self.transient_shutdown
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }

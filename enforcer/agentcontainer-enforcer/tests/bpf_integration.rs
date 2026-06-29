@@ -1381,9 +1381,7 @@ async fn test_transient_egress_v6_enforces_connect() {
     // then proceeds to the OS networking layer, which on a node without an IPv6
     // route returns NetworkUnreachable. That non-EPERM result still proves the
     // transient rule let the connect past the hook.
-    let denied = |r: &std::io::Result<()>| {
-        matches!(r, Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied)
-    };
+    let denied = |r: &std::io::Result<()>| matches!(r, Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied);
     assert!(
         denied(&deny_before),
         "v6 target should be default-denied before prepare: {deny_before:?}"
@@ -1396,6 +1394,65 @@ async fn test_transient_egress_v6_enforces_connect() {
         denied(&deny_after),
         "v6 target should be denied again after complete: {deny_after:?}"
     );
+}
+
+/// G4 overlap: two concurrent tool calls open transient egress to the SAME
+/// host:port. The declarative reconcile keeps one shared map entry while either
+/// window is open, so completing the first call must NOT close egress for the
+/// second (the review's premature-deny bug). Count-based and deterministic.
+#[tokio::test]
+#[serial]
+async fn test_transient_egress_overlap_refcount() {
+    let mgr = BpfPolicyManager::new().unwrap();
+    let cgroup = own_cgroup_path();
+    let handle = mgr
+        .register("test-transient-ovl", &cgroup, 0)
+        .await
+        .unwrap();
+
+    let rule = || {
+        vec![EgressRule {
+            host: "203.0.113.7".into(),
+            port: 443,
+            protocol: "udp".into(),
+        }]
+    };
+
+    // Both calls reference the same target -> one shared entry, not two.
+    mgr.prepare_tool_call("test-transient-ovl", "ovl-a", "fetch", &rule(), 30_000)
+        .await
+        .unwrap();
+    assert_eq!(mgr.transient_egress_count(handle.cgroup_id), 1);
+    mgr.prepare_tool_call("test-transient-ovl", "ovl-b", "fetch", &rule(), 30_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        mgr.transient_egress_count(handle.cgroup_id),
+        1,
+        "overlapping windows on the same target share one map entry"
+    );
+
+    // Completing the first window must keep the entry — the second still holds it.
+    mgr.complete_tool_call("test-transient-ovl", "ovl-a")
+        .await
+        .unwrap();
+    assert_eq!(
+        mgr.transient_egress_count(handle.cgroup_id),
+        1,
+        "completing one overlapping window must NOT close the shared egress"
+    );
+
+    // Completing the second (last) window removes it.
+    mgr.complete_tool_call("test-transient-ovl", "ovl-b")
+        .await
+        .unwrap();
+    assert_eq!(
+        mgr.transient_egress_count(handle.cgroup_id),
+        0,
+        "completing the last window removes the shared entry"
+    );
+
+    mgr.unregister("test-transient-ovl").await.unwrap();
 }
 
 /// A container with only unrestricted secrets (empty allowed_tools) keeps

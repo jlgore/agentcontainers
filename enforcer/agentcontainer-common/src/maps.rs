@@ -38,7 +38,7 @@ pub struct LpmDataV6 {
 
 /// Key for the allowed ports hash map (IPv4), scoped per-cgroup.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PortKeyV4 {
     pub cgroup_id: u64,
     pub ip: u32,
@@ -57,7 +57,7 @@ pub struct PortKeyV4 {
 /// uninitialized pad byte on either side would make a lookup miss. There is no
 /// implicit padding (8 + 16 + 2 + 1 + 1 + 4 = 32, u64-aligned).
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PortKeyV6 {
     pub cgroup_id: u64,
     pub addr: [u32; 4],
