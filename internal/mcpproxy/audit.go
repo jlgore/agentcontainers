@@ -26,16 +26,27 @@ type EnforcerAuditSink struct {
 	logger *audit.Logger
 }
 
-func NewEnforcerAuditSink(sessionID, dir string) (*EnforcerAuditSink, error) {
-	var opts []audit.LoggerOption
-	if dir != "" {
-		opts = append(opts, audit.WithDir(dir))
-	}
-	l, err := audit.NewLogger(sessionID+"-enforcer", opts...)
+// NewEnforcerAuditSink creates the enforcer audit logger. A non-nil signer
+// stamps every entry with the instance's DID + Ed25519 signature (G1).
+func NewEnforcerAuditSink(sessionID, dir string, signer audit.Signer) (*EnforcerAuditSink, error) {
+	l, err := audit.NewLogger(sessionID+"-enforcer", auditOpts(dir, signer)...)
 	if err != nil {
 		return nil, fmt.Errorf("mcpproxy: creating enforcer audit logger: %w", err)
 	}
 	return &EnforcerAuditSink{logger: l}, nil
+}
+
+// auditOpts builds the common logger options (directory + optional signer)
+// shared by all three sink constructors.
+func auditOpts(dir string, signer audit.Signer) []audit.LoggerOption {
+	var opts []audit.LoggerOption
+	if dir != "" {
+		opts = append(opts, audit.WithDir(dir))
+	}
+	if signer != nil {
+		opts = append(opts, audit.WithSigner(signer))
+	}
+	return opts
 }
 
 func (s *EnforcerAuditSink) Path() string { return s.logger.Path() }
@@ -191,12 +202,8 @@ func consumeEnforcerStream(stream enforcerapi.Enforcer_StreamEventsClient, sink 
 
 // NewAuditSink creates the proxy audit logger for a session. An empty dir
 // uses audit.DefaultDir ($AC_AUDIT_DIR or ~/.ac/audit).
-func NewAuditSink(sessionID, dir string) (*AuditSink, error) {
-	var opts []audit.LoggerOption
-	if dir != "" {
-		opts = append(opts, audit.WithDir(dir))
-	}
-	l, err := audit.NewLogger(sessionID+"-proxy", opts...)
+func NewAuditSink(sessionID, dir string, signer audit.Signer) (*AuditSink, error) {
+	l, err := audit.NewLogger(sessionID+"-proxy", auditOpts(dir, signer)...)
 	if err != nil {
 		return nil, fmt.Errorf("mcpproxy: creating proxy audit logger: %w", err)
 	}
@@ -216,6 +223,16 @@ type ToolCallRecord struct {
 	PoliciesEvaluated []string
 	ApprovalRequired  bool
 	LatencyMs         int64
+
+	// Override provenance (G3): set when a per-invocation operator override
+	// participated. OverrideApplied means a verified override waived at least
+	// one deny within the ceiling; OverrideIssuer is its signer DID;
+	// WaivedReasons are the cleared denies. OverrideRejected is non-empty when
+	// an override was present but refused (the call ran under static policy).
+	OverrideApplied  bool
+	OverrideIssuer   string
+	WaivedReasons    []string
+	OverrideRejected string
 }
 
 // LogToolCall appends a tool_call entry per SPEC §7.1 (camelCase metadata
@@ -245,6 +262,18 @@ func (s *AuditSink) LogToolCall(rec ToolCallRecord) error {
 	}
 	if rec.Enforcement != "" {
 		opts = append(opts, audit.WithMetadataAny("enforcement", rec.Enforcement))
+	}
+	// Override provenance (G3): record when a per-invocation override applied
+	// (with its issuer + the denies it waived) or was rejected.
+	if rec.OverrideApplied {
+		opts = append(opts,
+			audit.WithMetadataAny("policyOverride", true),
+			audit.WithMetadataAny("overrideIssuer", rec.OverrideIssuer),
+			audit.WithMetadataAny("waivedReasons", rec.WaivedReasons),
+		)
+	}
+	if rec.OverrideRejected != "" {
+		opts = append(opts, audit.WithMetadataAny("overrideRejected", rec.OverrideRejected))
 	}
 
 	return s.logger.Log(audit.EventToolCall, audit.Actor{Type: "tool", Name: rec.Server}, opts...)

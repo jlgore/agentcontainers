@@ -1,0 +1,51 @@
+{{.Header}}
+package sift.uri_egress
+
+import rego.v1
+
+# egress_targets are the host:port pairs the enforcer may transiently allow
+# for this tool call (G4: URI-scoped egress). URIs are parsed proxy-side (Go,
+# via net/url) and arrive in input.context.requested_uris as objects of the
+# form {uri, scheme, host, port, source}. A requested URI qualifies when:
+#   - its scheme is https (no http/file/ftp),
+#   - it carries no path traversal (".."),
+#   - its host is not in the operator denylist (data.uri_egress_denylist),
+#   - and it clears the provenance gate (see below).
+# The proxy only acts on egress_targets for an ALLOWED tool call, and only
+# when the server opts in via policy.network.uriEgress.
+
+# Provenance gate (Phase B). The harness attaches the URLs the *user* actually
+# supplied with source "user_message"; the proxy also extracts URLs from the
+# tool's own arguments with source "tool_args". When ANY user_message URI is
+# present we require user_message provenance for every grant — a URL the model
+# merely surfaced in tool arguments (or echoed from prior tool output) does not
+# get egress while a user-attested set exists. This is the PRD's "no implicit
+# grants from tool output" guarantee. Absent any harness attestation we fall
+# back to tool_args, the Phase-A behavior.
+has_user_message if {
+	some u in input.context.requested_uris
+	u.source == "user_message"
+}
+
+allowed_source(u) if {
+	has_user_message
+	u.source == "user_message"
+}
+
+allowed_source(u) if {
+	not has_user_message
+	u.source == "tool_args"
+}
+
+egress_targets contains {"host": u.host, "port": u.port} if {
+	some u in input.context.requested_uris
+	u.scheme == "https"
+	not contains(u.uri, "..")
+	not denied_host(u.host)
+	allowed_source(u)
+}
+
+denied_host(host) if {
+	some d in data.uri_egress_denylist
+	host == d
+}

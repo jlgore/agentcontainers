@@ -1,0 +1,18 @@
+{{- /*
+sift.capabilities — agentcontainers-native shell allowlist + per-binary
+denyArgs (from agentcontainer.json policy.shell.commands). The allowlist is
+case-insensitive (Rego: lower(binary) in lower(allowed_binaries)); denyArgs
+key on the exact binary and compare flags lowercased.
+*/ -}}
+{{- if .HasAllowlist}}
+@id("capabilities_allowlist")
+@reason("binary is not in the shell command allowlist")
+forbid(principal, action == Action::"Invoke", resource)
+when { resource.binary_lc != "" && !({{.AllowedBinaries}}.contains(resource.binary_lc)) };
+{{- end}}
+{{- range .DenyArgsPerTool}}
+@id("capabilities_denyargs::{{.Binary}}")
+@reason("arg is denied for this tool")
+forbid(principal, action == Action::"Invoke", resource)
+when { resource.binary == {{.BinaryLit}} && resource.flags.containsAny({{.FlagsLiteral}}) };
+{{- end}}

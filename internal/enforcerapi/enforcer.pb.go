@@ -210,8 +210,17 @@ type PrepareToolCallRequest struct {
 	CorrelationId string                 `protobuf:"bytes,1,opt,name=correlation_id,json=correlationId,proto3" json:"correlation_id,omitempty"`
 	ContainerId   string                 `protobuf:"bytes,2,opt,name=container_id,json=containerId,proto3" json:"container_id,omitempty"`
 	ToolName      string                 `protobuf:"bytes,3,opt,name=tool_name,json=toolName,proto3" json:"tool_name,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// transient_egress opens kernel egress to exactly these host:port targets
+	// for the duration of this tool-call window (G4: URI-scoped egress). The
+	// entries are removed on CompleteToolCall, or expire after
+	// window_timeout_ms — whichever comes first. Empty = no transient egress
+	// (unchanged behavior).
+	TransientEgress []*EgressRule `protobuf:"bytes,4,rep,name=transient_egress,json=transientEgress,proto3" json:"transient_egress,omitempty"`
+	// window_timeout_ms bounds the transient egress entries as a safety net
+	// against a lost CompleteToolCall. 0 = use the enforcer default horizon.
+	WindowTimeoutMs uint64 `protobuf:"varint,5,opt,name=window_timeout_ms,json=windowTimeoutMs,proto3" json:"window_timeout_ms,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *PrepareToolCallRequest) Reset() {
@@ -263,6 +272,20 @@ func (x *PrepareToolCallRequest) GetToolName() string {
 		return x.ToolName
 	}
 	return ""
+}
+
+func (x *PrepareToolCallRequest) GetTransientEgress() []*EgressRule {
+	if x != nil {
+		return x.TransientEgress
+	}
+	return nil
+}
+
+func (x *PrepareToolCallRequest) GetWindowTimeoutMs() uint64 {
+	if x != nil {
+		return x.WindowTimeoutMs
+	}
+	return 0
 }
 
 type PrepareToolCallResponse struct {
@@ -2310,11 +2333,13 @@ const file_enforcer_proto_rawDesc = "" +
 	"\tcgroup_id\x18\x01 \x01(\x04R\bcgroupId\"?\n" +
 	"\x1aUnregisterContainerRequest\x12!\n" +
 	"\fcontainer_id\x18\x01 \x01(\tR\vcontainerId\"\x1d\n" +
-	"\x1bUnregisterContainerResponse\"\x7f\n" +
+	"\x1bUnregisterContainerResponse\"\xff\x01\n" +
 	"\x16PrepareToolCallRequest\x12%\n" +
 	"\x0ecorrelation_id\x18\x01 \x01(\tR\rcorrelationId\x12!\n" +
 	"\fcontainer_id\x18\x02 \x01(\tR\vcontainerId\x12\x1b\n" +
-	"\ttool_name\x18\x03 \x01(\tR\btoolName\"\x19\n" +
+	"\ttool_name\x18\x03 \x01(\tR\btoolName\x12R\n" +
+	"\x10transient_egress\x18\x04 \x03(\v2'.agentcontainers.enforcer.v1.EgressRuleR\x0ftransientEgress\x12*\n" +
+	"\x11window_timeout_ms\x18\x05 \x01(\x04R\x0fwindowTimeoutMs\"\x19\n" +
 	"\x17PrepareToolCallResponse\"c\n" +
 	"\x17CompleteToolCallRequest\x12%\n" +
 	"\x0ecorrelation_id\x18\x01 \x01(\tR\rcorrelationId\x12!\n" +
@@ -2543,55 +2568,56 @@ var file_enforcer_proto_goTypes = []any{
 	nil,                                 // 38: agentcontainers.enforcer.v1.EnforcementEvent.DetailsEntry
 }
 var file_enforcer_proto_depIdxs = []int32{
-	9,  // 0: agentcontainers.enforcer.v1.NetworkPolicyRequest.egress_rules:type_name -> agentcontainers.enforcer.v1.EgressRule
-	12, // 1: agentcontainers.enforcer.v1.InjectSecretsRequest.secrets:type_name -> agentcontainers.enforcer.v1.SecretEntry
-	16, // 2: agentcontainers.enforcer.v1.CredentialPolicyRequest.secret_acls:type_name -> agentcontainers.enforcer.v1.SecretAcl
-	38, // 3: agentcontainers.enforcer.v1.EnforcementEvent.details:type_name -> agentcontainers.enforcer.v1.EnforcementEvent.DetailsEntry
-	24, // 4: agentcontainers.enforcer.v1.LoadComponentRequest.policy:type_name -> agentcontainers.enforcer.v1.ComponentPolicy
-	25, // 5: agentcontainers.enforcer.v1.LoadComponentRequest.limits:type_name -> agentcontainers.enforcer.v1.ComponentLimits
-	26, // 6: agentcontainers.enforcer.v1.LoadComponentResponse.tools:type_name -> agentcontainers.enforcer.v1.ToolDefinition
-	26, // 7: agentcontainers.enforcer.v1.ComponentInfo.tools:type_name -> agentcontainers.enforcer.v1.ToolDefinition
-	32, // 8: agentcontainers.enforcer.v1.ListComponentsResponse.components:type_name -> agentcontainers.enforcer.v1.ComponentInfo
-	26, // 9: agentcontainers.enforcer.v1.ListToolsResponse.tools:type_name -> agentcontainers.enforcer.v1.ToolDefinition
-	0,  // 10: agentcontainers.enforcer.v1.Enforcer.RegisterContainer:input_type -> agentcontainers.enforcer.v1.RegisterContainerRequest
-	2,  // 11: agentcontainers.enforcer.v1.Enforcer.UnregisterContainer:input_type -> agentcontainers.enforcer.v1.UnregisterContainerRequest
-	4,  // 12: agentcontainers.enforcer.v1.Enforcer.PrepareToolCall:input_type -> agentcontainers.enforcer.v1.PrepareToolCallRequest
-	6,  // 13: agentcontainers.enforcer.v1.Enforcer.CompleteToolCall:input_type -> agentcontainers.enforcer.v1.CompleteToolCallRequest
-	8,  // 14: agentcontainers.enforcer.v1.Enforcer.ApplyNetworkPolicy:input_type -> agentcontainers.enforcer.v1.NetworkPolicyRequest
-	10, // 15: agentcontainers.enforcer.v1.Enforcer.ApplyFilesystemPolicy:input_type -> agentcontainers.enforcer.v1.FilesystemPolicyRequest
-	11, // 16: agentcontainers.enforcer.v1.Enforcer.ApplyProcessPolicy:input_type -> agentcontainers.enforcer.v1.ProcessPolicyRequest
-	15, // 17: agentcontainers.enforcer.v1.Enforcer.ApplyCredentialPolicy:input_type -> agentcontainers.enforcer.v1.CredentialPolicyRequest
-	13, // 18: agentcontainers.enforcer.v1.Enforcer.InjectSecrets:input_type -> agentcontainers.enforcer.v1.InjectSecretsRequest
-	17, // 19: agentcontainers.enforcer.v1.Enforcer.LoadPolicyBundle:input_type -> agentcontainers.enforcer.v1.LoadPolicyBundleRequest
-	20, // 20: agentcontainers.enforcer.v1.Enforcer.StreamEvents:input_type -> agentcontainers.enforcer.v1.StreamEventsRequest
-	22, // 21: agentcontainers.enforcer.v1.Enforcer.GetStats:input_type -> agentcontainers.enforcer.v1.GetStatsRequest
-	27, // 22: agentcontainers.enforcer.v1.Enforcer.LoadComponent:input_type -> agentcontainers.enforcer.v1.LoadComponentRequest
-	29, // 23: agentcontainers.enforcer.v1.Enforcer.UnloadComponent:input_type -> agentcontainers.enforcer.v1.UnloadComponentRequest
-	31, // 24: agentcontainers.enforcer.v1.Enforcer.ListComponents:input_type -> agentcontainers.enforcer.v1.ListComponentsRequest
-	34, // 25: agentcontainers.enforcer.v1.Enforcer.ListTools:input_type -> agentcontainers.enforcer.v1.ListToolsRequest
-	36, // 26: agentcontainers.enforcer.v1.Enforcer.CallTool:input_type -> agentcontainers.enforcer.v1.CallToolRequest
-	1,  // 27: agentcontainers.enforcer.v1.Enforcer.RegisterContainer:output_type -> agentcontainers.enforcer.v1.RegisterContainerResponse
-	3,  // 28: agentcontainers.enforcer.v1.Enforcer.UnregisterContainer:output_type -> agentcontainers.enforcer.v1.UnregisterContainerResponse
-	5,  // 29: agentcontainers.enforcer.v1.Enforcer.PrepareToolCall:output_type -> agentcontainers.enforcer.v1.PrepareToolCallResponse
-	7,  // 30: agentcontainers.enforcer.v1.Enforcer.CompleteToolCall:output_type -> agentcontainers.enforcer.v1.CompleteToolCallResponse
-	19, // 31: agentcontainers.enforcer.v1.Enforcer.ApplyNetworkPolicy:output_type -> agentcontainers.enforcer.v1.PolicyResponse
-	19, // 32: agentcontainers.enforcer.v1.Enforcer.ApplyFilesystemPolicy:output_type -> agentcontainers.enforcer.v1.PolicyResponse
-	19, // 33: agentcontainers.enforcer.v1.Enforcer.ApplyProcessPolicy:output_type -> agentcontainers.enforcer.v1.PolicyResponse
-	19, // 34: agentcontainers.enforcer.v1.Enforcer.ApplyCredentialPolicy:output_type -> agentcontainers.enforcer.v1.PolicyResponse
-	14, // 35: agentcontainers.enforcer.v1.Enforcer.InjectSecrets:output_type -> agentcontainers.enforcer.v1.InjectSecretsResponse
-	18, // 36: agentcontainers.enforcer.v1.Enforcer.LoadPolicyBundle:output_type -> agentcontainers.enforcer.v1.LoadPolicyBundleResponse
-	21, // 37: agentcontainers.enforcer.v1.Enforcer.StreamEvents:output_type -> agentcontainers.enforcer.v1.EnforcementEvent
-	23, // 38: agentcontainers.enforcer.v1.Enforcer.GetStats:output_type -> agentcontainers.enforcer.v1.StatsResponse
-	28, // 39: agentcontainers.enforcer.v1.Enforcer.LoadComponent:output_type -> agentcontainers.enforcer.v1.LoadComponentResponse
-	30, // 40: agentcontainers.enforcer.v1.Enforcer.UnloadComponent:output_type -> agentcontainers.enforcer.v1.UnloadComponentResponse
-	33, // 41: agentcontainers.enforcer.v1.Enforcer.ListComponents:output_type -> agentcontainers.enforcer.v1.ListComponentsResponse
-	35, // 42: agentcontainers.enforcer.v1.Enforcer.ListTools:output_type -> agentcontainers.enforcer.v1.ListToolsResponse
-	37, // 43: agentcontainers.enforcer.v1.Enforcer.CallTool:output_type -> agentcontainers.enforcer.v1.CallToolResponse
-	27, // [27:44] is the sub-list for method output_type
-	10, // [10:27] is the sub-list for method input_type
-	10, // [10:10] is the sub-list for extension type_name
-	10, // [10:10] is the sub-list for extension extendee
-	0,  // [0:10] is the sub-list for field type_name
+	9,  // 0: agentcontainers.enforcer.v1.PrepareToolCallRequest.transient_egress:type_name -> agentcontainers.enforcer.v1.EgressRule
+	9,  // 1: agentcontainers.enforcer.v1.NetworkPolicyRequest.egress_rules:type_name -> agentcontainers.enforcer.v1.EgressRule
+	12, // 2: agentcontainers.enforcer.v1.InjectSecretsRequest.secrets:type_name -> agentcontainers.enforcer.v1.SecretEntry
+	16, // 3: agentcontainers.enforcer.v1.CredentialPolicyRequest.secret_acls:type_name -> agentcontainers.enforcer.v1.SecretAcl
+	38, // 4: agentcontainers.enforcer.v1.EnforcementEvent.details:type_name -> agentcontainers.enforcer.v1.EnforcementEvent.DetailsEntry
+	24, // 5: agentcontainers.enforcer.v1.LoadComponentRequest.policy:type_name -> agentcontainers.enforcer.v1.ComponentPolicy
+	25, // 6: agentcontainers.enforcer.v1.LoadComponentRequest.limits:type_name -> agentcontainers.enforcer.v1.ComponentLimits
+	26, // 7: agentcontainers.enforcer.v1.LoadComponentResponse.tools:type_name -> agentcontainers.enforcer.v1.ToolDefinition
+	26, // 8: agentcontainers.enforcer.v1.ComponentInfo.tools:type_name -> agentcontainers.enforcer.v1.ToolDefinition
+	32, // 9: agentcontainers.enforcer.v1.ListComponentsResponse.components:type_name -> agentcontainers.enforcer.v1.ComponentInfo
+	26, // 10: agentcontainers.enforcer.v1.ListToolsResponse.tools:type_name -> agentcontainers.enforcer.v1.ToolDefinition
+	0,  // 11: agentcontainers.enforcer.v1.Enforcer.RegisterContainer:input_type -> agentcontainers.enforcer.v1.RegisterContainerRequest
+	2,  // 12: agentcontainers.enforcer.v1.Enforcer.UnregisterContainer:input_type -> agentcontainers.enforcer.v1.UnregisterContainerRequest
+	4,  // 13: agentcontainers.enforcer.v1.Enforcer.PrepareToolCall:input_type -> agentcontainers.enforcer.v1.PrepareToolCallRequest
+	6,  // 14: agentcontainers.enforcer.v1.Enforcer.CompleteToolCall:input_type -> agentcontainers.enforcer.v1.CompleteToolCallRequest
+	8,  // 15: agentcontainers.enforcer.v1.Enforcer.ApplyNetworkPolicy:input_type -> agentcontainers.enforcer.v1.NetworkPolicyRequest
+	10, // 16: agentcontainers.enforcer.v1.Enforcer.ApplyFilesystemPolicy:input_type -> agentcontainers.enforcer.v1.FilesystemPolicyRequest
+	11, // 17: agentcontainers.enforcer.v1.Enforcer.ApplyProcessPolicy:input_type -> agentcontainers.enforcer.v1.ProcessPolicyRequest
+	15, // 18: agentcontainers.enforcer.v1.Enforcer.ApplyCredentialPolicy:input_type -> agentcontainers.enforcer.v1.CredentialPolicyRequest
+	13, // 19: agentcontainers.enforcer.v1.Enforcer.InjectSecrets:input_type -> agentcontainers.enforcer.v1.InjectSecretsRequest
+	17, // 20: agentcontainers.enforcer.v1.Enforcer.LoadPolicyBundle:input_type -> agentcontainers.enforcer.v1.LoadPolicyBundleRequest
+	20, // 21: agentcontainers.enforcer.v1.Enforcer.StreamEvents:input_type -> agentcontainers.enforcer.v1.StreamEventsRequest
+	22, // 22: agentcontainers.enforcer.v1.Enforcer.GetStats:input_type -> agentcontainers.enforcer.v1.GetStatsRequest
+	27, // 23: agentcontainers.enforcer.v1.Enforcer.LoadComponent:input_type -> agentcontainers.enforcer.v1.LoadComponentRequest
+	29, // 24: agentcontainers.enforcer.v1.Enforcer.UnloadComponent:input_type -> agentcontainers.enforcer.v1.UnloadComponentRequest
+	31, // 25: agentcontainers.enforcer.v1.Enforcer.ListComponents:input_type -> agentcontainers.enforcer.v1.ListComponentsRequest
+	34, // 26: agentcontainers.enforcer.v1.Enforcer.ListTools:input_type -> agentcontainers.enforcer.v1.ListToolsRequest
+	36, // 27: agentcontainers.enforcer.v1.Enforcer.CallTool:input_type -> agentcontainers.enforcer.v1.CallToolRequest
+	1,  // 28: agentcontainers.enforcer.v1.Enforcer.RegisterContainer:output_type -> agentcontainers.enforcer.v1.RegisterContainerResponse
+	3,  // 29: agentcontainers.enforcer.v1.Enforcer.UnregisterContainer:output_type -> agentcontainers.enforcer.v1.UnregisterContainerResponse
+	5,  // 30: agentcontainers.enforcer.v1.Enforcer.PrepareToolCall:output_type -> agentcontainers.enforcer.v1.PrepareToolCallResponse
+	7,  // 31: agentcontainers.enforcer.v1.Enforcer.CompleteToolCall:output_type -> agentcontainers.enforcer.v1.CompleteToolCallResponse
+	19, // 32: agentcontainers.enforcer.v1.Enforcer.ApplyNetworkPolicy:output_type -> agentcontainers.enforcer.v1.PolicyResponse
+	19, // 33: agentcontainers.enforcer.v1.Enforcer.ApplyFilesystemPolicy:output_type -> agentcontainers.enforcer.v1.PolicyResponse
+	19, // 34: agentcontainers.enforcer.v1.Enforcer.ApplyProcessPolicy:output_type -> agentcontainers.enforcer.v1.PolicyResponse
+	19, // 35: agentcontainers.enforcer.v1.Enforcer.ApplyCredentialPolicy:output_type -> agentcontainers.enforcer.v1.PolicyResponse
+	14, // 36: agentcontainers.enforcer.v1.Enforcer.InjectSecrets:output_type -> agentcontainers.enforcer.v1.InjectSecretsResponse
+	18, // 37: agentcontainers.enforcer.v1.Enforcer.LoadPolicyBundle:output_type -> agentcontainers.enforcer.v1.LoadPolicyBundleResponse
+	21, // 38: agentcontainers.enforcer.v1.Enforcer.StreamEvents:output_type -> agentcontainers.enforcer.v1.EnforcementEvent
+	23, // 39: agentcontainers.enforcer.v1.Enforcer.GetStats:output_type -> agentcontainers.enforcer.v1.StatsResponse
+	28, // 40: agentcontainers.enforcer.v1.Enforcer.LoadComponent:output_type -> agentcontainers.enforcer.v1.LoadComponentResponse
+	30, // 41: agentcontainers.enforcer.v1.Enforcer.UnloadComponent:output_type -> agentcontainers.enforcer.v1.UnloadComponentResponse
+	33, // 42: agentcontainers.enforcer.v1.Enforcer.ListComponents:output_type -> agentcontainers.enforcer.v1.ListComponentsResponse
+	35, // 43: agentcontainers.enforcer.v1.Enforcer.ListTools:output_type -> agentcontainers.enforcer.v1.ListToolsResponse
+	37, // 44: agentcontainers.enforcer.v1.Enforcer.CallTool:output_type -> agentcontainers.enforcer.v1.CallToolResponse
+	28, // [28:45] is the sub-list for method output_type
+	11, // [11:28] is the sub-list for method input_type
+	11, // [11:11] is the sub-list for extension type_name
+	11, // [11:11] is the sub-list for extension extendee
+	0,  // [0:11] is the sub-list for field type_name
 }
 
 func init() { file_enforcer_proto_init() }

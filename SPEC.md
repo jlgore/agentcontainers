@@ -158,6 +158,51 @@ in-process via `github.com/open-policy-agent/opa/v1/rego` — the OPA 1.0
 `/v1` path (Rego v1 syntax by default; the old un-versioned path is the
 deprecated v0-syntax shim).
 
+#### 3.2.1 Pluggable engine: Cedar (default) and OPA (legacy) (G5)
+
+**What:** A per-server `policy.engine` selector (`"cedar"` default | `"opa"`
+legacy) behind the engine-agnostic `PolicyEngine` seam in `policy.go`. Both
+engines consume the **same** `CompiledPolicy` (the YAML→data compilation and the
+Go-side structural decomposition are identical) and return the same `Decision`;
+only the allow/deny computation differs. Empty engine ⇒ Cedar. The two engines
+reach **byte-identical verdicts and reason strings** (the `TestCedarParity`
+suite asserts both over the canonical corpus), so the default flip is behaviour-
+preserving. Container and remote servers both support it; the agent-tool guard
+also runs on Cedar.
+
+**Where:** `internal/mcpproxy/policy.go` (`PolicyEngine`, the lifted
+`evaluateParsed`), `internal/mcpproxy/cedar.go` (`CedarEvaluator` +
+membership reason reconstruction), `internal/mcpproxy/{content,paths_eval,context_eval}.go`
+(native-Go category evaluators), `internal/mcpproxy/cedar_emit.go` +
+`templates/cedar/*` (emission).
+
+**Cedar backend (default):** the **embedded** cedar-go library (no subprocess,
+no external binary). The compiler bakes the **structured-membership** categories
+— `denied_binaries`, `dangerous_flags` (with per-tool exceptions),
+`tool_blocked_flags`, `capabilities` — into Cedar `forbid` policies under a
+baseline `permit` (Cedar is deny-by-default; the permit makes the default allow
+and the forbids carve out denials). One Command entity per call;
+`ac policy translate <securityYaml>` dumps the policies. Cedar owns the
+allow/deny verdict; the engine reconstructs OPA-identical per-atom reason strings
+for the determining category. Construction **fails closed** when the emitted
+policies do not parse.
+
+**Self-contained — no OPA on the default path.** The categories Cedar cannot
+express in policy language are decided by native-Go evaluators the Cedar engine
+owns, not by OPA: **content** (`shell_metacharacters` via `strings.Contains`;
+`awk_scanning` via an RE2 `regexp` — its `\s*` has no Cedar `like` equivalent),
+**path** (`path_policy`, `output_path_policy`, `rm_protection`, `filesystem` —
+`filesystem` keeps a `/`-bounded glob matcher because Cedar `like`'s `*` crosses
+`/` and would be *weaker*), and **context** (G4 `uri_egress` targets, G3
+`override` ceiling-waivers). Every category still appears in
+`policies_evaluated`, and the structural `parsed.Deny` short-circuit applies to
+both engines. `ac policy verify` parses the emitted policies in-process and runs
+a representative authorize (no external binary required).
+
+**OPA backend (`engine: opa`, legacy):** the original in-process Rego engine,
+retained unchanged as an opt-in and as the parity-suite reference
+implementation. It is constructed only when explicitly requested.
+
 ### 3.3 eBPF Enforcer Extensions
 
 **What:** Rekey existing global BPF maps to per-cgroup scope, and add

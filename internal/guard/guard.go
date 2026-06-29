@@ -63,7 +63,7 @@ type Verdict struct {
 // broker, and the audit logger. One Service serves many hook requests
 // concurrently; the evaluator and broker are safe for concurrent use.
 type Service struct {
-	eval        *mcpproxy.Evaluator
+	eval        mcpproxy.PolicyEngine
 	outputFlags []string
 	broker      *approval.ToolCallBroker // nil → policy-only (no HITL escalation)
 	audit       *audit.Logger            // nil → no audit
@@ -75,7 +75,7 @@ type Service struct {
 
 // Options configure a Service.
 type Options struct {
-	Evaluator   *mcpproxy.Evaluator
+	Evaluator   mcpproxy.PolicyEngine
 	OutputFlags []string
 	Broker      *approval.ToolCallBroker
 	Audit       *audit.Logger

@@ -132,6 +132,20 @@ type FilesystemCaps struct {
 type NetworkCaps struct {
 	Egress []EgressRule `json:"egress,omitempty"`
 	Deny   []string     `json:"deny,omitempty"`
+
+	// URIEgress opts the server into URI-scoped transient egress (G4): when
+	// true, the proxy extracts user-supplied https URLs from a tool call's
+	// arguments and asks the enforcer to open kernel egress to exactly those
+	// host:port targets for the duration of that one tool-call window. Off
+	// by default — static egress policy is unchanged unless enabled.
+	URIEgress bool `json:"uriEgress,omitempty"`
+
+	// URIEgressDeny lists hosts that are never eligible for URI-scoped
+	// transient egress, regardless of who requests them (G4). It is a hard
+	// ceiling on URIEgress: a denied host is rejected even when the user
+	// attests it. Distinct from Deny (static CIDR egress blocking) — this is
+	// hostname-scoped and only governs the transient URI path.
+	URIEgressDeny []string `json:"uriEgressDeny,omitempty"`
 }
 
 // EgressRule defines an allowed outbound connection.
@@ -353,13 +367,43 @@ type MCPServerPolicy struct {
 	// to the config file directory. Container type only.
 	SecurityYAML string `json:"securityYaml,omitempty"`
 
+	// OverrideCeiling lists the policy categories (Rego package names, e.g.
+	// "network", "dangerous_flags") that a per-invocation operator override
+	// VC (G3) is permitted to waive for a single tool call. Empty (the
+	// default) means no override can widen anything — fail closed. Structural
+	// decomposition denials are never waivable regardless of this list.
+	OverrideCeiling []string `json:"overrideCeiling,omitempty"`
+
+	// OperatorDIDs lists the did:key identities whose override VCs (G3) this
+	// server honors. An override signed by a DID outside this list is refused
+	// even if its signature is valid. Empty (the default) means overrides are
+	// off for this server — fail closed — regardless of OverrideCeiling.
+	OperatorDIDs []string `json:"operatorDids,omitempty"`
+
 	// ShellTools declares which of the server's MCP tools take shell
 	// commands as arguments, and how to map the arguments for policy
 	// decomposition. Tools not declared here fall back to a heuristic: an
 	// argument object with a string "binary" field (plus optional
 	// "extra_args" array) is treated as a shell command.
 	ShellTools map[string]ShellToolSpec `json:"shellTools,omitempty"`
+
+	// Engine selects the authorization backend that evaluates this server's
+	// compiled policy: "cedar" (the default — the embedded in-process cedar-go
+	// engine, no external binary) or "opa" (the legacy in-process Rego engine,
+	// consuming the same compiled data). Empty is treated as "cedar". Both
+	// container and remote servers may set it. The choice only swaps the
+	// decision engine; the YAML→data compilation and the structural
+	// decomposition layer are identical for both, and the two engines reach
+	// byte-identical verdicts and reasons (the policy parity suite).
+	Engine string `json:"engine,omitempty"`
 }
+
+// PolicyEngineOPA and PolicyEngineCedar are the recognized policy.engine
+// values. An empty engine defaults to Cedar.
+const (
+	PolicyEngineOPA   = "opa"
+	PolicyEngineCedar = "cedar"
+)
 
 // ShellToolSpec maps an MCP tool's arguments onto a shell command for
 // policy decomposition. Either CommandArg (a single free-form command
@@ -1082,6 +1126,12 @@ func validateSharedPolicy(p *MCPServerPolicy, field func(string) string) []error
 				errs = append(errs, fmt.Errorf("%s: host must not be empty", field(fmt.Sprintf("policy.network.egress[%d]", i))))
 			}
 		}
+	}
+	switch p.Engine {
+	case "", PolicyEngineOPA, PolicyEngineCedar:
+		// ok — empty defaults to Cedar.
+	default:
+		errs = append(errs, fmt.Errorf("%s: unknown policy engine %q (expected %q or %q)", field("policy.engine"), p.Engine, PolicyEngineOPA, PolicyEngineCedar))
 	}
 	return errs
 }

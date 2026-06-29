@@ -1,0 +1,26 @@
+{{.Header}}
+package sift.override
+
+import rego.v1
+
+# Per-invocation operator overrides (G3). An override is a verifiable
+# credential the operator signs; the proxy verifies it cryptographically and
+# injects the verified claims as input.context.operator_override before
+# evaluation. This package applies the OPERATOR CEILING: the hard bound on what
+# any override is allowed to widen. Crypto lives in Go; only the ceiling logic
+# lives here.
+#
+# operator_override.capabilities names the policy categories the override asks
+# to waive. cleared_packages is the intersection of that request with the
+# operator-configured ceiling (data.override_ceiling). A category outside the
+# ceiling can NEVER be waived, no matter what a (validly signed) override asks
+# for — so an over-broad or stolen override cannot widen past the operator's
+# static intent. With the default empty ceiling, nothing is waivable.
+cleared_packages contains pkg if {
+	some pkg in input.context.operator_override.capabilities
+	pkg in data.override_ceiling
+}
+
+# active reports that a verified override accompanied this call (it carries an
+# issuer). Drives audit provenance; not part of the allow decision itself.
+active if input.context.operator_override.iss

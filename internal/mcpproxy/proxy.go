@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +21,7 @@ import (
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/audit"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/config"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/enforcerapi"
+	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/identity"
 )
 
 // proxyImpl identifies the proxy in MCP initialize handshakes.
@@ -42,6 +45,25 @@ type Options struct {
 	// is structural, so a missing broker is a startup error, not a
 	// silent passthrough.
 	Approval *approval.ToolCallBroker
+
+	// PublisherName labels this deployment in the ARD catalog
+	// (/.well-known/ai-catalog.json). Defaults to "agentcontainers" when
+	// empty.
+	PublisherName string
+
+	// PublicEndpoint is the externally reachable MCP endpoint advertised in
+	// the ARD catalog (e.g. "https://forensic-e2e.example.com/mcp"). When
+	// empty the catalog omits per-capability endpoints; operators behind a
+	// proxy should set their public URL.
+	PublicEndpoint string
+
+	// Identity is the instance's signing identity (G1). When set, every audit
+	// entry across all three chains is signed with its did:key, the ARD
+	// catalog publishes the issuer DID + an enforcement credential, and
+	// operator-override VCs (G3) are verified against its resolver. Nil leaves
+	// audit entries unsigned (back-compat) and the catalog's trust fields
+	// empty.
+	Identity identity.KeyStore
 }
 
 // serverPolicy is the per-server policy machinery compiled at startup:
@@ -49,9 +71,21 @@ type Options struct {
 // Servers that declare nothing the engine evaluates have no entry and
 // skip Rego entirely (the Go-side allowedTools gate still applies).
 type serverPolicy struct {
-	eval        *Evaluator
+	eval        PolicyEngine
 	outputFlags []string
 	shellTools  map[string]config.ShellToolSpec
+	// policyHash is sha256 of the compiled policy bundle (modules + data),
+	// surfaced in the ARD catalog so external consumers can verify which
+	// policy governs a capability.
+	policyHash string
+	// uriEgress enables URI-scoped transient egress (G4) for this server:
+	// the proxy extracts user-supplied https URLs from tool arguments and
+	// asks the policy to approve transient egress to their hosts.
+	uriEgress bool
+	// operatorDIDs are the did:key identities whose per-invocation override
+	// VCs (G3) this server honors. Empty disables overrides (fail closed).
+	// The override ceiling itself lives in the compiled policy data.
+	operatorDIDs []string
 }
 
 // Proxy is an MCP reverse proxy: one client-facing mcp.Server aggregating
@@ -92,10 +126,26 @@ type Proxy struct {
 	backendResources map[string][]string
 	backendTemplates map[string][]string
 	backendPrompts   map[string][]string
+	// catalogTools holds the full tool descriptor for each aggregated
+	// (allowed) tool name, so the ARD catalog can publish descriptions and
+	// input schemas without re-listing backends on every request.
+	catalogTools map[string]*mcp.Tool
 
 	// refreshCancel stops the periodic network-policy hostname
 	// re-resolution goroutine (nil when no enforcer is connected).
 	refreshCancel context.CancelFunc
+
+	// publisherName and publicEndpoint feed the ARD catalog
+	// (/.well-known/ai-catalog.json); both come from Options.
+	publisherName  string
+	publicEndpoint string
+
+	// identity signs the audit chains and issues the catalog publisher
+	// credential (G1); nil when no identity is configured. publisherVC is the
+	// pre-issued enforcement credential the catalog serves (empty when
+	// identity is nil).
+	identity    identity.KeyStore
+	publisherVC string
 }
 
 // New connects all configured MCP backends, aggregates their tools,
@@ -124,14 +174,20 @@ func New(ctx context.Context, deps Deps, cfg *config.AgentContainer, sessionID s
 		return nil, fmt.Errorf("mcpproxy: policy.requireApproval is configured but no approval broker is available")
 	}
 
-	sink, err := NewAuditSink(sessionID, opts.AuditDir)
+	// A nil identity satisfies audit.Signer's nil contract (unsigned entries).
+	var signer audit.Signer
+	if opts.Identity != nil {
+		signer = opts.Identity
+	}
+
+	sink, err := NewAuditSink(sessionID, opts.AuditDir, signer)
 	if err != nil {
 		return nil, err
 	}
 
 	var approvalSink *ApprovalAuditSink
 	if needsApproval {
-		approvalSink, err = NewApprovalAuditSink(sessionID, opts.AuditDir)
+		approvalSink, err = NewApprovalAuditSink(sessionID, opts.AuditDir, signer)
 		if err != nil {
 			_ = sink.Close()
 			return nil, err
@@ -153,6 +209,10 @@ func New(ctx context.Context, deps Deps, cfg *config.AgentContainer, sessionID s
 		backendResources: make(map[string][]string),
 		backendTemplates: make(map[string][]string),
 		backendPrompts:   make(map[string][]string),
+		catalogTools:     make(map[string]*mcp.Tool),
+		publisherName:    opts.PublisherName,
+		publicEndpoint:   opts.PublicEndpoint,
+		identity:         opts.Identity,
 	}
 
 	p.server = mcp.NewServer(proxyImpl, &mcp.ServerOptions{
@@ -179,6 +239,30 @@ func New(ctx context.Context, deps Deps, cfg *config.AgentContainer, sessionID s
 			_ = approvalSink.Close()
 		}
 	}
+
+	// Issue the deployment's enforcement credential (G1): a VC the ARD catalog
+	// publishes so an external consumer can verify the enforcement posture
+	// without trusting the agent. Re-issued each start (no expiry); the DID is
+	// stable across restarts because the key is persisted. Enforcement layers
+	// are known here (proxy is always active; kernel when an enforcer is wired).
+	if p.identity != nil {
+		enforcement := []string{"opa_proxy"}
+		if p.deps.Enforcer != nil {
+			enforcement = append(enforcement, "ebpf_kernel")
+		}
+		vc, err := identity.IssueVC(p.identity, identity.VCClaims{
+			Sub:                  p.identity.DID(),
+			EnforcementModel:     enforcement,
+			EvidenceImmutability: "append_only_hash_chain",
+			AuditChainType:       "independent_sha256_hash_chains",
+		}, 0)
+		if err != nil {
+			closeSinks()
+			return nil, fmt.Errorf("mcpproxy: issuing publisher credential: %w", err)
+		}
+		p.publisherVC = vc
+	}
+
 	for _, name := range names {
 		tool := cfg.Agent.Tools.MCP[name]
 		cp, err := CompileServerPolicy(tool, opts.ConfigDir)
@@ -189,14 +273,28 @@ func New(ctx context.Context, deps Deps, cfg *config.AgentContainer, sessionID s
 		if cp == nil {
 			continue
 		}
-		ev, err := NewEvaluator(ctx, name, cp)
+		// Select the authorization backend (policy.engine). The embedded Cedar
+		// engine is the default; OPA (policy.engine: opa) is the legacy opt-in.
+		// OPA is constructed ONLY when explicitly requested, so a default
+		// deployment never depends on it. A bad compiled policy fails closed
+		// here at startup rather than silently degrading.
+		var engine PolicyEngine
+		if tool.Policy != nil && tool.Policy.Engine == config.PolicyEngineOPA {
+			engine, err = NewEvaluator(ctx, name, cp)
+		} else {
+			engine, err = NewCedarEvaluator(ctx, name, cp)
+		}
 		if err != nil {
 			closeSinks()
 			return nil, err
 		}
-		sp := &serverPolicy{eval: ev, outputFlags: cp.OutputFlags}
+		sp := &serverPolicy{eval: engine, outputFlags: cp.OutputFlags, policyHash: cp.Hash()}
 		if tool.Policy != nil {
 			sp.shellTools = tool.Policy.ShellTools
+			sp.operatorDIDs = tool.Policy.OperatorDIDs
+			if tool.Policy.Network != nil {
+				sp.uriEgress = tool.Policy.Network.URIEgress
+			}
 		}
 		p.policies[name] = sp
 	}
@@ -395,6 +493,7 @@ func (p *Proxy) aggregateBackend(ctx context.Context, b *Backend, strict bool) e
 		p.server.RemoveTools(old...)
 		for _, t := range old {
 			delete(p.toolRoutes, t)
+			delete(p.catalogTools, t)
 		}
 	}
 	if old := p.backendResources[b.Name]; len(old) > 0 {
@@ -432,6 +531,7 @@ func (p *Proxy) aggregateBackend(ctx context.Context, b *Backend, strict bool) e
 		}
 		p.server.AddTool(tool, p.handleToolCall(b, tool.Name))
 		p.toolRoutes[tool.Name] = b
+		p.catalogTools[tool.Name] = tool
 		p.backendTools[b.Name] = append(p.backendTools[b.Name], tool.Name)
 	}
 
@@ -483,7 +583,7 @@ func (p *Proxy) handleToolCall(b *Backend, toolName string) mcp.ToolHandler {
 		start := time.Now()
 
 		sp := p.policies[b.Name]
-		decision, parsedList := p.evaluatePolicy(ctx, sp, b.Name, toolName, corrID, args)
+		decision, parsedList := p.evaluatePolicy(ctx, sp, b.Name, toolName, corrID, args, req.Params.Meta)
 		summary := commandSummary(parsedList, args)
 
 		rec := ToolCallRecord{
@@ -495,6 +595,10 @@ func (p *Proxy) handleToolCall(b *Backend, toolName string) mcp.ToolHandler {
 			ArgsSummary:       summary,
 			Reasons:           decision.Reasons,
 			PoliciesEvaluated: decision.PoliciesEvaluated,
+			OverrideApplied:   decision.OverrideActive,
+			OverrideIssuer:    decision.OverrideIssuer,
+			WaivedReasons:     decision.WaivedReasons,
+			OverrideRejected:  decision.OverrideRejected,
 		}
 
 		if !decision.Allowed {
@@ -538,7 +642,7 @@ func (p *Proxy) handleToolCall(b *Backend, toolName string) mcp.ToolHandler {
 		}
 		defer b.releaseToolSlot()
 
-		if err := p.prepareToolCall(ctx, b, corrID); err != nil {
+		if err := p.prepareToolCall(ctx, b, corrID, decision.EgressTargets); err != nil {
 			return nil, err
 		}
 		if shouldCorrelate(b) {
@@ -654,7 +758,7 @@ func shouldCorrelate(b *Backend) bool {
 	return b != nil && b.ContainerID != ""
 }
 
-func (p *Proxy) prepareToolCall(ctx context.Context, b *Backend, corrID string) error {
+func (p *Proxy) prepareToolCall(ctx context.Context, b *Backend, corrID string, egress []EgressTarget) error {
 	if !shouldCorrelate(b) || p.deps.Enforcer == nil {
 		return nil
 	}
@@ -662,12 +766,23 @@ func (p *Proxy) prepareToolCall(ctx context.Context, b *Backend, corrID string) 
 	// (the tools.MCP entry name, b.Name), which is what policy resolution puts
 	// in a secret's allowedTools. Sending the individual method name here would
 	// never match the resolved ACL, so restricted secrets would be unreadable.
-	_, err := p.deps.Enforcer.PrepareToolCall(ctx, &enforcerapi.PrepareToolCallRequest{
+	req := &enforcerapi.PrepareToolCallRequest{
 		CorrelationId: corrID,
 		ContainerId:   b.ContainerID,
 		ToolName:      b.Name,
-	})
-	if err != nil {
+	}
+	// G4: attach URI-scoped transient egress targets. The enforcer opens
+	// kernel egress to exactly these host:port pairs for this tool-call
+	// window and closes them on CompleteToolCall (or at the timeout). Empty
+	// leaves static egress policy unchanged.
+	for _, t := range egress {
+		req.TransientEgress = append(req.TransientEgress, &enforcerapi.EgressRule{
+			Host:     t.Host,
+			Port:     uint32(t.Port),
+			Protocol: t.Protocol,
+		})
+	}
+	if _, err := p.deps.Enforcer.PrepareToolCall(ctx, req); err != nil {
 		return fmt.Errorf("mcpproxy: preparing tool-call correlation for %s: %w", b.Name, err)
 	}
 	return nil
@@ -720,7 +835,7 @@ func (p *Proxy) logToolCall(rec ToolCallRecord) {
 // evaluator allow by construction (nothing declared to evaluate). The
 // overall decision denies if any sub-command denies; reasons are the
 // deduplicated union. An evaluation error fails closed.
-func (p *Proxy) evaluatePolicy(ctx context.Context, sp *serverPolicy, server, toolName, corrID string, args json.RawMessage) (Decision, []Parsed) {
+func (p *Proxy) evaluatePolicy(ctx context.Context, sp *serverPolicy, server, toolName, corrID string, args json.RawMessage, meta map[string]any) (Decision, []Parsed) {
 	if sp == nil {
 		return Decision{Allowed: true}, nil
 	}
@@ -735,11 +850,40 @@ func (p *Proxy) evaluatePolicy(ctx context.Context, sp *serverPolicy, server, to
 
 	pctx := policyContext(corrID)
 	argsVal := rawArgsValue(args)
+	// G4: when the server opts into URI-scoped egress, surface user-supplied
+	// https URLs to the policy as input.context.requested_uris. Two sources,
+	// both tagged with provenance: Phase A from the tool's own arguments
+	// (source "tool_args") and Phase B from the harness-attested _meta
+	// (source "user_message"). The Rego rule prefers user_message when present;
+	// the proxy only acts on the resulting egress_targets for an allowed call.
+	if sp.uriEgress {
+		uris := extractRequestedURIs(parsedList, argsVal)
+		uris = append(uris, extractMetaURIs(meta)...)
+		if len(uris) > 0 {
+			pctx["requested_uris"] = uris
+		}
+	}
+
+	// G3: a per-invocation operator override arrives as a signed VC in _meta.
+	// Verify it here (crypto stays Go-side); on success inject the claims as
+	// input.context.operator_override so the Rego ceiling can waive denies
+	// within the operator's allowlist. A present-but-rejected override (bad
+	// signature, expired, untrusted issuer) is dropped — the call proceeds
+	// under static policy — and the reason is carried out for the audit trail.
+	overrideClaims, overrideRejected := verifyOverride(meta, sp.operatorDIDs)
+	if overrideClaims != nil {
+		pctx["operator_override"] = map[string]any{
+			"iss":          overrideClaims.Iss,
+			"capabilities": stringsToAny(overrideClaims.Capabilities),
+		}
+	}
+
 	agg := Decision{Allowed: true, PoliciesEvaluated: sp.eval.PoliciesEvaluated()}
 	seen := make(map[string]bool)
+	egressSeen := make(map[string]bool)
 
 	for _, parsed := range parsedList {
-		d, err := sp.eval.EvaluateParsed(ctx, server, toolName, argsVal, parsed, pctx)
+		d, err := evaluateParsed(ctx, sp.eval, server, toolName, argsVal, parsed, pctx)
 		if err != nil {
 			// Fail CLOSED: a broken policy engine never falls open.
 			p.deps.Logger.Error("policy evaluation failed",
@@ -762,8 +906,200 @@ func (p *Proxy) evaluatePolicy(ctx context.Context, sp *serverPolicy, server, to
 				agg.Reasons = append(agg.Reasons, r)
 			}
 		}
+		for _, t := range d.EgressTargets {
+			key := t.Host + ":" + strconv.Itoa(t.Port)
+			if !egressSeen[key] {
+				egressSeen[key] = true
+				agg.EgressTargets = append(agg.EgressTargets, t)
+			}
+		}
+		// Override provenance is the same across sub-commands (one pctx); OR
+		// the active flag and union the waived reasons for the audit record.
+		if d.OverrideActive {
+			agg.OverrideActive = true
+		}
+		for _, r := range d.WaivedReasons {
+			if !seen["waived:"+r] {
+				seen["waived:"+r] = true
+				agg.WaivedReasons = append(agg.WaivedReasons, r)
+			}
+		}
 	}
+	if overrideClaims != nil {
+		agg.OverrideIssuer = overrideClaims.Iss
+	}
+	agg.OverrideRejected = overrideRejected
 	return agg, parsedList
+}
+
+// extractRequestedURIs scans a tool call's decomposed arguments for https
+// URLs and returns them as policy input objects {uri, scheme, host, port,
+// source}. This is Phase A provenance: the URL is taken from the tool's own
+// arguments (the link the agent is about to fetch), tagged source
+// "tool_args". URL parsing is done here (Go net/url), not in Rego, so the
+// policy only applies allow-logic over already-parsed fields. Phase B
+// (harness-attested source "user_message" via request _meta) layers on top.
+func extractRequestedURIs(parsedList []Parsed, args any) []map[string]any {
+	seen := make(map[string]bool)
+	var out []map[string]any
+	consider := func(tok string) {
+		if seen[tok] {
+			return
+		}
+		u, ok := parseHTTPSURI(tok)
+		if !ok {
+			return
+		}
+		seen[tok] = true
+		u["source"] = "tool_args"
+		out = append(out, u)
+	}
+	for _, p := range parsedList {
+		for _, a := range p.Args {
+			consider(a)
+		}
+		for _, pth := range p.Paths {
+			consider(pth)
+		}
+	}
+	// Also scan raw string argument values (non-shell tools whose args carry
+	// a URL directly, e.g. {"url": "https://..."}).
+	scanArgStrings(args, consider)
+	return out
+}
+
+// parseHTTPSURI parses an https URL into the policy-input fields
+// {uri, scheme, host, port}, or reports false for anything that is not a
+// well-formed https URL. The caller adds the "source" provenance tag. https
+// only: http/file/ftp never qualify for transient egress.
+func parseHTTPSURI(tok string) (map[string]any, bool) {
+	if !strings.HasPrefix(tok, "https://") {
+		return nil, false
+	}
+	u, err := url.Parse(tok)
+	if err != nil || u.Host == "" {
+		return nil, false
+	}
+	portNum := 443
+	if p := u.Port(); p != "" {
+		if n, err := strconv.Atoi(p); err == nil {
+			portNum = n
+		}
+	}
+	return map[string]any{
+		"uri":    tok,
+		"scheme": u.Scheme,
+		"host":   u.Hostname(),
+		"port":   portNum,
+	}, true
+}
+
+// extractMetaURIs reads harness-attested URIs from a tool call's _meta field
+// (Phase B provenance, G4). The harness — the Claude Code PreToolUse guard or
+// the MCP client — attaches the URLs the *user* actually supplied under
+// _meta.requested_uris, so the policy can grant egress to a user-named host
+// without inferring intent from the tool's own arguments. Each entry may be a
+// bare string ("https://x") or an object carrying a "uri" field; both are
+// normalized and tagged source "user_message". This is the channel that
+// delivers the PRD's "no implicit grants from tool output" guarantee: a URL
+// the model merely echoed from prior output never arrives here.
+func extractMetaURIs(meta map[string]any) []map[string]any {
+	raw, ok := meta["requested_uris"]
+	if !ok {
+		return nil
+	}
+	list, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var out []map[string]any
+	for _, item := range list {
+		var tok string
+		switch v := item.(type) {
+		case string:
+			tok = v
+		case map[string]any:
+			tok, _ = v["uri"].(string)
+		}
+		if seen[tok] {
+			continue
+		}
+		if u, ok := parseHTTPSURI(tok); ok {
+			seen[tok] = true
+			u["source"] = "user_message"
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+// verifyOverride validates an operator-override VC carried in a tool call's
+// _meta (G3). It returns the verified claims to inject, or a non-empty
+// rejection reason when an override was present but refused — the call then
+// proceeds under static policy and the reason is audited. When no override is
+// present it returns (nil, ""). Verification is layered and fails closed:
+//
+//  1. the override must be a string JWT,
+//  2. its EdDSA signature and (if set) expiry must check out (VerifyVC),
+//  3. its issuer DID must be in this server's trusted operator set.
+//
+// did:key verification is self-certifying, so step 2 only proves the token is
+// internally consistent; step 3 is the actual authorization gate. With an
+// empty trusted set, every override is rejected.
+func verifyOverride(meta map[string]any, trusted []string) (*identity.VCClaims, string) {
+	raw, ok := meta["operator_override"]
+	if !ok {
+		return nil, ""
+	}
+	token, ok := raw.(string)
+	if !ok || token == "" {
+		return nil, "operator override present but not a string token"
+	}
+	claims, err := identity.VerifyVC(token, identity.DIDKeyResolver{})
+	if err != nil {
+		return nil, "operator override rejected: " + err.Error()
+	}
+	if !containsString(trusted, claims.Iss) {
+		return nil, "operator override issuer not trusted: " + claims.Iss
+	}
+	return claims, ""
+}
+
+// containsString reports whether s contains v.
+func containsString(s []string, v string) bool {
+	for _, e := range s {
+		if e == v {
+			return true
+		}
+	}
+	return false
+}
+
+// stringsToAny widens a []string to []any for Rego input documents.
+func stringsToAny(s []string) []any {
+	out := make([]any, len(s))
+	for i, v := range s {
+		out[i] = v
+	}
+	return out
+}
+
+// scanArgStrings walks a decoded JSON argument value, invoking fn on every
+// string it finds (recursing through objects and arrays).
+func scanArgStrings(v any, fn func(string)) {
+	switch t := v.(type) {
+	case string:
+		fn(t)
+	case []any:
+		for _, e := range t {
+			scanArgStrings(e, fn)
+		}
+	case map[string]any:
+		for _, e := range t {
+			scanArgStrings(e, fn)
+		}
+	}
 }
 
 // decomposeToolArgs maps an MCP tool's arguments onto shell commands for

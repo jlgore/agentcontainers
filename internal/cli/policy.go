@@ -8,9 +8,11 @@ import (
 	"encoding/pem"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 
+	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/mcpproxy"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/oci"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/orgpolicy"
 )
@@ -30,8 +32,133 @@ time via 'ac build --policy'.`,
 		newPolicyValidateCmd(),
 		newPolicyDiffCmd(),
 		newPolicyTrustCmd(),
+		newPolicyTranslateCmd(),
+		newPolicyVerifyCmd(),
 	)
 	return cmd
+}
+
+// newPolicyTranslateCmd returns "ac policy translate <securityYaml>", which
+// compiles a security.yaml and dumps the Cedar policies + schema the Cedar
+// backend (policy.engine: cedar) would evaluate. Pure emission — it does not
+// need the cedar binary.
+func newPolicyTranslateCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "translate <securityYaml>",
+		Short: "Compile a security.yaml and emit the equivalent Cedar policies + schema",
+		Long: `Compile a security.yaml policy and print the Cedar policies and schema
+that the Cedar authorization backend (policy.engine: cedar) would evaluate.
+
+Only the structured-membership categories (denied_binaries, dangerous_flags,
+tool_blocked_flags, capabilities) are translated to Cedar; path and content
+(regex/substring) categories are evaluated by the in-process OPA engine even
+under the Cedar backend and so are not emitted here.
+
+This is pure emission and does not require the Cedar CLI to be installed.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runPolicyTranslate(cmd, args[0])
+		},
+	}
+}
+
+func runPolicyTranslate(cmd *cobra.Command, securityYAML string) error {
+	sec, err := mcpproxy.LoadSecurityYAML(securityYAML)
+	if err != nil {
+		return fmt.Errorf("policy translate: %w", err)
+	}
+	cp, err := mcpproxy.Compile(sec, nil)
+	if err != nil {
+		return fmt.Errorf("policy translate: %w", err)
+	}
+	out := cmd.OutOrStdout()
+	_, _ = fmt.Fprintln(out, "// ===== Cedar policies =====")
+	_, _ = fmt.Fprintln(out, cp.CedarPolicies)
+	_, _ = fmt.Fprintln(out, "// ===== Cedar schema =====")
+	_, _ = fmt.Fprintln(out, cp.CedarSchema)
+	return nil
+}
+
+// newPolicyVerifyCmd returns "ac policy verify <securityYaml>", which parses the
+// emitted Cedar policies in-process (embedded cedar-go) and runs a
+// representative authorize to confirm the membership policies enforce. No
+// external binary is required, so it always runs.
+func newPolicyVerifyCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "verify <securityYaml>",
+		Short: "Validate the emitted Cedar policies and check a representative invariant",
+		Long: `Compile a security.yaml to Cedar, parse the emitted policies with the
+embedded Cedar engine, then exercise a representative authorize to confirm the
+membership policies actually enforce (e.g. a denied binary is denied).
+
+Runs entirely in-process via embedded cedar-go — no external Cedar CLI is
+required.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runPolicyVerify(cmd, args[0])
+		},
+	}
+}
+
+func runPolicyVerify(cmd *cobra.Command, securityYAML string) error {
+	sec, err := mcpproxy.LoadSecurityYAML(securityYAML)
+	if err != nil {
+		return fmt.Errorf("policy verify: %w", err)
+	}
+	cp, err := mcpproxy.Compile(sec, nil)
+	if err != nil {
+		return fmt.Errorf("policy verify: %w", err)
+	}
+	out := cmd.OutOrStdout()
+
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// Representative invariant: a denied binary must be denied. Falls back to
+	// confirming an innocuous binary is allowed when no denylist is declared.
+	// Building the engine (inside CedarCheck) parses the emitted policies, so a
+	// malformed emission fails here.
+	if binary := firstDeniedBinary(cp); binary != "" {
+		allowed, reasons, err := mcpproxy.CedarCheck(ctx, cp, binary, nil)
+		if err != nil {
+			return fmt.Errorf("policy verify: representative authorize: %w", err)
+		}
+		if allowed {
+			return fmt.Errorf("policy verify: invariant FAILED: denied binary %q was allowed", binary)
+		}
+		_, _ = fmt.Fprintf(out, "invariant OK: denied binary %q is denied (%s)\n", binary, strings.Join(reasons, "; "))
+		return nil
+	}
+
+	allowed, _, err := mcpproxy.CedarCheck(ctx, cp, "echo", nil)
+	if err != nil {
+		return fmt.Errorf("policy verify: representative authorize: %w", err)
+	}
+	if !allowed {
+		return fmt.Errorf("policy verify: invariant FAILED: innocuous binary \"echo\" was denied")
+	}
+	_, _ = fmt.Fprintln(out, "invariant OK: innocuous binary \"echo\" is allowed (no denylist declared)")
+	return nil
+}
+
+// firstDeniedBinary returns a denied binary from the compiled data, or "" if
+// none is declared. denied_binaries is the lowercased, sorted denylist.
+func firstDeniedBinary(cp *mcpproxy.CompiledPolicy) string {
+	switch xs := cp.Data["denied_binaries"].(type) {
+	case []string:
+		if len(xs) > 0 {
+			return xs[0]
+		}
+	case []any:
+		if len(xs) > 0 {
+			if s, ok := xs[0].(string); ok {
+				return s
+			}
+		}
+	}
+	return ""
 }
 
 // newPolicyValidateCmd returns the "agentcontainer policy validate <file>" command which

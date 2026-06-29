@@ -3,6 +3,7 @@ package audit
 import (
 	"bufio"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,6 +37,16 @@ func DefaultDir() (string, error) {
 	return filepath.Join(home, ".ac", "audit"), nil
 }
 
+// Signer signs audit entries with a stable cryptographic identity (G1).
+// internal/identity.FileKeyStore satisfies it. A nil signer leaves entries
+// unsigned (DID/Signature empty), which still hash-chain and verify.
+type Signer interface {
+	// DID returns the signer's did:key.
+	DID() string
+	// Sign returns a raw signature over message.
+	Sign(message []byte) ([]byte, error)
+}
+
 // Logger provides append-only audit logging with hash chain integrity.
 type Logger struct {
 	mu        sync.Mutex
@@ -45,6 +56,7 @@ type Logger struct {
 	sequence  uint64
 	prevHash  string
 	closed    bool
+	signer    Signer
 }
 
 // LoggerOption configures a Logger.
@@ -54,6 +66,15 @@ type LoggerOption func(*Logger)
 func WithDir(dir string) LoggerOption {
 	return func(l *Logger) {
 		l.dir = dir
+	}
+}
+
+// WithSigner attaches a signing identity. Every appended entry is then stamped
+// with the signer's DID and an Ed25519 signature over its EntryHash. A nil
+// signer is a no-op (entries stay unsigned).
+func WithSigner(s Signer) LoggerOption {
+	return func(l *Logger) {
+		l.signer = s
 	}
 }
 
@@ -171,11 +192,26 @@ func (l *Logger) Log(eventType EventType, actor Actor, opts ...LogEntryOption) e
 		opt(&entry)
 	}
 
+	// Set DID before hashing (it is attested content covered by the hash),
+	// then sign over the computed hash. Signature is excluded from the hash
+	// (computeHashCanonical zeroes it), so this ordering is consistent.
+	if l.signer != nil {
+		entry.DID = l.signer.DID()
+	}
+
 	hash, err := computeHash(entry)
 	if err != nil {
 		return err
 	}
 	entry.EntryHash = hash
+
+	if l.signer != nil {
+		sig, err := l.signer.Sign([]byte(entry.EntryHash))
+		if err != nil {
+			return fmt.Errorf("audit: signing entry: %w", err)
+		}
+		entry.Signature = base64.StdEncoding.EncodeToString(sig)
+	}
 
 	data, err := json.Marshal(entry)
 	if err != nil {
@@ -227,6 +263,10 @@ func computeHash(e Entry) (string, error) {
 // is zeroed first, since it is the output of this function.
 func computeHashCanonical(e Entry) (string, error) {
 	e.EntryHash = ""
+	// Signature is excluded from the hash for the same reason as EntryHash:
+	// it is computed *over* the hash, so it cannot also be an input to it.
+	// DID is intentionally NOT excluded — it is attested content.
+	e.Signature = ""
 	raw, err := json.Marshal(e)
 	if err != nil {
 		return "", fmt.Errorf("audit: canonicalizing entry: %w", err)
@@ -324,6 +364,50 @@ func ValidateChain(entries []Entry) error {
 	}
 
 	return nil
+}
+
+// SignatureVerifier verifies a raw signature by a DID over a message.
+// internal/identity.DIDKeyResolver satisfies it.
+type SignatureVerifier interface {
+	Verify(did string, message, sig []byte) error
+}
+
+// VerifySignatures checks the cryptographic signature on every signed entry
+// (G1). It is independent of, and complementary to, ValidateChain: the chain
+// proves the entries are intact and ordered; the signatures prove who wrote
+// them. An entry with neither DID nor Signature is treated as legacy/unsigned
+// and skipped. An entry carrying only one of the two is malformed and fails.
+// Verification fails closed on any decode error, hash mismatch, or bad
+// signature. Returns the count of entries whose signatures were verified.
+func VerifySignatures(entries []Entry, v SignatureVerifier) (int, error) {
+	verified := 0
+	for i, e := range entries {
+		if e.DID == "" && e.Signature == "" {
+			continue
+		}
+		if e.DID == "" || e.Signature == "" {
+			return verified, fmt.Errorf("audit: entry %d: incomplete signature (did=%q, sig set=%v)", i, e.DID, e.Signature != "")
+		}
+		sig, err := base64.StdEncoding.DecodeString(e.Signature)
+		if err != nil {
+			return verified, fmt.Errorf("audit: entry %d: malformed signature: %w", i, err)
+		}
+		// Recompute the hash and confirm it matches the stored EntryHash, so
+		// the signature is bound to the actual entry content, not a stale or
+		// swapped hash value.
+		expected, err := computeHash(e)
+		if err != nil {
+			return verified, fmt.Errorf("audit: entry %d: %w", i, err)
+		}
+		if e.EntryHash != expected {
+			return verified, fmt.Errorf("audit: entry %d: hash mismatch under signature check: expected %s, got %s", i, expected, e.EntryHash)
+		}
+		if err := v.Verify(e.DID, []byte(e.EntryHash), sig); err != nil {
+			return verified, fmt.Errorf("audit: entry %d: %w", i, err)
+		}
+		verified++
+	}
+	return verified, nil
 }
 
 // ListLogs returns all session audit log files in the audit directory.

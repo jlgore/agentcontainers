@@ -149,7 +149,10 @@ func runGuardServe(cmd *cobra.Command, o guardServeOpts) error {
 	if err != nil {
 		return fmt.Errorf("guard serve: compiling policy: %w", err)
 	}
-	ev, err := mcpproxy.NewEvaluator(ctx, "agent", cp)
+	// The embedded Cedar engine is the default authorization backend; the guard
+	// uses it for consistency with the MCP proxy. It is self-contained (no OPA,
+	// no external binary) and fails closed on a bad compiled policy.
+	ev, err := mcpproxy.NewCedarEvaluator(ctx, "agent", cp)
 	if err != nil {
 		return fmt.Errorf("guard serve: %w", err)
 	}

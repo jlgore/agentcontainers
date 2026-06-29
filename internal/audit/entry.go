@@ -58,4 +58,14 @@ type Entry struct {
 	Version   int            `json:"v,omitempty"`
 	PrevHash  string         `json:"prevHash"`
 	EntryHash string         `json:"entryHash"`
+
+	// DID and Signature carry the signer's identity (G1). DID is the
+	// did:key of the key that signed this entry; it is covered by the
+	// canonical hash (attested content). Signature is the base64 Ed25519
+	// signature over EntryHash and is EXCLUDED from the hash exactly like
+	// EntryHash itself — it is the output that binds an identity to the
+	// already-computed hash, not an input to it. Both are empty on unsigned
+	// (legacy or signer-less) logs, which still verify their hash chain.
+	DID       string `json:"did,omitempty"`
+	Signature string `json:"sig,omitempty"`
 }

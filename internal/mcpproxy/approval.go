@@ -15,13 +15,10 @@ type ApprovalAuditSink struct {
 }
 
 // NewApprovalAuditSink creates the approval audit logger for a session. An
-// empty dir uses audit.DefaultDir ($AC_AUDIT_DIR or ~/.ac/audit).
-func NewApprovalAuditSink(sessionID, dir string) (*ApprovalAuditSink, error) {
-	var opts []audit.LoggerOption
-	if dir != "" {
-		opts = append(opts, audit.WithDir(dir))
-	}
-	l, err := audit.NewLogger(sessionID+"-approval", opts...)
+// empty dir uses audit.DefaultDir ($AC_AUDIT_DIR or ~/.ac/audit). A non-nil
+// signer stamps every decision with the instance's DID + signature (G1).
+func NewApprovalAuditSink(sessionID, dir string, signer audit.Signer) (*ApprovalAuditSink, error) {
+	l, err := audit.NewLogger(sessionID+"-approval", auditOpts(dir, signer)...)
 	if err != nil {
 		return nil, fmt.Errorf("mcpproxy: creating approval audit logger: %w", err)
 	}

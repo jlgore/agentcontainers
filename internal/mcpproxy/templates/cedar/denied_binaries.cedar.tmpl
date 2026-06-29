@@ -1,0 +1,7 @@
+{{- /* sift.denied_binaries — hard denylist, case-insensitive (Rego: lower(binary) in denied). */ -}}
+{{- if .HasDenied}}
+@id("denied_binaries")
+@reason("binary is blocked by security policy and cannot be overridden")
+forbid(principal, action == Action::"Invoke", resource)
+when { {{.DeniedBinaries}}.contains(resource.binary_lc) };
+{{- end}}

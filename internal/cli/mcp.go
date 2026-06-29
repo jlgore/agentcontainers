@@ -25,6 +25,7 @@ import (
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/config"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/enforcement"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/enforcerapi"
+	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/identity"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/mcpproxy"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/sidecar"
 )
@@ -129,10 +130,22 @@ func runMCPStart(cmd *cobra.Command, port int, sessionID, auditDir string, appro
 	}
 	defer approvalCleanup()
 
+	// Load (or first-run generate) the instance signing identity (G1): one
+	// did:key that signs every audit chain and roots the catalog's publisher
+	// credential. A failure here is fatal — an unsigned forensic trail is a
+	// silent loss of provenance, not a degraded mode to fall back to.
+	keyStore, err := identity.LoadOrCreateKeyStore("")
+	if err != nil {
+		return fmt.Errorf("mcp start: loading identity: %w", err)
+	}
+
 	proxy, err := mcpproxy.New(ctx, deps, cfg, sessionID, &mcpproxy.Options{
-		AuditDir:  auditDir,
-		ConfigDir: filepath.Dir(cfgPath),
-		Approval:  broker,
+		AuditDir:       auditDir,
+		ConfigDir:      filepath.Dir(cfgPath),
+		Approval:       broker,
+		PublisherName:  filepath.Base(filepath.Dir(cfgPath)),
+		PublicEndpoint: fmt.Sprintf("http://localhost:%d/", port),
+		Identity:       keyStore,
 	})
 	if err != nil {
 		return fmt.Errorf("mcp start: %w", err)
@@ -141,7 +154,7 @@ func runMCPStart(cmd *cobra.Command, port int, sessionID, auditDir string, appro
 	streamCtx, cancelStream := context.WithCancel(ctx)
 	defer cancelStream()
 	if deps.Enforcer != nil {
-		enforcerAudit, err = mcpproxy.NewEnforcerAuditSink(sessionID, auditDir)
+		enforcerAudit, err = mcpproxy.NewEnforcerAuditSink(sessionID, auditDir, keyStore)
 		if err != nil {
 			_ = proxy.Close(ctx)
 			return fmt.Errorf("mcp start: %w", err)
@@ -157,11 +170,12 @@ func runMCPStart(cmd *cobra.Command, port int, sessionID, auditDir string, appro
 
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", port),
-		Handler:           proxy.Handler(),
+		Handler:           proxy.HTTPHandler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	_, _ = fmt.Fprintf(out, "MCP proxy listening on http://localhost:%d\n", port)
+	_, _ = fmt.Fprintf(out, "Catalog:  http://localhost:%d/.well-known/ai-catalog.json\n", port)
 	_, _ = fmt.Fprintf(out, "Session:  %s\n", sessionID)
 	_, _ = fmt.Fprintf(out, "Backends: %s\n", strings.Join(proxy.Backends(), ", "))
 	_, _ = fmt.Fprintf(out, "Audit:    %s\n", proxy.AuditPath())

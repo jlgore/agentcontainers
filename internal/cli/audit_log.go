@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/audit"
+	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/identity"
 )
 
 func newAuditListCmd() *cobra.Command {
@@ -127,23 +128,30 @@ func runAuditShow(out io.Writer, dir, sessionID string) error {
 
 func newAuditVerifyCmd() *cobra.Command {
 	var dir string
+	var verifySignatures bool
 
 	cmd := &cobra.Command{
 		Use:   "verify <session-id>",
 		Short: "Verify hash chain integrity of a session audit log",
 		Long: `Verify that the hash chain in the specified session audit log
-is intact. Reports the result and exits with non-zero status on failure.`,
+is intact. Reports the result and exits with non-zero status on failure.
+
+With --verify-signatures, also verify the Ed25519 signature on every signed
+entry (G1): each entry's did:key is resolved self-certifyingly and its
+signature checked against the recomputed entry hash. Unsigned legacy entries
+are reported but not failed.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runAuditVerify(cmd.OutOrStdout(), dir, args[0])
+			return runAuditVerify(cmd.OutOrStdout(), dir, args[0], verifySignatures)
 		},
 	}
 
 	cmd.Flags().StringVar(&dir, "dir", "", "Audit log directory (default: ~/.ac/audit/)")
+	cmd.Flags().BoolVar(&verifySignatures, "verify-signatures", false, "Also verify per-entry Ed25519 signatures (G1)")
 	return cmd
 }
 
-func runAuditVerify(out io.Writer, dir, sessionID string) error {
+func runAuditVerify(out io.Writer, dir, sessionID string, verifySignatures bool) error {
 	path, err := resolveAuditPath(dir, sessionID)
 	if err != nil {
 		return fmt.Errorf("audit verify: %w", err)
@@ -160,6 +168,23 @@ func runAuditVerify(out io.Writer, dir, sessionID string) error {
 	}
 
 	_, _ = fmt.Fprintf(out, "OK: %d entries, chain intact.\n", len(entries))
+
+	if verifySignatures {
+		// did:key resolution is self-certifying, so no truststore is needed:
+		// the verifier recovers each signer's public key from the DID carried
+		// in the entry itself.
+		verified, err := audit.VerifySignatures(entries, identity.DIDKeyResolver{})
+		if err != nil {
+			_, _ = fmt.Fprintf(out, "FAIL: %s\n", err)
+			return fmt.Errorf("audit verify: signature check failed")
+		}
+		unsigned := len(entries) - verified
+		_, _ = fmt.Fprintf(out, "OK: %d signed entries verified", verified)
+		if unsigned > 0 {
+			_, _ = fmt.Fprintf(out, ", %d unsigned (legacy)", unsigned)
+		}
+		_, _ = fmt.Fprintln(out, ".")
+	}
 	return nil
 }
 

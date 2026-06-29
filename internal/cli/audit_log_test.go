@@ -3,10 +3,13 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/audit"
+	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/identity"
 )
 
 func TestAuditListEmpty(t *testing.T) {
@@ -95,7 +98,7 @@ func TestAuditVerify(t *testing.T) {
 	_ = l.Close()
 
 	var buf bytes.Buffer
-	err = runAuditVerify(&buf, dir, "verify-test")
+	err = runAuditVerify(&buf, dir, "verify-test", false)
 	if err != nil {
 		t.Fatalf("runAuditVerify: %v", err)
 	}
@@ -106,6 +109,54 @@ func TestAuditVerify(t *testing.T) {
 	}
 	if !strings.Contains(output, "3 entries") {
 		t.Errorf("expected '3 entries' in output, got %q", output)
+	}
+}
+
+func TestAuditVerifySignatures(t *testing.T) {
+	dir := t.TempDir()
+	ks, err := identity.LoadOrCreateKeyStore(filepath.Join(t.TempDir(), "id.pem"))
+	if err != nil {
+		t.Fatalf("keystore: %v", err)
+	}
+	l, err := audit.NewLogger("sig-test", audit.WithDir(dir), audit.WithSigner(ks))
+	if err != nil {
+		t.Fatalf("NewLogger: %v", err)
+	}
+	actor := audit.Actor{Type: "tool", Name: "run"}
+	for range 3 {
+		if err := l.Log(audit.EventToolCall, actor, audit.WithVerdict(audit.VerdictAllow)); err != nil {
+			t.Fatalf("Log: %v", err)
+		}
+	}
+	_ = l.Close()
+
+	// Signed chain verifies.
+	var buf bytes.Buffer
+	if err := runAuditVerify(&buf, dir, "sig-test", true); err != nil {
+		t.Fatalf("runAuditVerify: %v", err)
+	}
+	if out := buf.String(); !strings.Contains(out, "3 signed entries verified") {
+		t.Errorf("expected signed verification, got %q", out)
+	}
+
+	// Tamper one entry on disk; signature verification must fail.
+	path := filepath.Join(dir, "sig-test.jsonl")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	tampered := bytes.Replace(raw, []byte(`"verdict":"allow"`), []byte(`"verdict":"deny"`), 1)
+	if bytes.Equal(tampered, raw) {
+		t.Fatal("tamper replacement did not apply")
+	}
+	if err := os.WriteFile(path, tampered, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// The hash chain itself breaks first (verdict is hashed), which is a valid
+	// detection path; assert verify fails either way.
+	var buf2 bytes.Buffer
+	if err := runAuditVerify(&buf2, dir, "sig-test", true); err == nil {
+		t.Fatalf("expected tampered log to fail verification, output: %q", buf2.String())
 	}
 }
 

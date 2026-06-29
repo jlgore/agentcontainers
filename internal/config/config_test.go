@@ -1513,6 +1513,19 @@ func TestValidate_MCPToolTypeMatrix(t *testing.T) {
 				}},
 			},
 		},
+		{
+			name:     "unknown policy engine is rejected",
+			tool:     MCPToolConfig{Image: "x:1", Policy: &MCPServerPolicy{Engine: "rego"}},
+			wantErrs: []string{`agent.tools.mcp["t"].policy.engine: unknown policy engine "rego"`},
+		},
+		{
+			name: "explicit opa and cedar engines are accepted",
+			tool: MCPToolConfig{Image: "x:1", Policy: &MCPServerPolicy{Engine: "cedar"}},
+		},
+		{
+			name: "empty engine defaults to opa and is accepted",
+			tool: MCPToolConfig{Image: "x:1", Policy: &MCPServerPolicy{Engine: ""}},
+		},
 	}
 
 	for _, tt := range tests {

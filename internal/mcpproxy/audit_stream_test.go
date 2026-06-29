@@ -71,7 +71,7 @@ func TestStreamEnforcerAuditReconnectsWithGapMarkers(t *testing.T) {
 	streamReconnectBaseDelay, streamReconnectMaxDelay = time.Millisecond, 10*time.Millisecond
 	defer func() { streamReconnectBaseDelay, streamReconnectMaxDelay = prevBase, prevMax }()
 
-	sink, err := NewEnforcerAuditSink("gapsess01", t.TempDir())
+	sink, err := NewEnforcerAuditSink("gapsess01", t.TempDir(), nil)
 	if err != nil {
 		t.Fatalf("NewEnforcerAuditSink: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestStreamEnforcerAuditReconnectsOnEOF(t *testing.T) {
 	streamReconnectBaseDelay, streamReconnectMaxDelay = time.Millisecond, 10*time.Millisecond
 	defer func() { streamReconnectBaseDelay, streamReconnectMaxDelay = prevBase, prevMax }()
 
-	sink, err := NewEnforcerAuditSink("gapsess02", t.TempDir())
+	sink, err := NewEnforcerAuditSink("gapsess02", t.TempDir(), nil)
 	if err != nil {
 		t.Fatalf("NewEnforcerAuditSink: %v", err)
 	}
