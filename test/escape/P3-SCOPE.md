@@ -21,14 +21,30 @@ kernel `connect4` hook blocks the POST that L1 let through — turning "L1 has a
   `cgroup_linux.go`) — the live path that registers a cgroup with a running enforcer.
 - The VM has **BPF-LSM active** (kernel 6.8.0-124); the enforcer runs there today.
 
-## ⚠️ The load-bearing risk: loopback
+## ✓ Loopback spike — RESOLVED (2026-06-29, by code, no VM run)
 
-The L1 exfil targeted `http://127.0.0.1:9137`. The existing egress test uses **routable**
-TEST-NET addresses (198.51.100.5), never loopback — `connect4` enforcement on `127.0.0.0/8`
-is unverified and the kernel may treat loopback specially. **Mitigation:** bind the canary to
-the VM's routable IP (e.g. its eth0 address, or a secondary `ip addr add`), exfil there, and
-leave that IP out of `allowed_hosts`. Allow one *declared* host as the C7 control. Verify the
-loopback question first (a 10-minute spike) before committing the cell.
+`connect4`/`connect6` (`agentcontainer-ebpf/src/network/connect.rs`) **unconditionally allow
+loopback as step 1, BEFORE the cgroup-scoping check**:
+
+```rust
+// 1. Always allow loopback (127.0.0.0/8).
+if is_loopback_v4(dst) { bump_stat(STAT_NET_ALLOWED); return Ok(1); }   // ALLOW
+```
+
+`is_loopback_v4` is strictly `(ntohl(ip) >> 24) == 127` — i.e. `127.0.0.0/8` only (`helpers.rs:17`).
+So **the enforcer never governs loopback egress** (by design — it's local IPC). The L1 exfil hit
+`http://127.0.0.1:9137`, which the kernel layer would let through *regardless of policy*. Therefore
+the canary MUST bind to a **non-loopback** address.
+
+**Concrete fix (mirrors the existing C7/C8 test's TEST-NET style):**
+```sh
+sudo ip addr add 198.51.100.5/32 dev lo     # TEST-NET-2; NOT 127/8 → governed, routes locally
+```
+Bind the canary to `198.51.100.5:9137`, exfil target `http://198.51.100.5:9137`. Set
+`allowed_hosts=[198.51.100.1]` (a declared C7 control); leave `198.51.100.5` undeclared →
+`connect4` default-denies it (EPERM) → exfil blocked, canary empty. (Address is on `lo` so it
+routes without external networking, but is outside `127/8` so `is_loopback_v4` returns false and
+enforcement applies.) Tear down with `ip addr del` after.
 
 ## Level 1 — "same script, kernel blocks it" (RECOMMENDED FIRST)
 
