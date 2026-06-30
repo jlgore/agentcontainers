@@ -187,15 +187,20 @@ pub fn parse_network_event(raw: &bpf::NetworkEvent, container_id: &str) -> Enfor
     details.insert("dst_port".into(), format!("{}", raw.dst_port));
 
     if raw.ip_version == 4 {
-        // BPF stores IPv4 as network-order (big-endian) bytes in a u32.
-        let ip = std::net::Ipv4Addr::from(raw.dst_ip4.to_be_bytes());
+        // dst_ip4 is the socket __be32 (network byte order) stored verbatim by the
+        // eBPF hook (connect.rs: `dst_ip4 = (*sock_addr).user_ip4`). On a
+        // little-endian host its integer value is byte-swapped from the address, so
+        // `from_be` is required to recover host order before Ipv4Addr lays out the
+        // octets — `from(dst_ip4.to_be_bytes())` here reversed them (e.g.
+        // 198.51.100.5 -> 5.100.51.198).
+        let ip = std::net::Ipv4Addr::from(u32::from_be(raw.dst_ip4));
         details.insert("dst_ip".into(), ip.to_string());
     } else if raw.ip_version == 6 {
-        // BPF stores IPv6 as 16 network-order bytes cast to [u32; 4].
+        // dst_ip6 is four __be32 words (network order). Recover each word's network
+        // bytes with from_be -> to_be_bytes, then concatenate in address order.
         let mut octets = [0u8; 16];
         for (i, word) in raw.dst_ip6.iter().enumerate() {
-            let bytes = word.to_be_bytes();
-            octets[i * 4..i * 4 + 4].copy_from_slice(&bytes);
+            octets[i * 4..i * 4 + 4].copy_from_slice(&u32::from_be(*word).to_be_bytes());
         }
         let ip = std::net::Ipv6Addr::from(octets);
         details.insert("dst_ip".into(), ip.to_string());
@@ -364,8 +369,11 @@ mod tests {
             event_type: bpf::EventType::NetworkConnect as u32,
             verdict: bpf::Verdict::Block as u32,
             cgroup_id: 1001,
-            // BPF stores 10.0.0.1 in network byte order (big-endian).
-            dst_ip4: 0x0a000001,
+            // The kernel hook stores user_ip4 as a __be32 (network byte order); on a
+            // little-endian host that is the address byte-swapped. `.to_be()` produces
+            // exactly that wire value for 10.0.0.1 (0x0100000a on LE), matching what
+            // the eBPF program emits — so this exercises the real from_be parse path.
+            dst_ip4: u32::from(std::net::Ipv4Addr::new(10, 0, 0, 1)).to_be(),
             dst_ip6: [0; 4],
             dst_port: 443,
             protocol: 6, // TCP
@@ -433,8 +441,9 @@ mod tests {
     fn test_parse_network_event_ipv6() {
         let mut raw = sample_network_event();
         raw.ip_version = 6;
-        // ::1 — 15 zero bytes then 0x01, stored as big-endian u32 words.
-        raw.dst_ip6 = [0, 0, 0, 0x00000001];
+        // ::1 — the low word is the __be32 of network bytes [0,0,0,1], i.e.
+        // 0x01000000 on a little-endian host (`1u32.to_be()`), as the eBPF hook emits.
+        raw.dst_ip6 = [0, 0, 0, 1u32.to_be()];
 
         let ev = parse_network_event(&raw, "ctr-v6");
         assert_eq!(ev.details.get("dst_ip").unwrap(), "::1");
