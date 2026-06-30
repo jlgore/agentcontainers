@@ -46,7 +46,18 @@ Bind the canary to `198.51.100.5:9137`, exfil target `http://198.51.100.5:9137`.
 routes without external networking, but is outside `127/8` so `is_loopback_v4` returns false and
 enforcement applies.) Tear down with `ip addr del` after.
 
-## Level 1 — "same script, kernel blocks it" (RECOMMENDED FIRST)
+## Level 1 — DONE ✓ (2026-06-29, 5/5 green on the VM kernel)
+
+`test_capability_matrix_exfil_under_enforcer` (`bpf_integration.rs`, in `enforcer-live.sh`'s
+TESTS) closes the loop: it adds `198.51.100.5/32` to `lo`, stands up a canary listener there,
+registers its own cgroup with `allowed_hosts=[198.51.100.1]` (canary undeclared), and runs the
+**exact Python urllib POST GLM used at L1** as a governed child. Result — **the kernel `connect4`
+hook denies the connect (EPERM, not ConnectionRefused — the canary IS listening) and the canary
+receives zero bytes.** The egress the guard could not contain is blocked at the kernel, same
+script. The whole `enforcer-live.sh` suite is 5/5 on the VM kernel. (Level 2 below is the live-agent
+capstone.)
+
+## Level 1 — design notes (as built)
 
 Self-contained, deterministic, no daemon, no container runtime. Mirrors the existing kernel
 cell exactly.

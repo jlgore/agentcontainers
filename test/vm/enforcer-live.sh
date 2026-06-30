@@ -39,6 +39,7 @@ log() { printf "${B}==>${Z} %s\n" "$*"; }
 TESTS=(
   test_capability_matrix_exec_under_enforcer
   test_egress_allowlist_allows_declared_denies_undeclared
+  test_capability_matrix_exfil_under_enforcer
   test_exec_allowlist_denies_nonlisted_binary
   test_exec_allowlist_permits_listed_binary
 )
@@ -75,8 +76,11 @@ guest "sudo AC_BPF_ELF_PATH=/home/ubuntu/agentcontainer-ebpf-progs /home/ubuntu/
 
 cat <<EOT
 
-${G}If the four tests above passed, the kernel boundary is proven live:${Z}
+${G}If the tests above passed, the kernel boundary is proven live:${Z}
   C9 exec   cat/ls/grep/tar run, dd/mkfs/nc denied (EACCES) at bprm_check
   C7/C8 net declared host allowed, undeclared denied (EPERM) at connect4
-…all with NO in-harness hook — the floor the Phase 5b/6b bypass cells point to.
+  exfil    the python urllib exfil that ESCAPED the guard layer
+           (Escape-the-Box F-L1-interp-egress) is denied at connect4; canary empty
+…all with NO in-harness hook — the floor the Phase 5b/6b bypass cells point to,
+and the close-the-loop on the interpreter-egress escape the guard could not stop.
 EOT
