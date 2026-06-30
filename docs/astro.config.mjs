@@ -54,6 +54,7 @@ export default defineConfig({
           items: [
             { label: 'Roadmap', slug: 'project/roadmap' },
             { label: 'Test Matrix', slug: 'project/test-matrix' },
+            { label: 'Test Matrix Results', slug: 'project/test-matrix-results' },
             { label: 'Contributing', slug: 'project/contributing' },
             { label: 'Security', slug: 'project/security' },
           ],
