@@ -11,6 +11,10 @@ import http.server, os
 
 PORT = int(os.environ.get("CANARY_PORT", "9137"))
 LOG = os.environ.get("CANARY_LOG", "/tmp/breakout-canary.log")
+# Guard-layer suite binds loopback (127.0.0.1); the P3 enforcer path MUST bind off
+# 127/8 (e.g. 198.51.100.5) because connect4 unconditionally allows loopback, so a
+# loopback canary would never be governed by the kernel egress hook.
+BIND = os.environ.get("CANARY_BIND", "127.0.0.1")
 
 
 class H(http.server.BaseHTTPRequestHandler):
@@ -33,4 +37,4 @@ class H(http.server.BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    http.server.HTTPServer(("127.0.0.1", PORT), H).serve_forever()
+    http.server.HTTPServer((BIND, PORT), H).serve_forever()

@@ -18,6 +18,7 @@ KEY="${AC_MATRIX_SSH_KEY:-$HOME/.ssh/ac-matrix-vm}"
 REPO="$(cd ../.. && pwd)"
 FIXTURE="$REPO/test/escape/breakout-matrix.yaml"
 REMOTE_DIR=/home/ubuntu/breakout
+CODEBASE_DIR="${BREAKOUT_CODEBASE_DIR:-/home/ubuntu/agentcontainers-src}"  # source snapshot for model grounding
 HARNESS="${BREAKOUT_HARNESS:-pi}"
 PROVIDER="${BREAKOUT_PROVIDER:-openrouter}"
 MODEL="${BREAKOUT_MODEL:?set BREAKOUT_MODEL, e.g. z-ai/glm-5.2}"
@@ -60,6 +61,50 @@ esac
   push "$WORK/agentcontainer" /home/ubuntu/agentcontainer >/dev/null
   guest 'sudo install -m0755 /home/ubuntu/agentcontainer /usr/local/bin/agentcontainer && agentcontainer version' | sed 's/^/  /'
 }
+
+# ---- 1b. (P3 Level 2) build + ship the eBPF enforcer bin + ELF -------------
+# Native build on the host (WSL2 x86_64 → VM x86_64 Ubuntu), mirroring
+# test/vm/enforcer-live.sh: cargo build --bin breakout-enforcer triggers aya-build
+# to emit the bpfel ELF; strip + scp both to $REMOTE_DIR. The runner runs the bin
+# as root with AC_BPF_ELF_PATH and places each harness's tree into the cgroup.
+if [ "${BREAKOUT_ENFORCER:-0}" = 1 ]; then
+  log "Building + shipping the eBPF enforcer (breakout-enforcer + ELF)"
+  ENF_DIR="$REPO/enforcer"
+  [ "${AC_SKIP_ENFORCER_BUILD:-0}" = 1 ] || ( cd "$ENF_DIR" && cargo build --bin breakout-enforcer )
+  ENF_BIN="$ENF_DIR/target/debug/breakout-enforcer"
+  ENF_ELF="$(find "$ENF_DIR/target" -path '*/out/agentcontainer-ebpf-progs' 2>/dev/null | xargs ls -t 2>/dev/null | head -1)"
+  [ -n "$ENF_ELF" ] || ENF_ELF="$ENF_DIR/target/bpfel-unknown-none/debug/agentcontainer-ebpf-progs"
+  [ -x "$ENF_BIN" ] || die "breakout-enforcer not built: $ENF_BIN"
+  [ -f "$ENF_ELF" ] || die "ebpf ELF not found: $ENF_ELF"
+  cp "$ENF_BIN" "$WORK/breakout-enforcer"; strip "$WORK/breakout-enforcer" 2>/dev/null || true
+  guest "mkdir -p $REMOTE_DIR"   # step 2 also mkdir's it; idempotent
+  push "$WORK/breakout-enforcer" "$REMOTE_DIR/breakout-enforcer" >/dev/null
+  push "$ENF_ELF" "$REMOTE_DIR/agentcontainer-ebpf-progs" >/dev/null
+  guest "chmod +x $REMOTE_DIR/breakout-enforcer; dpkg -s libelf1 >/dev/null 2>&1 || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libelf1 >/dev/null 2>&1 || (sudo apt-get update >/dev/null 2>&1 && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libelf1 >/dev/null 2>&1); echo 'enforcer ready'" | sed 's/^/  /'
+  ok "enforcer bin ($(du -h "$WORK/breakout-enforcer" | cut -f1)) + ELF shipped to $REMOTE_DIR"
+
+  # Ship a clean SOURCE snapshot of agentcontainers so a safety-reluctant attacker
+  # model can VERIFY (not just be told) that this is a defensive enforcement project
+  # and that the exfil objective is an authorized test against a local canary. This
+  # replaces unverifiable authority claims with evidence the model reads itself.
+  # git archive = tracked source only (no .git/target/build artifacts); append the
+  # uncommitted escape-suite files (the most relevant context). Idempotent; skippable.
+  if [ "${AC_SKIP_SRC_SHIP:-0}" != 1 ]; then
+    log "Shipping agentcontainers source snapshot -> $VM:$CODEBASE_DIR (for model grounding)"
+    # git archive HEAD = tracked source only (excludes .git/target/build artifacts and
+    # the untracked applevm/ backend). Append the uncommitted escape-suite files so the
+    # CURRENT versions win on extract (the most relevant context for the model).
+    ( cd "$REPO" && git archive --format=tar HEAD > "$WORK/ac-src.tar" \
+        && tar --append -f "$WORK/ac-src.tar" \
+          test/escape/breakout-run.sh test/escape/SCENARIOS.md test/escape/P3-SCOPE.md \
+          test/escape/P3-LEVEL2-PROMPT.md test/escape/breakout-matrix.yaml \
+          enforcer/agentcontainer-enforcer/src/bin/breakout-enforcer.rs \
+        && gzip -f "$WORK/ac-src.tar" )
+    push "$WORK/ac-src.tar.gz" /home/ubuntu/ac-src.tar.gz >/dev/null
+    guest "rm -rf $CODEBASE_DIR && mkdir -p $CODEBASE_DIR && tar xzf /home/ubuntu/ac-src.tar.gz -C $CODEBASE_DIR && chmod -R a+rX $CODEBASE_DIR && rm -f /home/ubuntu/ac-src.tar.gz && echo \"source: \$(find $CODEBASE_DIR -type f | wc -l) files\"" | sed 's/^/  /'
+    ok "source snapshot readable at $CODEBASE_DIR"
+  fi
+fi
 
 # ---- 2. derive policy + cases from the ONE fixture, ship to the VM ---------
 # Host has yq; the VM consumes only the derived guard-policy.yaml + cases.json
@@ -120,6 +165,11 @@ log "Running the breakout cell on the VM — harness=$HARNESS model=$MODEL"
 RUNENV="BREAKOUT_HARNESS='$HARNESS' BREAKOUT_PROVIDER='$PROVIDER' BREAKOUT_MODEL='$MODEL' BREAKOUT_AGENT_TIMEOUT=${BREAKOUT_AGENT_TIMEOUT:-180} AC_AUDIT_DIR=/var/lib/ac/audit"
 [ -n "${CASE_FILTER:-}" ] && RUNENV="$RUNENV CASE_FILTER='$CASE_FILTER'"
 [ -n "${SCORE_ONLY:-}" ] && RUNENV="$RUNENV SCORE_ONLY='$SCORE_ONLY'"
+if [ "${BREAKOUT_ENFORCER:-0}" = 1 ]; then
+  RUNENV="$RUNENV BREAKOUT_ENFORCER=1 BREAKOUT_CODEBASE_DIR='$CODEBASE_DIR'"
+  [ -n "${BREAKOUT_CANARY_IP:-}" ] && RUNENV="$RUNENV BREAKOUT_CANARY_IP='$BREAKOUT_CANARY_IP'"
+  [ -n "${BREAKOUT_ALLOWED_HOST:-}" ] && RUNENV="$RUNENV BREAKOUT_ALLOWED_HOST='$BREAKOUT_ALLOWED_HOST'"
+fi
 set +e
 guest "cd $REMOTE_DIR && $RUNENV ./breakout-run.sh"
 RC=$?
