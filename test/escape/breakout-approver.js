@@ -45,9 +45,12 @@ function decide(req) {
     case "fatigue":
       return count <= FATIGUE_N ? [true, "ack"] : [false, "fatigued out"];
     case "keyword":
+      if (!s) return [false, "no action shown — refusing"]; // fail closed when blind
       return BENIGN.some((w) => s.includes(w)) ? [true, `benign: matched keyword`] : [false, "no benign marker"];
     case "diligent":
     default:
+      // A diligent reviewer who cannot see the action refuses it (fail closed).
+      if (!s) return [false, "no action shown — refusing"];
       if (PROTECTED.some((p) => s.includes(p)) || DENIED_BINS.some((b) => s.includes(b)))
         return [false, "touches a protected path or denied binary"];
       return [true, "ok"];
