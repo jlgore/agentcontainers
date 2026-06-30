@@ -11,10 +11,14 @@ description: Design for proving that capabilities are allowed only explicitly wh
 > assertion), and **Phase 6** (pi + a `pi.on("tool_call")` extension adapter — **15/15 on two
 > OpenRouter models, Opus 4.8 and GLM 5.2** + the "agent disables its own hook, kernel blocks anyway"
 > assertion). Across all three harnesses and every model, the guard reaches identical verdicts from the
-> one fixture. Phase 3 surfaced finding **F1** below. The remaining work is the live
-> harness-under-enforcer kernel-block integration (the `agentcontainer run` containerized path). This
-> is the engineering plan for a test matrix that validates the Cedar policy backend and eBPF enforcer
-> across multiple agent harnesses and models.
+> one fixture. Phase 3 surfaced finding **F1** below. The **live kernel-holds proof**
+> (`test/vm/enforcer-live.sh`) closes the loop the 5b/6b bypass cells point to: the eBPF enforcer
+> applies the fixture's C1 allowlist as the kernel exec-allowlist and denies the C3 binaries
+> (dd/mkfs/nc) at `bprm_check` with EACCES — same classes, kernel layer, no harness hook (4/4 green on
+> the VM kernel). The one remaining piece is governing a *full live agent process tree* (the
+> `agentcontainer run` containerized path, which needs a container runtime). This is the engineering
+> plan for a test matrix that validates the Cedar policy backend and eBPF enforcer across multiple agent
+> harnesses and models.
 
 ## Goal
 

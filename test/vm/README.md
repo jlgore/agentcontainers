@@ -178,9 +178,40 @@ config (its own docs say enforce *outside* the harness), and the adapter is
 opt-in per `--extension`. The script runs the denied `cat -v` **with** and
 **without** `--extension`: with it the guard denies; without it the guard audit
 is **empty** — the agent simply doesn't load the hook. **Validated green.** So
-the in-harness hook is not a boundary for pi at all; the kernel (eBPF enforcer,
-proven in Phase 3) is the only one. A live pi-under-enforcer kernel-block is the
-remaining integration.
+the in-harness hook is not a boundary for pi at all; the kernel (eBPF enforcer)
+is the only one — see the live kernel-holds proof below.
+
+## Enforcer — the live kernel-holds proof
+
+`enforcer-live.sh` closes the gap the 5b/6b bypass cells point to: it runs the
+eBPF enforcer on the VM's **real kernel** and shows the **same capability classes
+the guard gates (C1-C6) enforced underneath at the kernel**, with NO in-harness
+hook. It mirrors `kernel-asserts.sh` (native build → strip → `virtctl scp` → run
+as root) and runs the live-demo tests:
+
+```bash
+cd test/vm && ./enforcer-live.sh     # AC_SKIP_BUILD=1 to reuse a build
+```
+
+The headline test, `test_capability_matrix_exec_under_enforcer`
+(`enforcer/.../tests/bpf_integration.rs`), applies the fixture's **C1 shell
+allowlist as the kernel exec-allowlist** via the enforcer's public
+`BpfPolicyManager` API (the same code the production daemon uses), then forks real
+execs into the governed cgroup: **cat/ls/grep/tar run** (kernel permits), while
+**dd/mkfs/nc are denied at the `bprm_check` LSM hook with EACCES** — the exact
+C3 "cannot be overridden" set, blocked with no guard hook involved. Plus the
+existing C7/C8 egress assert (declared host allowed, undeclared denied at
+`connect4` with EPERM) and the C9 true/false controls.
+
+**Validated GREEN (2026-06-29): 4/4 tests pass on the VM kernel** (kernel
+6.8.0-124, BPF-LSM active). This is "agent disables its own hook, kernel blocks
+anyway" made concrete.
+
+> Scope note: this governs a cgroup + a real forked exec — the harness's command
+> surface — via the enforcer's library API (no Docker needed). Governing a *full
+> live agent process tree* (pi/opencode) is the `agentcontainer run` containerized
+> path, which needs a container runtime the VM lacks; the kernel **mechanism** is
+> identical and is exactly what this proves.
 
 ## Scope
 

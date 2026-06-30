@@ -1689,3 +1689,124 @@ async fn test_exec_allowlist_permits_listed_binary() {
         "control: allowlisted binary failed to exec (exit {allowed})"
     );
 }
+
+// Like exec_in_child, but passes `--version` and redirects std{in,out,err} to
+// /dev/null so a real matrix binary (cat/ls/grep/tar) exits cleanly instead of
+// blocking on stdin, while a DENIED binary is still blocked at execve regardless
+// of args. Returns the binary's own exit (e.g. 0 for `--version`), 42 if the
+// kernel denied the exec (EACCES), or 43 for another execve errno.
+fn exec_probe_in_child(path: &std::ffi::CStr) -> i32 {
+    let verarg = std::ffi::CString::new("--version").unwrap();
+    let argv = [path.as_ptr(), verarg.as_ptr(), std::ptr::null()];
+    let envp = [std::ptr::null()];
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0, "fork failed");
+    if child == 0 {
+        unsafe {
+            let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+            if devnull >= 0 {
+                libc::dup2(devnull, 0);
+                libc::dup2(devnull, 1);
+                libc::dup2(devnull, 2);
+            }
+            libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+            let e = *libc::__errno_location(); // only reached if execve failed
+            libc::_exit(if e == libc::EACCES { 42 } else { 43 });
+        }
+    }
+    let mut wstatus = 0i32;
+    unsafe { libc::waitpid(child, &mut wstatus, 0) };
+    if libc::WIFEXITED(wstatus) {
+        libc::WEXITSTATUS(wstatus)
+    } else {
+        -1
+    }
+}
+
+/// Live "kernel holds" proof for the capability matrix, tied to the SAME
+/// binaries the guard gates in Phases 4-6 but enforced purely at the KERNEL with
+/// NO in-harness hook. With the fixture's C1 shell allowlist applied as the
+/// kernel exec-allowlist, an exec of an allowlisted binary (cat/ls/grep/tar)
+/// runs, while the C3 "cannot be overridden" binaries (dd/mkfs/nc) are denied at
+/// the bprm_check LSM hook with EACCES. This is the floor the Phase 5b/6b
+/// soft-hook-bypass assertions point to: even when an agent disables its guard
+/// hook, the kernel blocks the same exec class. Requires root + active bpf LSM.
+#[tokio::test]
+#[serial]
+async fn test_capability_matrix_exec_under_enforcer() {
+    if skip_unless_lsm("test_capability_matrix_exec_under_enforcer") {
+        return;
+    }
+
+    // The fixture's C1 shell allowlist, resolved to real paths on this host.
+    let allow: Vec<String> = [
+        ("/bin/cat", "/usr/bin/cat"),
+        ("/bin/ls", "/usr/bin/ls"),
+        ("/bin/grep", "/usr/bin/grep"),
+        ("/bin/tar", "/usr/bin/tar"),
+    ]
+    .iter()
+    .map(|(a, b)| resolve_bin(a, b))
+    .collect();
+
+    let mgr = BpfPolicyManager::new().expect("BPF programs should load");
+    let cgroup = own_cgroup_path();
+    let handle = mgr.register("cap-matrix-exec", &cgroup, 0).await.unwrap();
+    assert!(
+        mgr.lsm_status().active,
+        "BPF LSM not attached — exec enforcement would be a no-op"
+    );
+
+    mgr.apply_process(
+        "cap-matrix-exec",
+        &ProcessPolicy {
+            allowed_binaries: allow.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        mgr.exec_enforced(handle.cgroup_id),
+        "a non-empty exec allowlist must arm exec enforcement"
+    );
+
+    // ALLOW (C1): each allowlisted binary still execs — the kernel permits it.
+    for p in &allow {
+        let c = std::ffi::CString::new(p.as_str()).unwrap();
+        let r = exec_probe_in_child(&c);
+        assert_ne!(r, 42, "C1 allowlisted exec {p} was wrongly DENIED at the kernel");
+        assert_ne!(
+            r, 43,
+            "C1 allowlisted exec {p} failed execve for another reason (exit {r})"
+        );
+    }
+
+    // DENY (C9, = the C3 unoverridable set): each non-allowlisted binary present
+    // on this host is denied at execve with EACCES — no guard hook involved.
+    let deny = [
+        ("dd", "/bin/dd", "/usr/bin/dd"),
+        ("mkfs", "/sbin/mkfs", "/usr/sbin/mkfs"),
+        ("nc", "/bin/nc", "/usr/bin/nc"),
+    ];
+    let mut exercised = 0;
+    for (name, a, b) in deny {
+        let p = resolve_bin(a, b);
+        if !std::path::Path::new(&p).exists() {
+            eprintln!("note: deny-class binary {name} not present on host, skipping");
+            continue;
+        }
+        let c = std::ffi::CString::new(p.as_str()).unwrap();
+        let r = exec_probe_in_child(&c);
+        assert_eq!(
+            r, 42,
+            "C9: non-allowlisted {name} ({p}) was NOT denied with EACCES (exit {r}; 0 = it RAN)"
+        );
+        exercised += 1;
+    }
+
+    mgr.unregister("cap-matrix-exec").await.unwrap();
+    assert!(
+        exercised > 0,
+        "no deny-class binary present to exercise the kernel deny"
+    );
+}
