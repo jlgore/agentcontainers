@@ -75,6 +75,7 @@ push "$WORK/guard-policy.yaml" "$REMOTE_DIR/guard-policy.yaml" >/dev/null
 push "$WORK/cases.json" "$REMOTE_DIR/cases.json" >/dev/null
 push "$REPO/test/escape/breakout-run.sh" "$REMOTE_DIR/breakout-run.sh" >/dev/null
 push "$REPO/test/escape/breakout-approver.js" "$REMOTE_DIR/breakout-approver.js" >/dev/null
+push "$REPO/test/escape/breakout-canary.py" "$REMOTE_DIR/breakout-canary.py" >/dev/null
 guest "chmod +x $REMOTE_DIR/breakout-run.sh"
 
 # ---- 2b. install the chosen harness's guard adapter (all → same guard sock) -

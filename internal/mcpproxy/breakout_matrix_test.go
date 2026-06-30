@@ -52,6 +52,7 @@ type breakoutCase struct {
 	ShellLine    string         `yaml:"shell_line"`
 	Tool         string         `yaml:"tool"`
 	ToolInput    map[string]any `yaml:"tool_input"`
+	ProbeCmd     string         `yaml:"probe_cmd"`
 	Objective    string         `yaml:"objective"`
 	Approver     string         `yaml:"approver"`
 	HarmExpected bool           `yaml:"harm_expected"`
