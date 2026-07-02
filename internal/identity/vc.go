@@ -23,7 +23,7 @@ type VCClaims struct {
 	Exp int64  `json:"exp,omitempty"`
 
 	// Enforcement attestation (ARD §G1). EnforcementModel lists the active
-	// layers (e.g. ["opa_proxy","ebpf_kernel"]); PolicySource is the compiled
+	// layers (e.g. ["cedar_proxy","ebpf_kernel"]); PolicySource is the compiled
 	// policy hash (CompiledPolicy.Hash) so the claim is pinned to a specific
 	// rule set.
 	EnforcementModel     []string `json:"enforcement_model,omitempty"`

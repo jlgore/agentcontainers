@@ -246,7 +246,7 @@ func New(ctx context.Context, deps Deps, cfg *config.AgentContainer, sessionID s
 	// stable across restarts because the key is persisted. Enforcement layers
 	// are known here (proxy is always active; kernel when an enforcer is wired).
 	if p.identity != nil {
-		enforcement := []string{"opa_proxy"}
+		enforcement := []string{"cedar_proxy"}
 		if p.deps.Enforcer != nil {
 			enforcement = append(enforcement, "ebpf_kernel")
 		}

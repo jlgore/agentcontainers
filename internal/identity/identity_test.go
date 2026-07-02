@@ -89,7 +89,7 @@ func TestVCRoundTripAndExpiry(t *testing.T) {
 	res := DIDKeyResolver{}
 
 	claims := VCClaims{
-		EnforcementModel:     []string{"opa_proxy", "ebpf_kernel"},
+		EnforcementModel:     []string{"cedar_proxy", "ebpf_kernel"},
 		EvidenceImmutability: "append_only",
 		AuditChainType:       "sha256_hash_chain",
 		PolicySource:         "sha256:deadbeef",

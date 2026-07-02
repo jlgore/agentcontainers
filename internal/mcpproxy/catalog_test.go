@@ -92,10 +92,10 @@ func TestCatalogListsAllowedToolsOnly(t *testing.T) {
 	if !strings.HasPrefix(echo.ID, "urn:agentcontainers:") {
 		t.Errorf("id = %q, want urn:agentcontainers prefix", echo.ID)
 	}
-	// No enforcer in this test → opa_proxy model only; a remote backend is
+	// No enforcer in this test → cedar_proxy model only; a remote backend is
 	// proxy-only at the capability level.
-	if got := cat.Publisher.TrustManifest.EnforcementModel; len(got) != 1 || got[0] != "opa_proxy" {
-		t.Errorf("enforcement_model = %v, want [opa_proxy]", got)
+	if got := cat.Publisher.TrustManifest.EnforcementModel; len(got) != 1 || got[0] != "cedar_proxy" {
+		t.Errorf("enforcement_model = %v, want [cedar_proxy]", got)
 	}
 	if echo.Trust.Enforcement != "proxy-only" {
 		t.Errorf("capability enforcement = %q, want proxy-only (remote backend)", echo.Trust.Enforcement)
@@ -194,8 +194,8 @@ func TestCatalogPublishesPublisherCredential(t *testing.T) {
 	if claims.Iss != ks.DID() {
 		t.Errorf("VC iss = %q, want %q", claims.Iss, ks.DID())
 	}
-	if len(claims.EnforcementModel) == 0 || claims.EnforcementModel[0] != "opa_proxy" {
-		t.Errorf("VC enforcement_model = %v, want [opa_proxy ...]", claims.EnforcementModel)
+	if len(claims.EnforcementModel) == 0 || claims.EnforcementModel[0] != "cedar_proxy" {
+		t.Errorf("VC enforcement_model = %v, want [cedar_proxy ...]", claims.EnforcementModel)
 	}
 }
 

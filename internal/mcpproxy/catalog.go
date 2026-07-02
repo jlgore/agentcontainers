@@ -35,7 +35,7 @@ type CatalogPublisher struct {
 // CatalogTrustManifest carries deployment-wide enforcement claims.
 type CatalogTrustManifest struct {
 	// EnforcementModel lists the active enforcement layers, e.g.
-	// ["opa_proxy", "ebpf_kernel"].
+	// ["cedar_proxy", "ebpf_kernel"].
 	EnforcementModel []string `json:"enforcement_model"`
 	// AuditChain names the audit mechanism (the proxy keeps independent
 	// hash-chained trails).
@@ -85,7 +85,7 @@ func (p *Proxy) buildCatalog() Catalog {
 	if p.identity != nil {
 		publisherDID = p.identity.DID()
 	}
-	enforcement := []string{"opa_proxy"}
+	enforcement := []string{"cedar_proxy"}
 	if enforcerActive {
 		enforcement = append(enforcement, "ebpf_kernel")
 	}
