@@ -764,6 +764,38 @@ func TestValidateMounts_EmptyList(t *testing.T) {
 	require.NoError(t, err, "empty mount list should be valid")
 }
 
+// A writable host cgroupfs or scheduler bind-mount re-opens a cgroup-escape /
+// out-of-cgroup-execution path; a read-only mount of the same is allowed.
+func TestValidateMounts_RejectsEscapeMounts(t *testing.T) {
+	tests := []struct {
+		name         string
+		mount        mount.Mount
+		expectReject bool
+	}{
+		{"writable cgroupfs", mount.Mount{Type: mount.TypeBind, Source: "/sys/fs/cgroup", Target: "/sys/fs/cgroup"}, true},
+		{"writable cgroupfs subpath", mount.Mount{Type: mount.TypeBind, Source: "/x", Target: "/sys/fs/cgroup/foo"}, true},
+		{"read-only cgroupfs", mount.Mount{Type: mount.TypeBind, Source: "/sys/fs/cgroup", Target: "/sys/fs/cgroup", ReadOnly: true}, false},
+		{"writable /etc/cron.d", mount.Mount{Type: mount.TypeBind, Source: "/etc/cron.d", Target: "/etc/cron.d"}, true},
+		{"writable cron.d subpath", mount.Mount{Type: mount.TypeBind, Source: "/etc/cron.d/mine", Target: "/etc/cron.d/mine"}, true},
+		{"read-only /etc/cron.d", mount.Mount{Type: mount.TypeBind, Source: "/etc/cron.d", Target: "/etc/cron.d", ReadOnly: true}, false},
+		{"writable /etc/systemd/system", mount.Mount{Type: mount.TypeBind, Source: "/etc/systemd/system", Target: "/etc/systemd/system"}, true},
+		{"writable /var/spool/cron", mount.Mount{Type: mount.TypeBind, Source: "/var/spool/cron", Target: "/spool"}, true},
+		{"benign writable mount", mount.Mount{Type: mount.TypeBind, Source: "/home/user/data", Target: "/data"}, false},
+		{"no false positive on cron-lookalike", mount.Mount{Type: mount.TypeBind, Source: "/etc/cronjobs-custom", Target: "/x"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateMounts([]mount.Mount{tt.mount})
+			if tt.expectReject {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "forbidden mount")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
 func TestBuildContainerConfig_PanicsOnForbiddenMount(t *testing.T) {
 	// P0-4: buildContainerConfig should panic if it encounters a forbidden mount.
 	// This is a defense-in-depth measure: it should never happen in practice

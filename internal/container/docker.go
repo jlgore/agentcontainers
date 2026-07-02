@@ -907,7 +907,43 @@ func validateMounts(mounts []mount.Mount) error {
 		if forbiddenBasenames[filepath.Base(source)] {
 			return fmt.Errorf("forbidden mount: %s (grants host control via container runtime socket)", m.Source)
 		}
+
+		// Deny WRITABLE mounts that re-open a cgroup or scheduler escape. The
+		// enforcer holds at the kernel (cgroup subtree-match + cgroup.procs-write
+		// deny), and the agent has no capabilities by default — but a writable
+		// host cgroupfs or scheduler bind-mount is an unnecessary escape surface
+		// that these checks refuse. A read-only mount is allowed (the agent
+		// can't write it).
+		if m.ReadOnly {
+			continue
+		}
+		target := filepath.Clean(m.Target)
+		if target == "/sys/fs/cgroup" || strings.HasPrefix(target, "/sys/fs/cgroup/") {
+			return fmt.Errorf("forbidden mount: writable %s at %s lets the agent migrate cgroups; mount it read-only if a cgroup view is required", m.Source, m.Target)
+		}
+		for _, sched := range schedulerMountPaths {
+			if source == sched || strings.HasPrefix(source, sched+"/") {
+				return fmt.Errorf("forbidden mount: writable host scheduler path %s lets the agent schedule out-of-cgroup execution (cron/systemd); mount it read-only", m.Source)
+			}
+		}
 	}
 
 	return nil
+}
+
+// schedulerMountPaths are host paths a writable bind-mount of which would let an
+// enforced agent plant a cron/at/systemd job that a host daemon later runs in
+// an unenforced cgroup — the delegation half of the cgroup-move escape.
+var schedulerMountPaths = []string{
+	"/etc/crontab",
+	"/etc/anacrontab",
+	"/etc/cron.d",
+	"/etc/cron.hourly",
+	"/etc/cron.daily",
+	"/etc/cron.weekly",
+	"/etc/cron.monthly",
+	"/var/spool/cron",
+	"/var/spool/at",
+	"/etc/systemd/system",
+	"/etc/systemd/user",
 }
