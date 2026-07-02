@@ -273,17 +273,10 @@ func New(ctx context.Context, deps Deps, cfg *config.AgentContainer, sessionID s
 		if cp == nil {
 			continue
 		}
-		// Select the authorization backend (policy.engine). The embedded Cedar
-		// engine is the default; OPA (policy.engine: opa) is the legacy opt-in.
-		// OPA is constructed ONLY when explicitly requested, so a default
-		// deployment never depends on it. A bad compiled policy fails closed
-		// here at startup rather than silently degrading.
-		var engine PolicyEngine
-		if tool.Policy != nil && tool.Policy.Engine == config.PolicyEngineOPA {
-			engine, err = NewEvaluator(ctx, name, cp)
-		} else {
-			engine, err = NewCedarEvaluator(ctx, name, cp)
-		}
+		// The embedded Cedar engine evaluates the compiled policy. A bad
+		// compiled policy fails closed here at startup rather than silently
+		// degrading.
+		engine, err := NewCedarEvaluator(ctx, name, cp)
 		if err != nil {
 			closeSinks()
 			return nil, err

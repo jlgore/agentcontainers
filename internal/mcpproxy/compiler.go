@@ -2,7 +2,6 @@ package mcpproxy
 
 import (
 	"crypto/sha256"
-	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -10,17 +9,11 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"text/template"
 
 	"gopkg.in/yaml.v3"
 
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/config"
 )
-
-//go:embed templates/*.rego.tmpl
-var templateFS embed.FS
-
-const regoHeader = "# Generated from security policy by mcpproxy — do not edit directly."
 
 // securityPolicyPackages are the category packages rendered from the
 // embedded sift-mcp template ports, in evaluation order. The decision
@@ -236,27 +229,23 @@ func (p *SecurityPolicy) ToData() map[string]any {
 	}
 }
 
-// CompiledPolicy is a server's policy compiled to in-memory Rego module
-// sources plus the data document, ready for the OPA library (no temp
+// CompiledPolicy is a server's policy compiled to the neutral data document
+// plus the emitted Cedar policy set the embedded engine evaluates (no temp
 // files, unlike sift-mcp's compiler).
 type CompiledPolicy struct {
-	// Modules maps a synthetic filename to Rego source.
-	Modules map[string]string
-	// Data is the OPA data document.
+	// Data is the neutral policy document: allow/deny sets and structured
+	// categories the Cedar emitter and the native-Go evaluators consume.
 	Data map[string]any
-	// PolicyPackages drives decision.rego and policies_evaluated, in
-	// evaluation order (fully qualified as "sift.<pkg>" by the template).
+	// PolicyPackages drives policies_evaluated, in evaluation order (reported
+	// to audit fully qualified as "sift.<pkg>").
 	PolicyPackages []string
 	// OutputFlags classify output paths during decomposition (from the
 	// security.yaml, falling back to the sift-mcp catalog defaults).
 	OutputFlags []string
 
 	// CedarPolicies and CedarSchema are the Cedar emission of the
-	// structured-membership categories, baked from the same Data above. They
-	// are always populated (so `ac policy translate` works regardless of the
-	// configured engine) but only consumed when policy.engine == "cedar". They
-	// are NOT part of Hash() — adding them leaves the OPA bundle digest, and
-	// therefore the ARD catalog entry, byte-for-byte unchanged.
+	// structured-membership categories, baked from the Data above. They are the
+	// policy artifact the engine actually evaluates, so they are part of Hash().
 	CedarPolicies string
 	CedarSchema   string
 
@@ -264,26 +253,24 @@ type CompiledPolicy struct {
 	// compiles for the awk_scanning category (the one category Cedar cannot
 	// express, as its `\s*` has no `like` equivalent). Carried alongside the
 	// Data document — which already holds shell_metacharacters/awk_program_tools
-	// — because the regex itself is baked into the OPA module text, not Data.
-	// NOT part of Hash() (Hash marshals only Modules/Data/PolicyPackages), so
-	// the OPA bundle digest and ARD catalog entry stay byte-for-byte unchanged.
+	// — because the regex is compiled Go-side, not carried in Data.
 	AwkDangerRegex string
 }
 
-// Hash returns a stable "sha256:<hex>" digest of the compiled policy
-// bundle (Rego modules + data document + package order). It is published in
+// Hash returns a stable "sha256:<hex>" digest of the compiled policy bundle
+// (data document + package order + emitted Cedar policies). It is published in
 // the ARD catalog so external consumers can verify which policy governs a
-// capability and detect when it changes. json.Marshal sorts map keys, so
-// the digest is deterministic for equal policies.
+// capability and detect when it changes. json.Marshal sorts map keys, so the
+// digest is deterministic for equal policies.
 func (cp *CompiledPolicy) Hash() string {
 	if cp == nil {
 		return ""
 	}
 	payload := struct {
-		Modules        map[string]string `json:"modules"`
-		Data           map[string]any    `json:"data"`
-		PolicyPackages []string          `json:"policyPackages"`
-	}{cp.Modules, cp.Data, cp.PolicyPackages}
+		Data           map[string]any `json:"data"`
+		PolicyPackages []string       `json:"policyPackages"`
+		CedarPolicies  string         `json:"cedarPolicies"`
+	}{cp.Data, cp.PolicyPackages, cp.CedarPolicies}
 	b, err := json.Marshal(payload)
 	if err != nil {
 		// A compiled policy that cannot marshal is a programming error, not
@@ -304,11 +291,6 @@ func Compile(sec *SecurityPolicy, cfgPolicy *config.MCPServerPolicy) (*CompiledP
 		sec = DefaultSecurityPolicy()
 	}
 
-	tmpl, err := template.ParseFS(templateFS, "templates/*.rego.tmpl")
-	if err != nil {
-		return nil, fmt.Errorf("mcpproxy: parsing policy templates: %w", err)
-	}
-
 	pkgs := append([]string(nil), securityPolicyPackages...)
 	if cfgPolicy != nil && cfgPolicy.Filesystem != nil {
 		pkgs = append(pkgs, "filesystem")
@@ -320,62 +302,11 @@ func Compile(sec *SecurityPolicy, cfgPolicy *config.MCPServerPolicy) (*CompiledP
 		pkgs = append(pkgs, "network")
 	}
 
-	render := func(name string, data any) (string, error) {
-		var sb strings.Builder
-		if err := tmpl.ExecuteTemplate(&sb, name+".rego.tmpl", data); err != nil {
-			return "", fmt.Errorf("mcpproxy: rendering %s: %w", name, err)
-		}
-		return sb.String(), nil
-	}
-
-	type templateInput struct {
-		Header         string
-		AwkDangerRegex string
-		PolicyPackages []string
-	}
-	in := templateInput{
-		Header:         regoHeader,
-		AwkDangerRegex: sec.AwkDangerRegex,
-		PolicyPackages: pkgs,
-	}
-
-	modules := make(map[string]string, len(pkgs)+1)
-	for _, pkg := range pkgs {
-		src, err := render(pkg, in)
-		if err != nil {
-			return nil, err
-		}
-		modules[pkg+".rego"] = src
-	}
-	decision, err := render("decision", in)
-	if err != nil {
-		return nil, err
-	}
-	modules["decision.rego"] = decision
-
-	// uri_egress is always compiled (so data.sift.uri_egress is defined for
-	// the decision aggregator) but is NOT a PolicyPackages member: it
-	// contributes egress_targets, never a deny, and must not perturb
-	// policies_evaluated. It no-ops unless the proxy populates
-	// input.context.requested_uris (server opted into policy.network.uriEgress).
-	uriEgress, err := render("uri_egress", in)
-	if err != nil {
-		return nil, err
-	}
-	modules["uri_egress.rego"] = uriEgress
-
-	// override is always compiled (so data.sift.override is defined for the
-	// decision aggregator) but is NOT a PolicyPackages member: it never
-	// contributes a deny, only waives existing ones within the operator
-	// ceiling (G3). It no-ops unless the proxy injects a verified
-	// input.context.operator_override.
-	override, err := render("override", in)
-	if err != nil {
-		return nil, err
-	}
-	modules["override.rego"] = override
-
-	// Merge config-derived data on top of the security.yaml data.
+	// Data is the neutral policy document the Cedar emitter consumes; the
+	// security.yaml-derived defaults are merged with the config-derived
+	// allow/deny sets below. uri_egress and override categories live in the
+	// data (context_eval.go evaluates them natively) rather than as separate
+	// modules; they no-op unless the proxy populates the matching context.
 	data := sec.ToData()
 
 	fsRead, fsWrite, fsDeny := []any{}, []any{}, []any{}
@@ -450,7 +381,6 @@ func Compile(sec *SecurityPolicy, cfgPolicy *config.MCPServerPolicy) (*CompiledP
 	}
 
 	return &CompiledPolicy{
-		Modules:        modules,
 		Data:           data,
 		PolicyPackages: pkgs,
 		OutputFlags:    outputFlags,
