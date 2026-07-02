@@ -2015,6 +2015,115 @@ async fn test_cgroup_move_does_not_escape_exec_enforcement() {
     );
 }
 
+/// Fork a child, move it into `cgroup_procs`'s cgroup, then have it `open(path,
+/// flags)` — so file_open evaluates the open with the child in that (descendant)
+/// cgroup. Same pipe-coordination and 0/42/43 exit encoding as
+/// [`exec_in_moved_child`] (0 = opened, 42 = EACCES, 43 = other errno).
+fn open_in_moved_child(path: &std::ffi::CStr, flags: libc::c_int, cgroup_procs: &str) -> i32 {
+    let mut go = [0i32; 2];
+    unsafe {
+        assert_eq!(libc::pipe(go.as_mut_ptr()), 0);
+    }
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0, "fork failed");
+    if child == 0 {
+        unsafe {
+            libc::close(go[1]);
+            let mut b = [0u8; 1];
+            libc::read(go[0], b.as_mut_ptr() as *mut libc::c_void, 1);
+            let fd = libc::open(path.as_ptr(), flags);
+            if fd < 0 {
+                let e = *libc::__errno_location();
+                libc::_exit(if e == libc::EACCES { 42 } else { 43 });
+            }
+            libc::close(fd);
+            libc::_exit(0);
+        }
+    }
+    unsafe {
+        libc::close(go[0]);
+    }
+    let _ = std::fs::write(cgroup_procs, format!("{child}\n"));
+    unsafe {
+        libc::write(go[1], [1u8].as_ptr() as *const libc::c_void, 1);
+        libc::close(go[1]);
+    }
+    let mut wstatus = 0i32;
+    unsafe { libc::waitpid(child, &mut wstatus, 0) };
+    if libc::WIFEXITED(wstatus) {
+        libc::WEXITSTATUS(wstatus)
+    } else {
+        -1
+    }
+}
+
+/// LSM subtree proof (file): a `deny_paths` file (→ DENIED_INODES, keyed by the
+/// registered cgroup id) is blocked at file_open for a task moved into a
+/// DESCENDANT cgroup, while a non-denied file still opens — the file_open
+/// counterpart of `test_cgroup_move_does_not_escape_exec_enforcement`, proving
+/// the ancestor id is threaded through the per-cgroup inode lookup.
+#[tokio::test]
+#[serial]
+async fn test_cgroup_move_does_not_escape_file_enforcement() {
+    if skip_unless_lsm("test_cgroup_move_does_not_escape_file_enforcement") {
+        return;
+    }
+    let mgr = BpfPolicyManager::new().expect("BPF programs should load");
+    let cgroup = own_cgroup_path();
+    mgr.register("test-cg-file-escape", &cgroup, 0).await.unwrap();
+    assert!(mgr.lsm_status().active, "BPF LSM not attached");
+
+    let dir = tempfile::tempdir().unwrap();
+    let denied_file = dir.path().join("secret");
+    let ok_file = dir.path().join("public");
+    std::fs::write(&denied_file, b"x").unwrap();
+    std::fs::write(&ok_file, b"x").unwrap();
+
+    mgr.apply_filesystem(
+        "test-cg-file-escape",
+        &FilesystemPolicy {
+            read_paths: vec![],
+            write_paths: vec![],
+            deny_paths: vec![denied_file.to_string_lossy().into_owned()],
+        },
+    )
+    .await
+    .unwrap();
+
+    let escape_cg = format!("{cgroup}/ac-file-escape");
+    if std::fs::create_dir_all(&escape_cg).is_err() {
+        eprintln!("skipping file-escape assertion: cannot create child cgroup under {cgroup}");
+        mgr.unregister("test-cg-file-escape").await.unwrap();
+        return;
+    }
+    let procs = format!("{escape_cg}/cgroup.procs");
+
+    // DENIED_INODES blocks all access, so a read-open suffices.
+    let denied = open_in_moved_child(
+        &std::ffi::CString::new(denied_file.to_string_lossy().as_bytes()).unwrap(),
+        libc::O_RDONLY,
+        &procs,
+    );
+    let allowed = open_in_moved_child(
+        &std::ffi::CString::new(ok_file.to_string_lossy().as_bytes()).unwrap(),
+        libc::O_RDONLY,
+        &procs,
+    );
+
+    let _ = std::fs::remove_dir(&escape_cg);
+    mgr.unregister("test-cg-file-escape").await.unwrap();
+
+    assert_eq!(
+        denied, 42,
+        "deny_paths open in a descendant cgroup was NOT denied (exit {denied}) — \
+         file enforcement escaped via cgroup move"
+    );
+    assert_eq!(
+        allowed, 0,
+        "a non-denied file failed to open in a descendant cgroup (exit {allowed})"
+    );
+}
+
 /// C9 (hard boundary): with a non-empty exec allowlist applied, an execve of a
 /// NON-allowlisted binary is denied (EACCES) at the bprm_check LSM hook. Also
 /// asserts the BPF LSM actually attached (`lsm_status().active`) — the
