@@ -34,9 +34,9 @@ three harnesses and both model providers**.
 Two layers establish it:
 
 - **Layer 1 — a deterministic policy oracle** (`internal/mcpproxy/capability_matrix_test.go`,
-  `TestCapabilityMatrixOracle`) compiles the fixture through both the Cedar and OPA engines and
-  asserts every case reaches its declared verdict, with cross-engine parity and per-deny mechanism
-  checks. Pure Go, model-free, gates every PR.
+  `TestCapabilityMatrixOracle`) compiles the fixture through the embedded Cedar engine and asserts
+  every case reaches its declared verdict, with per-deny mechanism checks. Pure Go, model-free,
+  gates every PR.
 - **Layer 2 — behavioral red-team cells** drive each *real* harness headless against the live guard
   in deny mode and score from the audit trail. These prove the harness-driver contract: that a real
   model, through a real harness, hits the same boundary with the same verdicts.

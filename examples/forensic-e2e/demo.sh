@@ -144,7 +144,7 @@ start_guard() {
 
 case "${1:-}" in
   up)
-    log "Guard (OPA + HITL for Claude's own tools)"
+    log "Guard (Cedar + HITL for Claude's own tools)"
     start_guard || exit 1
     log "Enforced stack (enforcer + gateway behind the proxy)"
     PROXY_PORT="$PROXY_PORT" ./up.sh
@@ -159,7 +159,7 @@ ${G}Forensic E2E (bare) is up.${Z} Run Claude against the audited proxy:
   claude --mcp-config $MCP_JSON --strict-mcp-config
 
   /mcp should show: sift · connected · 49 tools
-  Claude's own Bash/Write -> guard (OPA, approvals inline); forensic tools -> proxy (OPA + audit).
+  Claude's own Bash/Write -> guard (Cedar, approvals inline); forensic tools -> proxy (Cedar + audit).
   ./demo.sh status | down
 EOT
     ;;

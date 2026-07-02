@@ -3,7 +3,7 @@
 #
 # Layer 1 (the deterministic policy oracle, TestCapabilityMatrixOracle) loads
 # this file, compiles `policy` into a CompiledPolicy, and asserts every `case`
-# reaches its `expect` verdict under BOTH the Cedar and OPA engines. Layer 2
+# reaches its `expect` verdict under the embedded Cedar engine. Layer 2
 # (the behavioral red-team runner, on the KubeVirt VM) reads the SAME file so
 # the live runs and the oracle can never drift.
 #

@@ -28,7 +28,7 @@ func newGuardCmd() *cobra.Command {
 		Use:   "guard",
 		Short: "Policy-gate the agent's own tool calls (Claude Code hooks)",
 		Long: `Gate an AI agent's native tools (Claude Code's Bash, …) with the same
-OPA policy that gates the MCP forensic tools, escalating denials to a human.
+Cedar policy that gates the MCP forensic tools, escalating denials to a human.
 
   guard serve         run the host-side decision service (the authority)
   guard monitor       review pending approvals in a TUI
@@ -155,9 +155,9 @@ func runGuardServe(cmd *cobra.Command, o guardServeOpts) error {
 	if err != nil {
 		return fmt.Errorf("guard serve: compiling policy: %w", err)
 	}
-	// The embedded Cedar engine is the default authorization backend; the guard
-	// uses it for consistency with the MCP proxy. It is self-contained (no OPA,
-	// no external binary) and fails closed on a bad compiled policy.
+	// The embedded Cedar engine is the authorization backend; the guard uses it
+	// for consistency with the MCP proxy. It is self-contained (no external
+	// binary) and fails closed on a bad compiled policy.
 	ev, err := mcpproxy.NewCedarEvaluator(ctx, "agent", cp)
 	if err != nil {
 		return fmt.Errorf("guard serve: %w", err)

@@ -51,8 +51,8 @@ that the Cedar authorization backend (policy.engine: cedar) would evaluate.
 
 Only the structured-membership categories (denied_binaries, dangerous_flags,
 tool_blocked_flags, capabilities) are translated to Cedar; path and content
-(regex/substring) categories are evaluated by the in-process OPA engine even
-under the Cedar backend and so are not emitted here.
+(regex/substring) categories are evaluated by the native-Go evaluators that run
+alongside the Cedar engine and so are not emitted here.
 
 This is pure emission and does not require the Cedar CLI to be installed.`,
 		Args: cobra.ExactArgs(1),

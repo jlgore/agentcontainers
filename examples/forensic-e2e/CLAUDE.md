@@ -3,7 +3,7 @@
 This case has two separate tool paths:
 
 - Forensic MCP tools: 49 tools exposed through the sift proxy. These run inside an enforced gateway container where evidence is mounted read-only.
-- Claude's native tools: Bash, Write, Edit, MultiEdit, and related file tools. These are gated by the agentcontainer guard hook using OPA policy and human-in-the-loop approval.
+- Claude's native tools: Bash, Write, Edit, MultiEdit, and related file tools. These are gated by the agentcontainer guard hook using Cedar policy and human-in-the-loop approval.
 
 All evidence-touching operations MUST go through the forensic MCP `run_command` tool. Never use raw Bash, `ls`, `stat`, Python, or local filesystem commands against evidence paths.
 
@@ -63,7 +63,7 @@ correlation IDs.
 
 ## Self-Correction
 
-If a tool call is denied by OPA policy, read the structured denial. It includes blocked flags and allowed alternatives. Correct the arguments and retry.
+If a tool call is denied by Cedar policy, read the structured denial. It includes blocked flags and allowed alternatives. Correct the arguments and retry.
 
 If `record_finding` rejects an `audit_id` as "not found in audit trail", that's an
 infrastructure misconfiguration, not a normal case: the gateway's `VHIR_AUDIT_DIR`

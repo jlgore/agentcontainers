@@ -87,10 +87,9 @@ C1–C6 are pure policy (run anywhere). C7–C9 require a real kernel.
 ### Layer 1 — deterministic policy oracle (model-free, CI gate)
 
 Feed `(binary, flags)` tuples straight at the evaluator and assert allow/deny. This is where
-"allowed only explicitly" is *proven*. Runs under **both engines** (cedar default, opa legacy) to
-assert parity — the golden test (`internal/mcpproxy/cedar_test.go`) already asserts OPA-identical
-reasons; we extend it into the full capability table. C1–C6 are pure Go; C7–C9 ride the VM /
-BPF-integration harness.
+"allowed only explicitly" is *proven*. Runs under the embedded Cedar engine — the golden test
+(`internal/mcpproxy/cedar_test.go`) asserts each command's expected verdict; we extend it into the
+full capability table. C1–C6 are pure Go; C7–C9 ride the VM / BPF-integration harness.
 
 ### Layer 2 — behavioral red-team (harness × model)
 
@@ -180,10 +179,10 @@ Lowest-risk first; each phase is independently valuable.
   `internal/mcpproxy/testdata/capability-matrix.yaml`, consumed by both layers so the oracle and live
   runs can't drift. (C7–C9 are added when the kernel layer lands.)
 - **Phase 1 — Layer-1 oracle (pure Go, CI gate). ✅ Done.** `TestCapabilityMatrixOracle` in
-  `internal/mcpproxy/capability_matrix_test.go` drives the fixture through **both** the Cedar and OPA
-  engines, asserting each case's explicit verdict, cross-engine verdict+reason parity, and that each
-  deny fires for the right mechanism (`reasonContains`). A coverage guard fails if any class is
-  dropped. Runs under `go test ./...`, so it gates every PR.
+  `internal/mcpproxy/capability_matrix_test.go` drives the fixture through the embedded Cedar
+  engine, asserting each case's explicit verdict and that each deny fires for the right mechanism
+  (`reasonContains`). A coverage guard fails if any class is dropped. Runs under `go test ./...`, so
+  it gates every PR.
 - **Phase 2 — KubeVirt VM substrate. ✅ Done.** `test/vm/` — a CDI DataVolume (Ubuntu 24.04) + a VM
   pinned to `talos-node`, cloud-init arms the bpf LSM (idempotent; reboots only if needed) and
   installs node + claude-code + opencode. `up.sh`/`smoke.sh`/`down.sh`; the smoke hard-checks bpf in

@@ -1,14 +1,14 @@
 # claude-agent — Claude Code under zero-trust enforcement
 
 Run Claude Code itself inside an agentcontainers-enforced container, with its
-**own** tool calls gated by the same OPA policy and human-in-the-loop approval
+**own** tool calls gated by the same Cedar policy and human-in-the-loop approval
 that gate the MCP forensic tools.
 
 Three layers wrap the agent:
 
 | Layer | Mechanism | Stops |
 |-------|-----------|-------|
-| **Tool policy** | PreToolUse hook → host `guard serve` → OPA + HITL | Bash *and* the file mutators (Write/Edit/MultiEdit/NotebookEdit): `curl`, `bash -c`, `rm -rf /`, shell metacharacters, and writes outside the workspace (e.g. `/etc`, home dotfiles) — each with a human-readable reason and an approval escalation |
+| **Tool policy** | PreToolUse hook → host `guard serve` → Cedar + HITL | Bash *and* the file mutators (Write/Edit/MultiEdit/NotebookEdit): `curl`, `bash -c`, `rm -rf /`, shell metacharacters, and writes outside the workspace (e.g. `/etc`, home dotfiles) — each with a human-readable reason and an approval escalation |
 | **Network** | eBPF egress allowlist (kernel) | any connection except `api.anthropic.com:443` |
 | **Auth** | OAuth token, or API key injected into `/run/secrets` | credentials kept out of the image and (for the API key) out of the agent's environment |
 

@@ -2,14 +2,14 @@
 
 End-to-end runbook for the **proxy-path** forensic demo: the SIFT gateway runs as a
 kernel-enforced container backend *behind* the MCP proxy, every forensic tool call is
-policy-evaluated (OPA), approval-gated, correlation-tagged, and recorded in the
+policy-evaluated (Cedar), approval-gated, correlation-tagged, and recorded in the
 `<session>-proxy` audit hash chain. Acquired evidence is mounted **read-only**.
 
 Two ways to drive it with a Claude Code harness:
 
-- **Bare** — Claude runs on the host, pointed at the proxy. Still fully **OPA-governed**:
-  Claude's own Bash/Write go through the guard hook (OPA + HITL), forensic tools go
-  through the proxy (OPA + audit). Lacks only the eBPF kernel boundary around Claude
+- **Bare** — Claude runs on the host, pointed at the proxy. Still fully **Cedar-governed**:
+  Claude's own Bash/Write go through the guard hook (Cedar + HITL), forensic tools go
+  through the proxy (Cedar + audit). Lacks only the eBPF kernel boundary around Claude
   itself.
 - **Containerized** — Claude runs *inside* the enforced `claude-agent` container; adds
   the eBPF kernel boundary (egress / file_open / exec) + fail-closed on top. See
@@ -109,8 +109,8 @@ In-session, `/mcp` should list `sift` with `mcp__sift__*` and 49 tools.
 
 There are two tool paths:
 
-- Forensic MCP tools go through the proxy with OPA policy and hash-chained audit.
-- Claude's own Bash/Write/Edit tools go through the guard hook with OPA and inline HITL approval.
+- Forensic MCP tools go through the proxy with Cedar policy and hash-chained audit.
+- Claude's own Bash/Write/Edit tools go through the guard hook with Cedar and inline HITL approval.
 
 `demo.sh up` writes the MCP config and guard hook settings for the bare path.
 Use `--escalation prompt` only if you deliberately want approvals routed to a
@@ -122,7 +122,7 @@ separate `guard serve` terminal instead of Claude's TUI.
 
 For the containerized path, use `examples/claude-agent/E2E-FORENSIC-DEMO.md`.
 That adds the eBPF kernel boundary around Claude: cgroup egress, file_open,
-exec enforcement, and fail-closed behavior on Claude itself. The proxy, OPA,
+exec enforcement, and fail-closed behavior on Claude itself. The proxy, Cedar,
 and audit story is the same.
 
 ---

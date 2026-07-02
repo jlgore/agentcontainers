@@ -111,7 +111,7 @@ Artifacts left in place on the VM for the fresh session: the two `:e2e` images,
         ▼
    agentcontainer exec -it claude-agent-e2e -- claude        ← the demo session
         │
-        ├── Bash / Write / Edit ──▶ PreToolUse hook ──▶ host `guard serve` ──▶ OPA + HITL + audit
+        ├── Bash / Write / Edit ──▶ PreToolUse hook ──▶ host `guard serve` ──▶ Cedar + HITL + audit
         │                                                    (gates the agent's OWN tools)
         │
         └── mcp__sift__* tools ───▶ agentcontainers MCP proxy (:4510, policy/approval/audit)
@@ -522,7 +522,7 @@ TOOLS & RULES
   plaso-timeline, memory-analysis) for the correct invocations and flags.
 - Your own Bash/Write/Edit are policy-gated and may escalate to a human — that is
   expected; adapt when a command is denied, don't fight it.
-- If an OPA denial includes structured feedback, read it and retry with corrected
+- If an Cedar denial includes structured feedback, read it and retry with corrected
   arguments instead of repeating the blocked call.
 - `vhir --case e2e-demo …` is available for READ-ONLY orientation (case status,
   evidence list, audit summary). Do not approve, reject, or mutate the case —

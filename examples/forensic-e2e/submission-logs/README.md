@@ -4,7 +4,7 @@ Audit trails and case output from a live `forensic-e2e` run: Claude Code, inside
 an agentcontainers-enforced container, investigates a Windows 7 x64 disk image
 (`win7-64-nfury-c-drive.E01`) through the kernel-enforced SIFT gateway and stages
 findings into a Valhuntir case. Every forensic tool call flows through the MCP
-proxy's OPA policy evaluation, correlation-ID tagging, and a hash-chained audit
+proxy's Cedar policy evaluation, correlation-ID tagging, and a hash-chained audit
 log; the gateway runs as a kernel-enforced (eBPF LSM) container backend.
 
 **Run session:** `ffb9490a42197fac` · gateway image
@@ -15,7 +15,7 @@ log; the gateway runs as a kernel-enforced (eBPF LSM) container backend.
 
 - **`audit-chains/`** — hash-chained JSONL audit trails for the run session.
   - `ffb9490a42197fac-proxy.jsonl` — the MCP **proxy** chain: one entry per
-    forensic tool call, each with a **correlation ID**, the **OPA policy
+    forensic tool call, each with a **correlation ID**, the **Cedar policy
     decision** (verdict + reasons), an argument summary, and timing. 95 entries,
     hash-linked (each entry carries the previous entry's hash).
   - `ffb9490a42197fac-enforcer.jsonl` — the eBPF **enforcer** stream for this
@@ -54,7 +54,7 @@ A judge can trace any finding end to end:
 1. **Finding** in `case-data/findings.json` carries `audit_ids`.
 2. Each `audit_id` (e.g. `sift-jgore-20260616-NNN`) is the response ID of a
    `run_command` call — recorded both in the **proxy chain**
-   (`audit-chains/…-proxy.jsonl`, with its correlation ID and OPA verdict) and
+   (`audit-chains/…-proxy.jsonl`, with its correlation ID and Cedar verdict) and
    in **`case-data/case-audit/sift-mcp.jsonl`** (the trail `record_finding`
    validates against). Provenance is FULL — not the `supporting_commands`
    fallback — because the audit_ids resolve.
