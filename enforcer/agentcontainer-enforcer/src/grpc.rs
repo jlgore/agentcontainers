@@ -1140,6 +1140,124 @@ impl Enforcer for EnforcerService {
             injected_count: count,
         }))
     }
+
+    async fn set_immutable(
+        &self,
+        request: Request<SetImmutableRequest>,
+    ) -> Result<Response<SetImmutableResponse>, Status> {
+        let req = request.into_inner();
+
+        // Look up init PID, copying the value so the read guard can be dropped.
+        let init_pid = {
+            let pids = self.container_pids.read().await;
+            pids.get(&req.container_id).copied().ok_or_else(|| {
+                Status::not_found(format!("container {} not registered", req.container_id))
+            })?
+        };
+
+        // SEC: validate every path up-front. Paths are absolute in the agent
+        // namespace; a ".." component could escape /proc/<pid>/root back onto the
+        // host. The run flow only sends trusted Catalog paths, but the enforcer
+        // never trusts its caller.
+        for p in &req.paths {
+            if !p.starts_with('/') || p.split('/').any(|c| c == "..") {
+                return Err(Status::invalid_argument(format!(
+                    "invalid path {:?}: must be absolute with no \"..\" component",
+                    p
+                )));
+            }
+        }
+
+        let mut changed = 0u32;
+        for p in &req.paths {
+            let full = format!("/proc/{}/root{}", init_pid, p);
+            match set_immutable_flag(&full, req.immutable) {
+                Ok(true) => changed += 1,
+                Ok(false) => {}                        // already in desired state
+                Err(SetImmutableError::NotFound) => {} // missing file — skip, not fatal
+                Err(SetImmutableError::Io(e)) => {
+                    return Err(Status::internal(format!(
+                        "set immutable={} on {}: {}",
+                        req.immutable, full, e
+                    )));
+                }
+            }
+        }
+
+        tracing::info!(
+            container_id = %req.container_id,
+            immutable = req.immutable,
+            changed = changed,
+            "execution-config immutability updated via /proc/{}/root",
+            init_pid,
+        );
+
+        Ok(Response::new(SetImmutableResponse {
+            success: true,
+            error: String::new(),
+            changed_count: changed,
+        }))
+    }
+}
+
+/// Outcome-distinguishing error for [`set_immutable_flag`]: a missing target is
+/// skippable (the Catalog surface simply does not exist in this image), while an
+/// I/O/ioctl failure is fatal.
+#[allow(dead_code)] // NotFound is only constructed on Linux.
+enum SetImmutableError {
+    NotFound,
+    Io(std::io::Error),
+}
+
+/// Set (`on=true`) or clear (`on=false`) `FS_IMMUTABLE_FL` on `path` via ioctl,
+/// returning `Ok(true)` if the bit changed and `Ok(false)` if it was already in
+/// the desired state. Requires `CAP_LINUX_IMMUTABLE` (granted to the enforcer
+/// sidecar). Mirrors `internal/harness/immutable_linux.go`: `O_RDONLY` is
+/// sufficient — the flag ioctl does not need write permission.
+#[cfg(target_os = "linux")]
+fn set_immutable_flag(path: &str, on: bool) -> Result<bool, SetImmutableError> {
+    use std::os::unix::io::AsRawFd;
+
+    // Fixed kernel ABI values (libc 0.2 does not export the FS_IOC_* requests).
+    const FS_IOC_GETFLAGS: libc::c_ulong = 0x8008_6601;
+    const FS_IOC_SETFLAGS: libc::c_ulong = 0x4008_6602;
+    const FS_IMMUTABLE_FL: libc::c_int = 0x0000_0010;
+
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SetImmutableError::NotFound)
+        }
+        Err(e) => return Err(SetImmutableError::Io(e)),
+    };
+    let fd = file.as_raw_fd();
+
+    let mut flags: libc::c_int = 0;
+    // SAFETY: fd is a live open file; &mut flags is a valid out-pointer for the request.
+    if unsafe { libc::ioctl(fd, FS_IOC_GETFLAGS, &mut flags) } != 0 {
+        return Err(SetImmutableError::Io(std::io::Error::last_os_error()));
+    }
+    if (flags & FS_IMMUTABLE_FL != 0) == on {
+        return Ok(false); // already in the desired state — idempotent
+    }
+    if on {
+        flags |= FS_IMMUTABLE_FL;
+    } else {
+        flags &= !FS_IMMUTABLE_FL;
+    }
+    // SAFETY: fd is a live open file; &flags is a valid in-pointer for the request.
+    if unsafe { libc::ioctl(fd, FS_IOC_SETFLAGS, &flags) } != 0 {
+        return Err(SetImmutableError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(true)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_immutable_flag(_path: &str, _on: bool) -> Result<bool, SetImmutableError> {
+    Err(SetImmutableError::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "immutable flag is only supported on Linux",
+    )))
 }
 
 /// Create the gRPC server with a given policy manager.
@@ -1489,6 +1607,87 @@ mod tests {
         );
         let status = result.unwrap_err();
         assert_eq!(status.code(), tonic::Code::Internal);
+    }
+
+    #[tokio::test]
+    async fn test_set_immutable_not_registered_returns_not_found() {
+        let (uri, _handle) = start_test_server().await;
+        let mut client = EnforcerClient::connect(uri).await.unwrap();
+
+        let result = client
+            .set_immutable(SetImmutableRequest {
+                container_id: "ctr-never-registered".into(),
+                paths: vec!["/etc/crontab".into()],
+                immutable: true,
+            })
+            .await;
+
+        assert!(
+            result.is_err(),
+            "set_immutable on unregistered container should fail"
+        );
+        assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn test_set_immutable_rejects_path_traversal() {
+        let (uri, _handle) = start_test_server().await;
+        let mut client = EnforcerClient::connect(uri).await.unwrap();
+
+        client
+            .register_container(RegisterContainerRequest {
+                container_id: "ctr-immutable-traversal".into(),
+                cgroup_path: "/sys/fs/cgroup/test".into(),
+                init_pid: 12345,
+            })
+            .await
+            .unwrap();
+
+        // A ".." component could escape /proc/<pid>/root back onto the host.
+        for bad in ["/etc/../../escape", "relative/path"] {
+            let result = client
+                .set_immutable(SetImmutableRequest {
+                    container_id: "ctr-immutable-traversal".into(),
+                    paths: vec![bad.into()],
+                    immutable: true,
+                })
+                .await;
+            assert!(result.is_err(), "path {bad:?} should be rejected");
+            assert_eq!(
+                result.unwrap_err().code(),
+                tonic::Code::InvalidArgument,
+                "path {bad:?} should be InvalidArgument"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_set_immutable_missing_paths_succeed() {
+        // Registered container, valid paths that do not exist under /proc/<pid>/root:
+        // the enforcer skips non-existent surfaces rather than erroring.
+        let (uri, _handle) = start_test_server().await;
+        let mut client = EnforcerClient::connect(uri).await.unwrap();
+
+        client
+            .register_container(RegisterContainerRequest {
+                container_id: "ctr-immutable-missing".into(),
+                cgroup_path: "/sys/fs/cgroup/test".into(),
+                init_pid: 99999999,
+            })
+            .await
+            .unwrap();
+
+        let resp = client
+            .set_immutable(SetImmutableRequest {
+                container_id: "ctr-immutable-missing".into(),
+                paths: vec!["/etc/crontab".into(), "/root/.bashrc".into()],
+                immutable: true,
+            })
+            .await
+            .expect("missing paths must be skipped, not error")
+            .into_inner();
+        assert!(resp.success);
+        assert_eq!(resp.changed_count, 0, "no existing surface should change");
     }
 
     #[tokio::test]

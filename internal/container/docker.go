@@ -5,7 +5,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +20,7 @@ import (
 
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/config"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/enforcement"
+	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/harness"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/policy"
 )
 
@@ -45,6 +48,10 @@ type DockerRuntime struct {
 	stopTimeout  time.Duration
 	strategy     enforcement.Strategy
 	cgroupnsHost bool
+	// scanExecConfig discovers the agent's execution-config surfaces for the
+	// freeze step; nil means the default harness.Scan. A seam so bootstrap tests
+	// can inject findings without a real container filesystem.
+	scanExecConfig func(harness.Options) ([]harness.Finding, error)
 }
 
 // DockerOption configures a DockerRuntime.
@@ -303,6 +310,19 @@ func (d *DockerRuntime) Start(ctx context.Context, cfg *config.AgentContainer, o
 			return nil, fmt.Errorf("docker runtime: installing credential ACLs: %w", err)
 		}
 
+		// 3b. Freeze the agent's writable execution-config immutable, while still
+		// paused, so it is locked before the agent runs a single instruction. This
+		// closes the self-rewrite escape (the agent disabling its own guard hook or
+		// planting a cron/systemd job that runs in an unenforced cgroup) without a
+		// manual `harness protect`. Docker/kernel-primary runtime only; the sandbox
+		// (VM) and compose runtimes do not wire this yet.
+		if opts.FreezeConfig {
+			if err := d.freezeExecConfig(ctx, resp.ID, initPID); err != nil {
+				teardownUnenforced()
+				return nil, fmt.Errorf("docker runtime: freezing execution-config: %w", err)
+			}
+		}
+
 		// 4. Resume only after every step succeeded.
 		if _, err := d.client.ContainerUnpause(ctx, resp.ID, client.ContainerUnpauseOptions{}); err != nil {
 			teardownUnenforced()
@@ -321,6 +341,101 @@ func (d *DockerRuntime) Start(ctx context.Context, cfg *config.AgentContainer, o
 		Status:      "running",
 		CreatedAt:   time.Now(),
 	}, nil
+}
+
+// freezeExecConfig scans the paused agent's mount namespace for writable
+// execution-config surfaces (harness guard hook, cron/systemd, shell rc) and
+// freezes them immutable via the enforcer. The agent's uid/gid/HOME — needed for
+// the writability verdict and "~" expansion — are read from the init process's
+// /proc/<initPID>/{status,environ}. A scan error is fatal (the caller tears the
+// container down); an individual non-existent surface is skipped inside Scan.
+func (d *DockerRuntime) freezeExecConfig(ctx context.Context, containerID string, initPID uint32) error {
+	root := fmt.Sprintf("/proc/%d/root", initPID)
+	uid, gid := procUIDGID(initPID)
+	home := procHome(initPID)
+
+	scan := d.scanExecConfig
+	if scan == nil {
+		scan = harness.Scan
+	}
+	findings, err := scan(harness.Options{
+		Root:     root,
+		Home:     home,
+		AgentUID: uid,
+		AgentGID: gid,
+	})
+	if err != nil {
+		return fmt.Errorf("scan %s: %w", root, err)
+	}
+
+	var paths []string
+	for _, f := range findings {
+		if !f.Writable {
+			continue // freeze only the agent-writable surfaces (the actual risks)
+		}
+		// Strip the /proc/<pid>/root prefix so the enforcer re-resolves the path
+		// in its own view of the same mount namespace.
+		paths = append(paths, strings.TrimPrefix(f.Path, root))
+	}
+	if len(paths) == 0 {
+		d.logger.Info("no writable execution-config to freeze", zap.String("id", containerID))
+		return nil
+	}
+
+	if err := d.strategy.SetImmutable(ctx, containerID, paths, true); err != nil {
+		return err
+	}
+	d.logger.Info("execution-config frozen immutable",
+		zap.String("id", containerID),
+		zap.Int("count", len(paths)),
+	)
+	return nil
+}
+
+// procUIDGID reads the real uid/gid of a process from /proc/<pid>/status.
+// Returns (0,0) when unreadable; harness.writableBy then treats owner-writable
+// surfaces conservatively.
+func procUIDGID(pid uint32) (int, int) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		return 0, 0
+	}
+	uid, gid := 0, 0
+	for _, line := range strings.Split(string(data), "\n") {
+		if rest, ok := strings.CutPrefix(line, "Uid:"); ok {
+			uid = firstIntField(rest)
+		} else if rest, ok := strings.CutPrefix(line, "Gid:"); ok {
+			gid = firstIntField(rest)
+		}
+	}
+	return uid, gid
+}
+
+// procHome reads HOME from a process's environment (/proc/<pid>/environ, a
+// NUL-delimited list). Returns "" if unset, in which case harness.Scan skips
+// user-scoped ("~/") entries. The value is namespace-relative (e.g. "/home/node"),
+// exactly what harness.Options.Home expects.
+func procHome(pid uint32) string {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
+	if err != nil {
+		return ""
+	}
+	for _, kv := range strings.Split(string(data), "\x00") {
+		if v, ok := strings.CutPrefix(kv, "HOME="); ok {
+			return v
+		}
+	}
+	return ""
+}
+
+// firstIntField parses the first whitespace-separated field of s as an int.
+func firstIntField(s string) int {
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return 0
+	}
+	n, _ := strconv.Atoi(fields[0])
+	return n
 }
 
 // Stop gracefully stops the container, waits for the stop timeout, then removes it.

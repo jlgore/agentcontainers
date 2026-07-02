@@ -36,6 +36,7 @@ const (
 	Enforcer_ListComponents_FullMethodName        = "/agentcontainers.enforcer.v1.Enforcer/ListComponents"
 	Enforcer_ListTools_FullMethodName             = "/agentcontainers.enforcer.v1.Enforcer/ListTools"
 	Enforcer_CallTool_FullMethodName              = "/agentcontainers.enforcer.v1.Enforcer/CallTool"
+	Enforcer_SetImmutable_FullMethodName          = "/agentcontainers.enforcer.v1.Enforcer/SetImmutable"
 )
 
 // EnforcerClient is the client API for Enforcer service.
@@ -68,6 +69,14 @@ type EnforcerClient interface {
 	// Tool invocation.
 	ListTools(ctx context.Context, in *ListToolsRequest, opts ...grpc.CallOption) (*ListToolsResponse, error)
 	CallTool(ctx context.Context, in *CallToolRequest, opts ...grpc.CallOption) (*CallToolResponse, error)
+	// Freeze (or unfreeze) execution-config files inside the agent's mount
+	// namespace by setting the immutable inode flag (chattr +i). Auto-invoked by
+	// the run flow after secret injection to lock the harness guard hook, cron/
+	// systemd, and shell rc the agent could otherwise rewrite to run code out-of-
+	// band or disable its own guard. Runs in the same /proc/<init_pid>/root
+	// namespace as InjectSecrets; the enforcer holds CAP_LINUX_IMMUTABLE.
+	// Declared last so adding it does not renumber the generated method table.
+	SetImmutable(ctx context.Context, in *SetImmutableRequest, opts ...grpc.CallOption) (*SetImmutableResponse, error)
 }
 
 type enforcerClient struct {
@@ -257,6 +266,16 @@ func (c *enforcerClient) CallTool(ctx context.Context, in *CallToolRequest, opts
 	return out, nil
 }
 
+func (c *enforcerClient) SetImmutable(ctx context.Context, in *SetImmutableRequest, opts ...grpc.CallOption) (*SetImmutableResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetImmutableResponse)
+	err := c.cc.Invoke(ctx, Enforcer_SetImmutable_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // EnforcerServer is the server API for Enforcer service.
 // All implementations must embed UnimplementedEnforcerServer
 // for forward compatibility.
@@ -287,6 +306,14 @@ type EnforcerServer interface {
 	// Tool invocation.
 	ListTools(context.Context, *ListToolsRequest) (*ListToolsResponse, error)
 	CallTool(context.Context, *CallToolRequest) (*CallToolResponse, error)
+	// Freeze (or unfreeze) execution-config files inside the agent's mount
+	// namespace by setting the immutable inode flag (chattr +i). Auto-invoked by
+	// the run flow after secret injection to lock the harness guard hook, cron/
+	// systemd, and shell rc the agent could otherwise rewrite to run code out-of-
+	// band or disable its own guard. Runs in the same /proc/<init_pid>/root
+	// namespace as InjectSecrets; the enforcer holds CAP_LINUX_IMMUTABLE.
+	// Declared last so adding it does not renumber the generated method table.
+	SetImmutable(context.Context, *SetImmutableRequest) (*SetImmutableResponse, error)
 	mustEmbedUnimplementedEnforcerServer()
 }
 
@@ -347,6 +374,9 @@ func (UnimplementedEnforcerServer) ListTools(context.Context, *ListToolsRequest)
 }
 func (UnimplementedEnforcerServer) CallTool(context.Context, *CallToolRequest) (*CallToolResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CallTool not implemented")
+}
+func (UnimplementedEnforcerServer) SetImmutable(context.Context, *SetImmutableRequest) (*SetImmutableResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SetImmutable not implemented")
 }
 func (UnimplementedEnforcerServer) mustEmbedUnimplementedEnforcerServer() {}
 func (UnimplementedEnforcerServer) testEmbeddedByValue()                  {}
@@ -668,6 +698,24 @@ func _Enforcer_CallTool_Handler(srv interface{}, ctx context.Context, dec func(i
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Enforcer_SetImmutable_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetImmutableRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EnforcerServer).SetImmutable(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Enforcer_SetImmutable_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EnforcerServer).SetImmutable(ctx, req.(*SetImmutableRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Enforcer_ServiceDesc is the grpc.ServiceDesc for Enforcer service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -738,6 +786,10 @@ var Enforcer_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CallTool",
 			Handler:    _Enforcer_CallTool_Handler,
+		},
+		{
+			MethodName: "SetImmutable",
+			Handler:    _Enforcer_SetImmutable_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

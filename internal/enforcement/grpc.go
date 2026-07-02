@@ -529,6 +529,28 @@ func (s *GRPCStrategy) InjectSecrets(ctx context.Context, containerID string, re
 	return nil
 }
 
+// SetImmutable freezes (on=true) or unfreezes (on=false) the given
+// agent-namespace paths via the enforcer sidecar, which sets FS_IMMUTABLE_FL on
+// /proc/<init_pid>/root<path> for each. A path that does not exist in the agent
+// image is skipped by the enforcer, not an error.
+func (s *GRPCStrategy) SetImmutable(ctx context.Context, containerID string, paths []string, on bool) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	resp, err := s.client.SetImmutable(ctx, &enforcerapi.SetImmutableRequest{
+		ContainerId: containerID,
+		Paths:       paths,
+		Immutable:   on,
+	})
+	if err != nil {
+		return fmt.Errorf("grpc strategy: set immutable: %w", err)
+	}
+	if !resp.GetSuccess() {
+		return fmt.Errorf("grpc strategy: set immutable failed: %s", resp.GetError())
+	}
+	return nil
+}
+
 // Events returns the audit event channel for the given container.
 func (s *GRPCStrategy) Events(containerID string) <-chan Event {
 	s.mu.Lock()

@@ -2319,6 +2319,132 @@ func (x *CallToolResponse) GetFuelConsumed() uint64 {
 	return 0
 }
 
+type SetImmutableRequest struct {
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	ContainerId string                 `protobuf:"bytes,1,opt,name=container_id,json=containerId,proto3" json:"container_id,omitempty"`
+	// paths are absolute in the agent's mount namespace (e.g. "/etc/crontab",
+	// "/home/node/.bashrc"). The enforcer resolves each as
+	// /proc/<init_pid>/root<path>. A path that does not exist is skipped, not an
+	// error. Paths containing a ".." component are rejected.
+	Paths []string `protobuf:"bytes,2,rep,name=paths,proto3" json:"paths,omitempty"`
+	// immutable=true sets FS_IMMUTABLE_FL (freeze); false clears it (unfreeze),
+	// mirroring `ac harness protect`/`unprotect`.
+	Immutable     bool `protobuf:"varint,3,opt,name=immutable,proto3" json:"immutable,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetImmutableRequest) Reset() {
+	*x = SetImmutableRequest{}
+	mi := &file_enforcer_proto_msgTypes[38]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetImmutableRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetImmutableRequest) ProtoMessage() {}
+
+func (x *SetImmutableRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_enforcer_proto_msgTypes[38]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetImmutableRequest.ProtoReflect.Descriptor instead.
+func (*SetImmutableRequest) Descriptor() ([]byte, []int) {
+	return file_enforcer_proto_rawDescGZIP(), []int{38}
+}
+
+func (x *SetImmutableRequest) GetContainerId() string {
+	if x != nil {
+		return x.ContainerId
+	}
+	return ""
+}
+
+func (x *SetImmutableRequest) GetPaths() []string {
+	if x != nil {
+		return x.Paths
+	}
+	return nil
+}
+
+func (x *SetImmutableRequest) GetImmutable() bool {
+	if x != nil {
+		return x.Immutable
+	}
+	return false
+}
+
+type SetImmutableResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	Error         string                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	ChangedCount  uint32                 `protobuf:"varint,3,opt,name=changed_count,json=changedCount,proto3" json:"changed_count,omitempty"` // paths whose immutable bit actually changed
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetImmutableResponse) Reset() {
+	*x = SetImmutableResponse{}
+	mi := &file_enforcer_proto_msgTypes[39]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetImmutableResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetImmutableResponse) ProtoMessage() {}
+
+func (x *SetImmutableResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_enforcer_proto_msgTypes[39]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetImmutableResponse.ProtoReflect.Descriptor instead.
+func (*SetImmutableResponse) Descriptor() ([]byte, []int) {
+	return file_enforcer_proto_rawDescGZIP(), []int{39}
+}
+
+func (x *SetImmutableResponse) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+func (x *SetImmutableResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+func (x *SetImmutableResponse) GetChangedCount() uint32 {
+	if x != nil {
+		return x.ChangedCount
+	}
+	return 0
+}
+
 var File_enforcer_proto protoreflect.FileDescriptor
 
 const file_enforcer_proto_rawDesc = "" +
@@ -2493,7 +2619,15 @@ const file_enforcer_proto_rawDesc = "" +
 	"\vresult_json\x18\x03 \x01(\tR\n" +
 	"resultJson\x12*\n" +
 	"\x11execution_time_ns\x18\x04 \x01(\x04R\x0fexecutionTimeNs\x12#\n" +
-	"\rfuel_consumed\x18\x05 \x01(\x04R\ffuelConsumed2\x95\x10\n" +
+	"\rfuel_consumed\x18\x05 \x01(\x04R\ffuelConsumed\"l\n" +
+	"\x13SetImmutableRequest\x12!\n" +
+	"\fcontainer_id\x18\x01 \x01(\tR\vcontainerId\x12\x14\n" +
+	"\x05paths\x18\x02 \x03(\tR\x05paths\x12\x1c\n" +
+	"\timmutable\x18\x03 \x01(\bR\timmutable\"k\n" +
+	"\x14SetImmutableResponse\x12\x18\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error\x12#\n" +
+	"\rchanged_count\x18\x03 \x01(\rR\fchangedCount2\x8a\x11\n" +
 	"\bEnforcer\x12\x82\x01\n" +
 	"\x11RegisterContainer\x125.agentcontainers.enforcer.v1.RegisterContainerRequest\x1a6.agentcontainers.enforcer.v1.RegisterContainerResponse\x12\x88\x01\n" +
 	"\x13UnregisterContainer\x127.agentcontainers.enforcer.v1.UnregisterContainerRequest\x1a8.agentcontainers.enforcer.v1.UnregisterContainerResponse\x12|\n" +
@@ -2511,7 +2645,8 @@ const file_enforcer_proto_rawDesc = "" +
 	"\x0fUnloadComponent\x123.agentcontainers.enforcer.v1.UnloadComponentRequest\x1a4.agentcontainers.enforcer.v1.UnloadComponentResponse\x12y\n" +
 	"\x0eListComponents\x122.agentcontainers.enforcer.v1.ListComponentsRequest\x1a3.agentcontainers.enforcer.v1.ListComponentsResponse\x12j\n" +
 	"\tListTools\x12-.agentcontainers.enforcer.v1.ListToolsRequest\x1a..agentcontainers.enforcer.v1.ListToolsResponse\x12g\n" +
-	"\bCallTool\x12,.agentcontainers.enforcer.v1.CallToolRequest\x1a-.agentcontainers.enforcer.v1.CallToolResponseBKZIgithub.com/Kubedoll-Heavy-Industries/agentcontainers/internal/enforcerapib\x06proto3"
+	"\bCallTool\x12,.agentcontainers.enforcer.v1.CallToolRequest\x1a-.agentcontainers.enforcer.v1.CallToolResponse\x12s\n" +
+	"\fSetImmutable\x120.agentcontainers.enforcer.v1.SetImmutableRequest\x1a1.agentcontainers.enforcer.v1.SetImmutableResponseBKZIgithub.com/Kubedoll-Heavy-Industries/agentcontainers/internal/enforcerapib\x06proto3"
 
 var (
 	file_enforcer_proto_rawDescOnce sync.Once
@@ -2525,7 +2660,7 @@ func file_enforcer_proto_rawDescGZIP() []byte {
 	return file_enforcer_proto_rawDescData
 }
 
-var file_enforcer_proto_msgTypes = make([]protoimpl.MessageInfo, 39)
+var file_enforcer_proto_msgTypes = make([]protoimpl.MessageInfo, 41)
 var file_enforcer_proto_goTypes = []any{
 	(*RegisterContainerRequest)(nil),    // 0: agentcontainers.enforcer.v1.RegisterContainerRequest
 	(*RegisterContainerResponse)(nil),   // 1: agentcontainers.enforcer.v1.RegisterContainerResponse
@@ -2565,14 +2700,16 @@ var file_enforcer_proto_goTypes = []any{
 	(*ListToolsResponse)(nil),           // 35: agentcontainers.enforcer.v1.ListToolsResponse
 	(*CallToolRequest)(nil),             // 36: agentcontainers.enforcer.v1.CallToolRequest
 	(*CallToolResponse)(nil),            // 37: agentcontainers.enforcer.v1.CallToolResponse
-	nil,                                 // 38: agentcontainers.enforcer.v1.EnforcementEvent.DetailsEntry
+	(*SetImmutableRequest)(nil),         // 38: agentcontainers.enforcer.v1.SetImmutableRequest
+	(*SetImmutableResponse)(nil),        // 39: agentcontainers.enforcer.v1.SetImmutableResponse
+	nil,                                 // 40: agentcontainers.enforcer.v1.EnforcementEvent.DetailsEntry
 }
 var file_enforcer_proto_depIdxs = []int32{
 	9,  // 0: agentcontainers.enforcer.v1.PrepareToolCallRequest.transient_egress:type_name -> agentcontainers.enforcer.v1.EgressRule
 	9,  // 1: agentcontainers.enforcer.v1.NetworkPolicyRequest.egress_rules:type_name -> agentcontainers.enforcer.v1.EgressRule
 	12, // 2: agentcontainers.enforcer.v1.InjectSecretsRequest.secrets:type_name -> agentcontainers.enforcer.v1.SecretEntry
 	16, // 3: agentcontainers.enforcer.v1.CredentialPolicyRequest.secret_acls:type_name -> agentcontainers.enforcer.v1.SecretAcl
-	38, // 4: agentcontainers.enforcer.v1.EnforcementEvent.details:type_name -> agentcontainers.enforcer.v1.EnforcementEvent.DetailsEntry
+	40, // 4: agentcontainers.enforcer.v1.EnforcementEvent.details:type_name -> agentcontainers.enforcer.v1.EnforcementEvent.DetailsEntry
 	24, // 5: agentcontainers.enforcer.v1.LoadComponentRequest.policy:type_name -> agentcontainers.enforcer.v1.ComponentPolicy
 	25, // 6: agentcontainers.enforcer.v1.LoadComponentRequest.limits:type_name -> agentcontainers.enforcer.v1.ComponentLimits
 	26, // 7: agentcontainers.enforcer.v1.LoadComponentResponse.tools:type_name -> agentcontainers.enforcer.v1.ToolDefinition
@@ -2596,25 +2733,27 @@ var file_enforcer_proto_depIdxs = []int32{
 	31, // 25: agentcontainers.enforcer.v1.Enforcer.ListComponents:input_type -> agentcontainers.enforcer.v1.ListComponentsRequest
 	34, // 26: agentcontainers.enforcer.v1.Enforcer.ListTools:input_type -> agentcontainers.enforcer.v1.ListToolsRequest
 	36, // 27: agentcontainers.enforcer.v1.Enforcer.CallTool:input_type -> agentcontainers.enforcer.v1.CallToolRequest
-	1,  // 28: agentcontainers.enforcer.v1.Enforcer.RegisterContainer:output_type -> agentcontainers.enforcer.v1.RegisterContainerResponse
-	3,  // 29: agentcontainers.enforcer.v1.Enforcer.UnregisterContainer:output_type -> agentcontainers.enforcer.v1.UnregisterContainerResponse
-	5,  // 30: agentcontainers.enforcer.v1.Enforcer.PrepareToolCall:output_type -> agentcontainers.enforcer.v1.PrepareToolCallResponse
-	7,  // 31: agentcontainers.enforcer.v1.Enforcer.CompleteToolCall:output_type -> agentcontainers.enforcer.v1.CompleteToolCallResponse
-	19, // 32: agentcontainers.enforcer.v1.Enforcer.ApplyNetworkPolicy:output_type -> agentcontainers.enforcer.v1.PolicyResponse
-	19, // 33: agentcontainers.enforcer.v1.Enforcer.ApplyFilesystemPolicy:output_type -> agentcontainers.enforcer.v1.PolicyResponse
-	19, // 34: agentcontainers.enforcer.v1.Enforcer.ApplyProcessPolicy:output_type -> agentcontainers.enforcer.v1.PolicyResponse
-	19, // 35: agentcontainers.enforcer.v1.Enforcer.ApplyCredentialPolicy:output_type -> agentcontainers.enforcer.v1.PolicyResponse
-	14, // 36: agentcontainers.enforcer.v1.Enforcer.InjectSecrets:output_type -> agentcontainers.enforcer.v1.InjectSecretsResponse
-	18, // 37: agentcontainers.enforcer.v1.Enforcer.LoadPolicyBundle:output_type -> agentcontainers.enforcer.v1.LoadPolicyBundleResponse
-	21, // 38: agentcontainers.enforcer.v1.Enforcer.StreamEvents:output_type -> agentcontainers.enforcer.v1.EnforcementEvent
-	23, // 39: agentcontainers.enforcer.v1.Enforcer.GetStats:output_type -> agentcontainers.enforcer.v1.StatsResponse
-	28, // 40: agentcontainers.enforcer.v1.Enforcer.LoadComponent:output_type -> agentcontainers.enforcer.v1.LoadComponentResponse
-	30, // 41: agentcontainers.enforcer.v1.Enforcer.UnloadComponent:output_type -> agentcontainers.enforcer.v1.UnloadComponentResponse
-	33, // 42: agentcontainers.enforcer.v1.Enforcer.ListComponents:output_type -> agentcontainers.enforcer.v1.ListComponentsResponse
-	35, // 43: agentcontainers.enforcer.v1.Enforcer.ListTools:output_type -> agentcontainers.enforcer.v1.ListToolsResponse
-	37, // 44: agentcontainers.enforcer.v1.Enforcer.CallTool:output_type -> agentcontainers.enforcer.v1.CallToolResponse
-	28, // [28:45] is the sub-list for method output_type
-	11, // [11:28] is the sub-list for method input_type
+	38, // 28: agentcontainers.enforcer.v1.Enforcer.SetImmutable:input_type -> agentcontainers.enforcer.v1.SetImmutableRequest
+	1,  // 29: agentcontainers.enforcer.v1.Enforcer.RegisterContainer:output_type -> agentcontainers.enforcer.v1.RegisterContainerResponse
+	3,  // 30: agentcontainers.enforcer.v1.Enforcer.UnregisterContainer:output_type -> agentcontainers.enforcer.v1.UnregisterContainerResponse
+	5,  // 31: agentcontainers.enforcer.v1.Enforcer.PrepareToolCall:output_type -> agentcontainers.enforcer.v1.PrepareToolCallResponse
+	7,  // 32: agentcontainers.enforcer.v1.Enforcer.CompleteToolCall:output_type -> agentcontainers.enforcer.v1.CompleteToolCallResponse
+	19, // 33: agentcontainers.enforcer.v1.Enforcer.ApplyNetworkPolicy:output_type -> agentcontainers.enforcer.v1.PolicyResponse
+	19, // 34: agentcontainers.enforcer.v1.Enforcer.ApplyFilesystemPolicy:output_type -> agentcontainers.enforcer.v1.PolicyResponse
+	19, // 35: agentcontainers.enforcer.v1.Enforcer.ApplyProcessPolicy:output_type -> agentcontainers.enforcer.v1.PolicyResponse
+	19, // 36: agentcontainers.enforcer.v1.Enforcer.ApplyCredentialPolicy:output_type -> agentcontainers.enforcer.v1.PolicyResponse
+	14, // 37: agentcontainers.enforcer.v1.Enforcer.InjectSecrets:output_type -> agentcontainers.enforcer.v1.InjectSecretsResponse
+	18, // 38: agentcontainers.enforcer.v1.Enforcer.LoadPolicyBundle:output_type -> agentcontainers.enforcer.v1.LoadPolicyBundleResponse
+	21, // 39: agentcontainers.enforcer.v1.Enforcer.StreamEvents:output_type -> agentcontainers.enforcer.v1.EnforcementEvent
+	23, // 40: agentcontainers.enforcer.v1.Enforcer.GetStats:output_type -> agentcontainers.enforcer.v1.StatsResponse
+	28, // 41: agentcontainers.enforcer.v1.Enforcer.LoadComponent:output_type -> agentcontainers.enforcer.v1.LoadComponentResponse
+	30, // 42: agentcontainers.enforcer.v1.Enforcer.UnloadComponent:output_type -> agentcontainers.enforcer.v1.UnloadComponentResponse
+	33, // 43: agentcontainers.enforcer.v1.Enforcer.ListComponents:output_type -> agentcontainers.enforcer.v1.ListComponentsResponse
+	35, // 44: agentcontainers.enforcer.v1.Enforcer.ListTools:output_type -> agentcontainers.enforcer.v1.ListToolsResponse
+	37, // 45: agentcontainers.enforcer.v1.Enforcer.CallTool:output_type -> agentcontainers.enforcer.v1.CallToolResponse
+	39, // 46: agentcontainers.enforcer.v1.Enforcer.SetImmutable:output_type -> agentcontainers.enforcer.v1.SetImmutableResponse
+	29, // [29:47] is the sub-list for method output_type
+	11, // [11:29] is the sub-list for method input_type
 	11, // [11:11] is the sub-list for extension type_name
 	11, // [11:11] is the sub-list for extension extendee
 	0,  // [0:11] is the sub-list for field type_name
@@ -2631,7 +2770,7 @@ func file_enforcer_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_enforcer_proto_rawDesc), len(file_enforcer_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   39,
+			NumMessages:   41,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

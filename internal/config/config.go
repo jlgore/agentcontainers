@@ -111,6 +111,19 @@ type EnforcerConfig struct {
 	// boundary and eBPF is defense-in-depth, so leaving this unset preserves the
 	// existing behavior; setting it there is harmless (the VM is a bonus layer).
 	KernelPrimary bool `json:"kernelPrimary,omitempty"`
+
+	// FreezeConfig makes agentcontainer run automatically freeze the agent's
+	// writable execution-config immutable (chattr +i) inside its mount namespace
+	// during the paused enforcement bootstrap — the harness guard hook, cron/
+	// systemd, and shell rc it could otherwise rewrite to run code out-of-band or
+	// disable its own guard (the equivalent of `agentcontainer harness protect`,
+	// applied automatically via the enforcer sidecar).
+	//
+	// Opt-in (default false): a harness that legitimately rewrites its own user
+	// settings at runtime would be blocked by the immutable bit, so it is off
+	// until explicitly enabled. Docker/kernel-primary runtime only; the sandbox
+	// (VM) and compose runtimes ignore it for now.
+	FreezeConfig bool `json:"freezeConfig,omitempty"`
 }
 
 // Capabilities declares what the agent is allowed to do.

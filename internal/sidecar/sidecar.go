@@ -295,6 +295,10 @@ func StartSidecar(ctx context.Context, dockerClient client.APIClient, opts Start
 			// processes unless the caller holds CAP_SYS_PTRACE. Without it,
 			// injection fails with EACCES the moment it steps into the agent root.
 			"SYS_PTRACE",
+			// LINUX_IMMUTABLE lets the enforcer set/clear FS_IMMUTABLE_FL on the
+			// agent's execution-config (see grpc.rs SetImmutable). Without it the
+			// FS_IOC_SETFLAGS ioctl fails with EPERM.
+			"LINUX_IMMUTABLE",
 		},
 		PidMode: container.PidMode("host"),
 		Mounts: []mount.Mount{

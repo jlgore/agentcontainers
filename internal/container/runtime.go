@@ -113,6 +113,13 @@ type StartOptions struct {
 	// ServiceAuthConfig on the VMCreateRequest. Keyed by secret name.
 	ResolvedSecrets map[string]*secrets.Secret
 
+	// FreezeConfig, when true, makes the enforcing runtime freeze the agent's
+	// writable execution-config (harness guard hook, cron/systemd, shell rc)
+	// immutable inside its mount namespace during the paused enforcement
+	// bootstrap, before the agent runs — closing the self-rewrite escape without
+	// a manual `harness protect`. Docker/kernel-primary runtime only for now.
+	FreezeConfig bool
+
 	// PinnedImageRef is a content-addressed reference (image:tag@sha256:...)
 	// derived from the lockfile. When set, the runtime MUST use this reference
 	// for the image pull instead of cfg.Image, preventing TOCTOU tag-swap

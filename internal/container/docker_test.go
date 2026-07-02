@@ -883,6 +883,9 @@ func (m *mockStrategy) Remove(_ context.Context, _ string) error { return nil }
 func (m *mockStrategy) InjectSecrets(_ context.Context, _ string, _ map[string]*secrets.Secret) error {
 	return nil
 }
+func (m *mockStrategy) SetImmutable(_ context.Context, _ string, _ []string, _ bool) error {
+	return nil
+}
 func (m *mockStrategy) Events(_ string) <-chan enforcement.Event { return nil }
 func (m *mockStrategy) Level() enforcement.Level                 { return m.level }
 

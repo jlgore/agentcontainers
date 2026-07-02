@@ -38,6 +38,15 @@ service Enforcer {
   // Tool invocation.
   rpc ListTools(ListToolsRequest) returns (ListToolsResponse);
   rpc CallTool(CallToolRequest) returns (CallToolResponse);
+
+  // Freeze (or unfreeze) execution-config files inside the agent's mount
+  // namespace by setting the immutable inode flag (chattr +i). Auto-invoked by
+  // the run flow after secret injection to lock the harness guard hook, cron/
+  // systemd, and shell rc the agent could otherwise rewrite to run code out-of-
+  // band or disable its own guard. Runs in the same /proc/<init_pid>/root
+  // namespace as InjectSecrets; the enforcer holds CAP_LINUX_IMMUTABLE.
+  // Declared last so adding it does not renumber the generated method table.
+  rpc SetImmutable(SetImmutableRequest) returns (SetImmutableResponse);
 }
 
 // --- Container lifecycle ---
@@ -317,4 +326,26 @@ message CallToolResponse {
   string result_json = 3;          // JSON-encoded result
   uint64 execution_time_ns = 4;    // Wall-clock execution time
   uint64 fuel_consumed = 5;        // Instructions consumed
+}
+
+// --- Immutable execution-config (harness freeze) ---
+// Defined at the end of the file so inserting these messages does not renumber
+// the generated msgType indices of the messages above.
+
+message SetImmutableRequest {
+  string container_id = 1;
+  // paths are absolute in the agent's mount namespace (e.g. "/etc/crontab",
+  // "/home/node/.bashrc"). The enforcer resolves each as
+  // /proc/<init_pid>/root<path>. A path that does not exist is skipped, not an
+  // error. Paths containing a ".." component are rejected.
+  repeated string paths = 2;
+  // immutable=true sets FS_IMMUTABLE_FL (freeze); false clears it (unfreeze),
+  // mirroring `ac harness protect`/`unprotect`.
+  bool immutable = 3;
+}
+
+message SetImmutableResponse {
+  bool success = 1;
+  string error = 2;
+  uint32 changed_count = 3;  // paths whose immutable bit actually changed
 }

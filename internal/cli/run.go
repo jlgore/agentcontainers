@@ -372,6 +372,11 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 		// and to Sandbox for CredentialSources/ServiceAuthConfig.
 		opts.ResolvedSecrets = secretsMgr.CachedSecrets()
 	}
+	if cfg.Agent != nil && cfg.Agent.Enforcer != nil {
+		// Freeze the agent's writable execution-config immutable during the
+		// enforcement bootstrap (Docker/kernel-primary runtime). Opt-in.
+		opts.FreezeConfig = cfg.Agent.Enforcer.FreezeConfig
+	}
 
 	// 7. Start the container.
 	ctx, cancel := context.WithCancel(cmd.Context())

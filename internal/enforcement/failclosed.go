@@ -42,6 +42,11 @@ func (s *FailClosedStrategy) InjectSecrets(_ context.Context, _ string, _ map[st
 	return errors.New("enforcement: not available: cannot inject secrets (fail-closed)")
 }
 
+// SetImmutable returns an error because no enforcement mechanism is available.
+func (s *FailClosedStrategy) SetImmutable(_ context.Context, _ string, _ []string, _ bool) error {
+	return errors.New("enforcement: not available: cannot freeze execution-config (fail-closed)")
+}
+
 // Events returns nil because there is no enforcement to emit events.
 func (s *FailClosedStrategy) Events(_ string) <-chan Event {
 	return nil

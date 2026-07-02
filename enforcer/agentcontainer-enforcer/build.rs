@@ -1,6 +1,12 @@
 use anyhow::Context as _;
 
 fn main() -> anyhow::Result<()> {
+    // Regenerate the gRPC bindings whenever the proto changes. Without this,
+    // cargo caches each build unit's build-script output and a proto edit can
+    // silently leave some units (e.g. `cargo test` vs `cargo check`) compiling
+    // against stale generated code.
+    println!("cargo:rerun-if-changed=proto/enforcer.proto");
+
     // Compile protobuf definitions for the gRPC service.
     tonic_prost_build::compile_protos("proto/enforcer.proto")?;
 

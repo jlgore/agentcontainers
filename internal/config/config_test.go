@@ -1757,6 +1757,42 @@ func TestParse_EnforcerKernelPrimary(t *testing.T) {
 	}
 }
 
+func TestParse_EnforcerFreezeConfig(t *testing.T) {
+	// Default: absent → false (opt-in).
+	var base AgentContainer
+	if err := json.Unmarshal([]byte(`{"name":"t","image":"alpine:3","agent":{"enforcer":{}}}`), &base); err != nil {
+		t.Fatalf("Unmarshal() error: %v", err)
+	}
+	if base.Agent.Enforcer.FreezeConfig {
+		t.Error("FreezeConfig should default to false when absent")
+	}
+
+	// Explicit opt-in parses and round-trips.
+	raw := `{"name":"t","image":"alpine:3","agent":{"enforcer":{"freezeConfig":true}}}`
+	var cfg AgentContainer
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		t.Fatalf("Unmarshal() error: %v", err)
+	}
+	if !cfg.Agent.Enforcer.FreezeConfig {
+		t.Fatal("FreezeConfig = false, want true")
+	}
+
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("Marshal() error: %v", err)
+	}
+	var cfg2 AgentContainer
+	if err := json.Unmarshal(data, &cfg2); err != nil {
+		t.Fatalf("round-trip Unmarshal() error: %v", err)
+	}
+	if !cfg2.Agent.Enforcer.FreezeConfig {
+		t.Error("round-trip FreezeConfig = false, want true")
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate() unexpected error: %v", err)
+	}
+}
+
 func TestValidate_FromTestdata(t *testing.T) {
 	tests := []struct {
 		name    string

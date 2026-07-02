@@ -1228,6 +1228,10 @@ func (m *mockSandboxStrategy) InjectSecrets(_ context.Context, _ string, _ map[s
 	return nil
 }
 
+func (m *mockSandboxStrategy) SetImmutable(_ context.Context, _ string, _ []string, _ bool) error {
+	return nil
+}
+
 func (m *mockSandboxStrategy) Events(containerID string) <-chan enforcement.Event {
 	if m.eventsCh != nil {
 		return m.eventsCh

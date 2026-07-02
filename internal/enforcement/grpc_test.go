@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,8 +32,11 @@ type mockEnforcerServer struct {
 	failProcessPolicy     bool
 	failCredentialPolicy  bool
 	failInjectSecrets     bool
+	setImmutableCalled    bool
+	failSetImmutable      bool
 	lastCredentialRequest *enforcerapi.CredentialPolicyRequest
 	lastInjectRequest     *enforcerapi.InjectSecretsRequest
+	lastSetImmutableReq   *enforcerapi.SetImmutableRequest
 	events                []*enforcerapi.EnforcementEvent
 	lsmActive             bool
 	lsmDetail             string
@@ -116,6 +120,21 @@ func (m *mockEnforcerServer) InjectSecrets(ctx context.Context, req *enforcerapi
 	return &enforcerapi.InjectSecretsResponse{
 		Success:       true,
 		InjectedCount: uint32(len(req.GetSecrets())),
+	}, nil
+}
+
+func (m *mockEnforcerServer) SetImmutable(ctx context.Context, req *enforcerapi.SetImmutableRequest) (*enforcerapi.SetImmutableResponse, error) {
+	m.setImmutableCalled = true
+	m.lastSetImmutableReq = req
+	if m.failSetImmutable {
+		return &enforcerapi.SetImmutableResponse{
+			Success: false,
+			Error:   "set immutable error",
+		}, nil
+	}
+	return &enforcerapi.SetImmutableResponse{
+		Success:      true,
+		ChangedCount: uint32(len(req.GetPaths())),
 	}, nil
 }
 
@@ -667,6 +686,51 @@ func TestGRPCStrategy_Update_CredentialPolicyError(t *testing.T) {
 	}
 	if !mock.processCalled {
 		t.Error("ApplyProcessPolicy was not called")
+	}
+}
+
+func TestGRPCStrategy_SetImmutable(t *testing.T) {
+	mock := &mockEnforcerServer{}
+	server, listener := setupMockServer(mock)
+	defer server.Stop()
+
+	strategy := newTestGRPCStrategy(t, listener)
+	defer strategy.Close() //nolint:errcheck
+
+	paths := []string{"/etc/crontab", "/home/node/.bashrc"}
+	if err := strategy.SetImmutable(context.Background(), "c1", paths, true); err != nil {
+		t.Fatalf("SetImmutable() error = %v", err)
+	}
+	if !mock.setImmutableCalled {
+		t.Fatal("SetImmutable was not called on the server")
+	}
+	if got := mock.lastSetImmutableReq; got == nil ||
+		got.GetContainerId() != "c1" || !got.GetImmutable() ||
+		strings.Join(got.GetPaths(), ",") != strings.Join(paths, ",") {
+		t.Errorf("server got %+v, want container c1, immutable=true, paths=%v", got, paths)
+	}
+
+	// Empty path list is a no-op that never hits the wire.
+	mock.setImmutableCalled = false
+	if err := strategy.SetImmutable(context.Background(), "c1", nil, true); err != nil {
+		t.Fatalf("SetImmutable(nil) error = %v", err)
+	}
+	if mock.setImmutableCalled {
+		t.Error("SetImmutable with no paths must not call the server")
+	}
+}
+
+func TestGRPCStrategy_SetImmutable_Failure(t *testing.T) {
+	mock := &mockEnforcerServer{failSetImmutable: true}
+	server, listener := setupMockServer(mock)
+	defer server.Stop()
+
+	strategy := newTestGRPCStrategy(t, listener)
+	defer strategy.Close() //nolint:errcheck
+
+	err := strategy.SetImmutable(context.Background(), "c1", []string{"/etc/crontab"}, true)
+	if err == nil {
+		t.Fatal("SetImmutable() expected error when server reports success=false, got nil")
 	}
 }
 

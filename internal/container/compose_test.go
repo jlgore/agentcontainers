@@ -436,6 +436,9 @@ func (s *composeTestStrategy) Remove(_ context.Context, containerID string) erro
 func (s *composeTestStrategy) InjectSecrets(_ context.Context, _ string, _ map[string]*secrets.Secret) error {
 	return nil
 }
+func (s *composeTestStrategy) SetImmutable(_ context.Context, _ string, _ []string, _ bool) error {
+	return nil
+}
 func (s *composeTestStrategy) Events(_ string) <-chan enforcement.Event { return nil }
 func (s *composeTestStrategy) Level() enforcement.Level                 { return s.level }
 

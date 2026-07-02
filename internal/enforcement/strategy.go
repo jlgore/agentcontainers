@@ -49,6 +49,13 @@ type Strategy interface {
 	// enforcer writes each value to /run/secrets/<name>.
 	InjectSecrets(ctx context.Context, containerID string, resolved map[string]*secrets.Secret) error
 
+	// SetImmutable sets (on=true) or clears (on=false) the immutable inode flag
+	// on the given agent-namespace paths via the enforcer, freezing the agent's
+	// execution-config (harness guard hook, cron/systemd, shell rc) so it cannot
+	// rewrite them to run code out-of-band or disable its own guard. Paths are
+	// absolute in the agent's mount namespace; a non-existent path is skipped.
+	SetImmutable(ctx context.Context, containerID string, paths []string, on bool) error
+
 	// Events returns an audit event channel, or nil if the strategy
 	// doesn't support event streaming.
 	Events(containerID string) <-chan Event

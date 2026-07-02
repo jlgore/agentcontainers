@@ -769,3 +769,119 @@ async fn test_inject_secrets_chowns_to_agent_uid() {
         "agent (uid 1000) should read its secret"
     );
 }
+
+/// SetImmutable freezes an agent-writable execution-config file inside the
+/// agent's mount namespace so the agent (uid 1000, no CAP_LINUX_IMMUTABLE)
+/// can no longer rewrite it — the automated equivalent of `harness protect`.
+/// Proven by behavior: a write that succeeds before the freeze is blocked after
+/// it, and unfreezing restores writability.
+#[tokio::test]
+#[serial]
+async fn test_set_immutable_blocks_agent_write() {
+    let (container, uri) = start_enforcer().await;
+    let mut client = connect_with_retry(&uri).await;
+
+    // A long-lived uid-1000 process whose /proc/<pid>/root is the container root.
+    let pid_str = exec_stdout(
+        &container,
+        &[
+            "sh",
+            "-c",
+            "setpriv --reuid=1000 --regid=1000 --clear-groups sleep 300 >/dev/null 2>&1 & echo $!",
+        ],
+    )
+    .await;
+    let init_pid: u32 = pid_str
+        .parse()
+        .unwrap_or_else(|_| panic!("expected a PID, got {pid_str:?}"));
+
+    // A target the agent owns and can write: /workspace/.bashrc.
+    exec_stdout(
+        &container,
+        &[
+            "sh",
+            "-c",
+            "mkdir -p /workspace && echo original > /workspace/.bashrc && chown -R 1000:1000 /workspace",
+        ],
+    )
+    .await;
+
+    // Helper: attempt a write as uid 1000, reporting WROTE or BLOCKED.
+    let write_probe = [
+        "setpriv",
+        "--reuid=1000",
+        "--regid=1000",
+        "--clear-groups",
+        "sh",
+        "-c",
+        "echo mutated > /workspace/.bashrc && echo WROTE || echo BLOCKED",
+    ];
+
+    // Before freezing, the agent can write it.
+    assert_eq!(
+        exec_stdout(&container, &write_probe).await,
+        "WROTE",
+        "agent should be able to write its own config before freeze"
+    );
+
+    client
+        .register_container(RegisterContainerRequest {
+            container_id: "test-immutable".into(),
+            cgroup_path: CONTAINER_CGROUP_PATH.into(),
+            init_pid,
+        })
+        .await
+        .expect("register failed");
+
+    // Freeze it. changed_count == 1 (one existing surface flipped).
+    let resp = client
+        .set_immutable(SetImmutableRequest {
+            container_id: "test-immutable".into(),
+            paths: vec!["/workspace/.bashrc".into()],
+            immutable: true,
+        })
+        .await
+        .expect("set_immutable(true) RPC failed")
+        .into_inner();
+    assert!(resp.success, "set_immutable should succeed: {}", resp.error);
+    assert_eq!(resp.changed_count, 1, "exactly one surface frozen");
+
+    // The immutable bit now blocks the write (chattr +i denies even the owner).
+    assert_eq!(
+        exec_stdout(&container, &write_probe).await,
+        "BLOCKED",
+        "frozen config must not be writable by the agent"
+    );
+
+    // Idempotent re-freeze changes nothing.
+    let resp2 = client
+        .set_immutable(SetImmutableRequest {
+            container_id: "test-immutable".into(),
+            paths: vec!["/workspace/.bashrc".into()],
+            immutable: true,
+        })
+        .await
+        .expect("re-freeze RPC failed")
+        .into_inner();
+    assert_eq!(
+        resp2.changed_count, 0,
+        "already-frozen surface must not re-change"
+    );
+
+    // Unfreeze restores writability.
+    let resp3 = client
+        .set_immutable(SetImmutableRequest {
+            container_id: "test-immutable".into(),
+            paths: vec!["/workspace/.bashrc".into()],
+            immutable: false,
+        })
+        .await
+        .expect("set_immutable(false) RPC failed")
+        .into_inner();
+    assert_eq!(resp3.changed_count, 1, "exactly one surface unfrozen");
+    assert_eq!(
+        exec_stdout(&container, &write_probe).await,
+        "WROTE",
+        "agent should be able to write again after unfreeze"
+    );
+}

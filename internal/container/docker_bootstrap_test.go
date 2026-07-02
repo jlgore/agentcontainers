@@ -12,6 +12,7 @@ import (
 
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/config"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/enforcement"
+	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/harness"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/policy"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/secrets"
 )
@@ -68,9 +69,10 @@ func (c *recordingDockerClient) ContainerRemove(_ context.Context, _ string, _ c
 // recordingStrategy records its enforcement calls into the same slice as the
 // docker client, and can be configured to fail at a chosen stage.
 type recordingStrategy struct {
-	rec     *[]string
-	failAt  string // "base", "inject", "acl", or ""
-	removed bool
+	rec        *[]string
+	failAt     string // "base", "inject", "acl", "freeze", or ""
+	removed    bool
+	freezePath []string // paths passed to the last SetImmutable call
 }
 
 func (s *recordingStrategy) record(stage string) error {
@@ -92,6 +94,10 @@ func (s *recordingStrategy) ApplyCredentialACLs(_ context.Context, _ string, _ *
 }
 func (s *recordingStrategy) InjectSecrets(_ context.Context, _ string, _ map[string]*secrets.Secret) error {
 	return s.record("inject")
+}
+func (s *recordingStrategy) SetImmutable(_ context.Context, _ string, paths []string, _ bool) error {
+	s.freezePath = paths
+	return s.record("freeze")
 }
 func (s *recordingStrategy) Update(_ context.Context, _ string, _ *policy.ContainerPolicy) error {
 	return nil
@@ -206,4 +212,85 @@ func contains(xs []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// oneWritableScanner returns a scanner that reports a single agent-writable
+// surface at <root>/etc/crontab, plus a non-writable one that must be skipped.
+func oneWritableScanner() func(harness.Options) ([]harness.Finding, error) {
+	return func(o harness.Options) ([]harness.Finding, error) {
+		return []harness.Finding{
+			{Path: o.Root + "/etc/crontab", Category: harness.CategoryScheduler, Writable: true},
+			{Path: o.Root + "/etc/profile", Category: harness.CategoryShellRC, Writable: false},
+		}, nil
+	}
+}
+
+// TestDockerStart_FreezeConfigOn asserts that with FreezeConfig the writable
+// execution-config is frozen after credential ACLs and before unpause, and the
+// enforcer receives the namespace-relative path (the /proc/<pid>/root prefix
+// stripped) — not the non-writable surface.
+func TestDockerStart_FreezeConfigOn(t *testing.T) {
+	var rec []string
+	strat := &recordingStrategy{rec: &rec}
+	rt := bootstrapTestRuntime(&rec, strat, nil)
+	rt.scanExecConfig = oneWritableScanner()
+
+	cfg, opts := bootstrapStartOpts()
+	opts.FreezeConfig = true
+	if _, err := rt.Start(context.Background(), cfg, opts); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	want := []string{"start", "pause", "inspect", "base", "inject", "acl", "freeze", "unpause"}
+	if strings.Join(rec, ",") != strings.Join(want, ",") {
+		t.Fatalf("bootstrap order = %v, want %v", rec, want)
+	}
+	if len(strat.freezePath) != 1 || strat.freezePath[0] != "/etc/crontab" {
+		t.Errorf("froze %v, want exactly [/etc/crontab] (writable only, ns-relative)", strat.freezePath)
+	}
+}
+
+// TestDockerStart_FreezeConfigOff asserts the freeze step is skipped (and the
+// scanner never consulted) when FreezeConfig is unset — the default.
+func TestDockerStart_FreezeConfigOff(t *testing.T) {
+	var rec []string
+	strat := &recordingStrategy{rec: &rec}
+	rt := bootstrapTestRuntime(&rec, strat, nil)
+	scanned := false
+	rt.scanExecConfig = func(harness.Options) ([]harness.Finding, error) {
+		scanned = true
+		return nil, nil
+	}
+
+	cfg, opts := bootstrapStartOpts() // FreezeConfig defaults false
+	if _, err := rt.Start(context.Background(), cfg, opts); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if contains(rec, "freeze") {
+		t.Errorf("freeze must not run when FreezeConfig is off; got %v", rec)
+	}
+	if scanned {
+		t.Error("scanner must not be consulted when FreezeConfig is off")
+	}
+}
+
+// TestDockerStart_FreezeFailureTearsDown asserts a freeze failure is fatal: the
+// container is force-removed and never unpaused (fail-closed).
+func TestDockerStart_FreezeFailureTearsDown(t *testing.T) {
+	var rec []string
+	strat := &recordingStrategy{rec: &rec, failAt: "freeze"}
+	rt := bootstrapTestRuntime(&rec, strat, nil)
+	rt.scanExecConfig = oneWritableScanner()
+
+	cfg, opts := bootstrapStartOpts()
+	opts.FreezeConfig = true
+	if _, err := rt.Start(context.Background(), cfg, opts); err == nil {
+		t.Fatal("expected Start to fail when freeze fails")
+	}
+	if contains(rec, "unpause") {
+		t.Errorf("must never unpause on freeze failure; got %v", rec)
+	}
+	if !contains(rec, "remove") || !strat.removed {
+		t.Errorf("expected force-remove + enforcement removal on freeze failure; got %v", rec)
+	}
 }
