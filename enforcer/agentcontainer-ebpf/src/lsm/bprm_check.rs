@@ -13,8 +13,8 @@
 //! its executable identity is treated as a denial (fail-closed).
 
 use aya_ebpf::helpers::{
-    bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid,
-    bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel,
+    bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
+    bpf_probe_read_kernel,
 };
 use aya_ebpf::macros::lsm;
 use aya_ebpf::programs::LsmContext;
@@ -24,7 +24,7 @@ use agentcontainer_common::maps::{FsInodeKey, CGROUP_FLAG_EXEC_ENFORCED, LSM_ALL
 
 use crate::maps::{
     bump_cgroup_stat, ALLOWED_EXECS, CGROUP_STAT_PROC_ALLOWED, CGROUP_STAT_PROC_BLOCKED,
-    ENFORCED_CGROUPS, KERNEL_OFFSETS, PROC_EVENTS, PROC_STATS,
+    KERNEL_OFFSETS, PROC_EVENTS, PROC_STATS,
 };
 
 // ---------------------------------------------------------------------------
@@ -117,10 +117,11 @@ pub fn ac_bprm_check(ctx: LsmContext) -> i32 {
 
 fn try_bprm_check(ctx: &LsmContext) -> Result<i32, i64> {
     // 0. Cgroup scoping: only enforce for processes in target containers.
-    //    LSM hooks are system-wide; skip all non-container processes.
-    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
-    let flags = match unsafe { ENFORCED_CGROUPS.get(&cgroup_id) } {
-        Some(&f) => f,
+    //    LSM hooks are system-wide; skip all non-container processes. Subtree
+    //    match: `cgroup_id` is the enforced ANCESTOR (with its flags) when the
+    //    task was moved into a descendant cgroup, so exec enforcement follows.
+    let (cgroup_id, flags) = match crate::maps::enforced_cgroup_flags_for_current() {
+        Some(x) => x,
         None => return Ok(LSM_ALLOW),
     };
 

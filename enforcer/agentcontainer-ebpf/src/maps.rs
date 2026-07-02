@@ -26,20 +26,24 @@ pub static ENFORCED_CGROUPS: HashMap<u64, u8> = HashMap::with_max_entries(256, 0
 /// bound keeps the ancestor walk verifier-friendly.
 pub const MAX_CGROUP_DEPTH: i32 = 16;
 
-/// The enforced cgroup id governing the current task: its own cgroup if directly
-/// registered, otherwise the nearest ancestor present in `ENFORCED_CGROUPS`
-/// (SUBTREE match). Returning the registered ancestor means a task moved into a
-/// descendant cgroup — `mkdir <enforced>/x; echo $$ > x/cgroup.procs`, the
-/// Escape-the-Box T11 vector — stays governed by that ancestor's policy/stats
-/// instead of escaping enforcement. `None` when neither the task nor any
-/// ancestor is enforced.
+/// The enforced cgroup (id + its policy flags) governing the current task: its
+/// own cgroup if directly registered, otherwise the nearest ancestor present in
+/// `ENFORCED_CGROUPS` (SUBTREE match). Returning the registered ancestor means a
+/// task moved into a descendant cgroup — `mkdir <enforced>/x; echo $$ >
+/// x/cgroup.procs`, the Escape-the-Box T11 vector — stays governed by that
+/// ancestor's policy/stats/inode maps instead of escaping enforcement. `None`
+/// when neither the task nor any ancestor is enforced.
+///
+/// Perf: the fast path is one lookup for a directly-registered cgroup (the
+/// normal container case). Only tasks NOT directly enforced pay the bounded
+/// ancestor walk — including unenforced host processes on the system-wide LSM
+/// hooks. A future optimization is registering descendants at cgroup-creation
+/// time (a `cgroup_mkdir` hook) so the hot path stays a single lookup.
 #[inline(always)]
-pub fn enforced_cgroup_for_current() -> Option<u64> {
-    // Fast path: the task's own cgroup is the registered one (the normal
-    // container case) — one lookup, no walk.
+pub fn enforced_cgroup_flags_for_current() -> Option<(u64, u8)> {
     let cgid = unsafe { aya_ebpf::helpers::bpf_get_current_cgroup_id() };
-    if unsafe { ENFORCED_CGROUPS.get(&cgid) }.is_some() {
-        return Some(cgid);
+    if let Some(&flags) = unsafe { ENFORCED_CGROUPS.get(&cgid) } {
+        return Some((cgid, flags));
     }
     // Subtree walk: root (level 0) → self. `bpf_get_current_ancestor_cgroup_id`
     // returns 0 past the task's own depth, so break there.
@@ -48,11 +52,18 @@ pub fn enforced_cgroup_for_current() -> Option<u64> {
         if id == 0 {
             break;
         }
-        if unsafe { ENFORCED_CGROUPS.get(&id) }.is_some() {
-            return Some(id);
+        if let Some(&flags) = unsafe { ENFORCED_CGROUPS.get(&id) } {
+            return Some((id, flags));
         }
     }
     None
+}
+
+/// Id-only [`enforced_cgroup_flags_for_current`] for callers that don't read the
+/// per-cgroup policy flags (the egress and file hooks).
+#[inline(always)]
+pub fn enforced_cgroup_for_current() -> Option<u64> {
+    enforced_cgroup_flags_for_current().map(|(id, _)| id)
 }
 
 /// Kernel struct field byte-offsets, resolved from BTF and populated by

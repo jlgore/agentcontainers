@@ -1911,6 +1911,110 @@ fn exec_in_child(path: &std::ffi::CStr) -> i32 {
     }
 }
 
+/// Fork a child, move it into `cgroup_procs`'s cgroup, then have it execve
+/// `path` — so bprm_check evaluates the exec with the child in that (descendant)
+/// cgroup. Pipe-coordinated (child blocks until the parent has moved it): the
+/// child only does read/execve/_exit after fork (async-signal-safe); the parent
+/// does the cgroup write in normal context. Same 0/42/43 exit encoding as
+/// [`exec_in_child`].
+fn exec_in_moved_child(path: &std::ffi::CStr, cgroup_procs: &str) -> i32 {
+    let mut go = [0i32; 2];
+    unsafe {
+        assert_eq!(libc::pipe(go.as_mut_ptr()), 0);
+    }
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0, "fork failed");
+    if child == 0 {
+        unsafe {
+            libc::close(go[1]);
+            let mut b = [0u8; 1];
+            libc::read(go[0], b.as_mut_ptr() as *mut libc::c_void, 1);
+            let argv = [path.as_ptr(), std::ptr::null()];
+            let envp = [std::ptr::null()];
+            libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+            let e = *libc::__errno_location(); // only reached if execve failed
+            libc::_exit(if e == libc::EACCES { 42 } else { 43 });
+        }
+    }
+    // Parent: move the child into the target cgroup, then release it.
+    unsafe {
+        libc::close(go[0]);
+    }
+    let _ = std::fs::write(cgroup_procs, format!("{child}\n"));
+    unsafe {
+        libc::write(go[1], [1u8].as_ptr() as *const libc::c_void, 1);
+        libc::close(go[1]);
+    }
+    let mut wstatus = 0i32;
+    unsafe { libc::waitpid(child, &mut wstatus, 0) };
+    if libc::WIFEXITED(wstatus) {
+        libc::WEXITSTATUS(wstatus)
+    } else {
+        -1
+    }
+}
+
+/// LSM subtree proof: exec enforcement follows a task moved into a DESCENDANT of
+/// the enforced cgroup — the file/exec counterpart of
+/// `test_cgroup_move_escapes_egress_enforcement`. With `enforced_cgroup_flags_for_current`
+/// walking the ancestry, a child moved into a fresh child cgroup is still gated
+/// by bprm_check: a non-allowlisted binary is denied (EACCES) there, while an
+/// allowlisted one still runs (so it's real enforcement, not blanket denial).
+#[tokio::test]
+#[serial]
+async fn test_cgroup_move_does_not_escape_exec_enforcement() {
+    if skip_unless_lsm("test_cgroup_move_does_not_escape_exec_enforcement") {
+        return;
+    }
+    let true_bin = resolve_bin("/bin/true", "/usr/bin/true");
+    let false_bin = resolve_bin("/bin/false", "/usr/bin/false");
+
+    let mgr = BpfPolicyManager::new().expect("BPF programs should load");
+    let cgroup = own_cgroup_path();
+    mgr.register("test-cg-exec-escape", &cgroup, 0)
+        .await
+        .unwrap();
+    assert!(mgr.lsm_status().active, "BPF LSM not attached");
+
+    mgr.apply_process(
+        "test-cg-exec-escape",
+        &ProcessPolicy {
+            allowed_binaries: vec![true_bin.clone()],
+        },
+    )
+    .await
+    .unwrap();
+
+    let escape_cg = format!("{cgroup}/ac-exec-escape");
+    if std::fs::create_dir_all(&escape_cg).is_err() {
+        eprintln!("skipping exec-escape assertion: cannot create child cgroup under {cgroup}");
+        mgr.unregister("test-cg-exec-escape").await.unwrap();
+        return;
+    }
+    let procs = format!("{escape_cg}/cgroup.procs");
+
+    let denied = exec_in_moved_child(
+        &std::ffi::CString::new(false_bin.clone()).unwrap(),
+        &procs,
+    );
+    let allowed = exec_in_moved_child(&std::ffi::CString::new(true_bin.clone()).unwrap(), &procs);
+
+    let _ = std::fs::remove_dir(&escape_cg);
+    mgr.unregister("test-cg-exec-escape").await.unwrap();
+
+    // Subtree match: the descendant-cgroup exec of a non-allowlisted binary is
+    // denied at bprm_check (EACCES → 42), and the allowlisted one still runs (0).
+    assert_eq!(
+        denied, 42,
+        "non-allowlisted exec in a descendant cgroup was NOT denied (exit {denied}) — \
+         exec enforcement escaped via cgroup move"
+    );
+    assert_eq!(
+        allowed, 0,
+        "allowlisted exec in a descendant cgroup did not run (exit {allowed})"
+    );
+}
+
 /// C9 (hard boundary): with a non-empty exec allowlist applied, an execve of a
 /// NON-allowlisted binary is denied (EACCES) at the bprm_check LSM hook. Also
 /// asserts the BPF LSM actually attached (`lsm_status().active`) — the

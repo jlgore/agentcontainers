@@ -12,8 +12,8 @@
 //! Increments per-CPU stats on every decision.
 
 use aya_ebpf::helpers::{
-    bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid,
-    bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel,
+    bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
+    bpf_probe_read_kernel,
 };
 use aya_ebpf::macros::lsm;
 use aya_ebpf::programs::LsmContext;
@@ -31,8 +31,7 @@ use agentcontainer_common::maps::{
 use crate::maps::{
     bump_cgroup_stat, ACTIVE_TOOL, ALLOWED_INODES, CGROUP_STAT_CRED_ALLOWED,
     CGROUP_STAT_CRED_BLOCKED, CGROUP_STAT_FS_ALLOWED, CGROUP_STAT_FS_BLOCKED, CRED_EVENTS,
-    CRED_STATS, DENIED_INODES, ENFORCED_CGROUPS, FS_EVENTS, FS_STATS, KERNEL_OFFSETS, SECRET_ACLS,
-    SECRET_TOOL_ACLS,
+    CRED_STATS, DENIED_INODES, FS_EVENTS, FS_STATS, KERNEL_OFFSETS, SECRET_ACLS, SECRET_TOOL_ACLS,
 };
 
 // ---------------------------------------------------------------------------
@@ -233,12 +232,14 @@ pub fn ac_file_open(ctx: LsmContext) -> i32 {
 #[inline(always)]
 fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
     // 0. Cgroup scoping: only enforce for processes in target containers.
-    //    LSM hooks are system-wide; skip all non-container processes.
-    let cgid = unsafe { bpf_get_current_cgroup_id() };
-    let in_enforced = unsafe { ENFORCED_CGROUPS.get(&cgid) };
-    if in_enforced.is_none() {
-        return Ok(LSM_ALLOW);
-    }
+    //    LSM hooks are system-wide; skip all non-container processes. Subtree
+    //    match: `cgid` is the enforced ANCESTOR when the task was moved into a
+    //    descendant cgroup, so the per-cgroup inode maps (keyed by the registered
+    //    cgroup id) are consulted for the descendant too.
+    let cgid = match crate::maps::enforced_cgroup_for_current() {
+        Some(id) => id,
+        None => return Ok(LSM_ALLOW),
+    };
 
     // BTF-resolved field offsets. Absent means userspace failed to populate them;
     // file_open's error policy is fail-open (matches the `Err` arm below).
