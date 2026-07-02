@@ -150,15 +150,10 @@ func TestCedarMembershipReasons(t *testing.T) {
 	checkOn(caps, "ls", nil, false, "")
 }
 
-// TestCedarParity is the core gate for the Cedar-first migration: for a corpus
-// of commands, the embedded Cedar engine must reach the SAME verdict AND the
-// SAME reason set as the legacy OPA engine. Both legs always run in-process.
-func TestCedarParity(t *testing.T) {
+// TestCedarVerdicts is the core policy gate: for a corpus of commands, the
+// embedded Cedar engine must reach each command's expected verdict.
+func TestCedarVerdicts(t *testing.T) {
 	cp := compileCanonical(t, nil)
-	opa, err := NewEvaluator(t.Context(), "test-server", cp)
-	if err != nil {
-		t.Fatalf("NewEvaluator: %v", err)
-	}
 	cedar, err := NewCedarEvaluator(t.Context(), "test-server", cp)
 	if err != nil {
 		t.Fatalf("NewCedarEvaluator: %v", err)
@@ -186,24 +181,13 @@ func TestCedarParity(t *testing.T) {
 			}
 			input := buildTestInput(DecomposeCommand(cmd, defaultOutputFlags), activeCase, cwd)
 
-			opaDec, err := opa.Evaluate(t.Context(), input)
-			if err != nil {
-				t.Fatalf("opa Evaluate: %v", err)
-			}
-			if opaDec.Allowed != tc.expectAllowed() {
-				t.Fatalf("OPA allowed=%v want %v (reasons %v)", opaDec.Allowed, tc.expectAllowed(), opaDec.Reasons)
-			}
-
 			cedarDec, err := cedar.Evaluate(t.Context(), input)
 			if err != nil {
 				t.Fatalf("cedar Evaluate: %v", err)
 			}
-			if cedarDec.Allowed != opaDec.Allowed {
-				t.Errorf("VERDICT MISMATCH on %q: cedar allowed=%v opa allowed=%v (cedar %v / opa %v)",
-					strings.Join(cmd, " "), cedarDec.Allowed, opaDec.Allowed, cedarDec.Reasons, opaDec.Reasons)
-			}
-			if a, b := sortedCopy(cedarDec.Reasons), sortedCopy(opaDec.Reasons); !equalStrings(a, b) {
-				t.Errorf("REASON MISMATCH on %q:\n cedar: %v\n opa:   %v", strings.Join(cmd, " "), a, b)
+			if cedarDec.Allowed != tc.expectAllowed() {
+				t.Errorf("verdict on %q: cedar allowed=%v want %v (reasons %v)",
+					strings.Join(cmd, " "), cedarDec.Allowed, tc.expectAllowed(), cedarDec.Reasons)
 			}
 		})
 	}

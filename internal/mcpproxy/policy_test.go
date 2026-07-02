@@ -24,12 +24,12 @@ func compileCanonical(t *testing.T, cfgPolicy *config.MCPServerPolicy) *Compiled
 	return cp
 }
 
-func newCanonicalEvaluator(t *testing.T) *Evaluator {
+func newCanonicalEvaluator(t *testing.T) PolicyEngine {
 	t.Helper()
 	cp := compileCanonical(t, nil)
-	ev, err := NewEvaluator(t.Context(), "test-server", cp)
+	ev, err := NewCedarEvaluator(t.Context(), "test-server", cp)
 	if err != nil {
-		t.Fatalf("NewEvaluator: %v", err)
+		t.Fatalf("NewCedarEvaluator: %v", err)
 	}
 	return ev
 }
@@ -55,8 +55,8 @@ func TestCompile_PackageSelection(t *testing.T) {
 	if len(cp.PolicyPackages) != 8 {
 		t.Errorf("packages = %v, want 8 security packages", cp.PolicyPackages)
 	}
-	if _, ok := cp.Modules["decision.rego"]; !ok {
-		t.Error("decision.rego missing")
+	if cp.CedarPolicies == "" {
+		t.Error("CedarPolicies empty — compile emitted no policy set")
 	}
 
 	// shell + network policy adds the two native packages.
@@ -359,9 +359,9 @@ func TestCapabilitiesPackage(t *testing.T) {
 			{Binary: "find", DenyArgs: []string{"-exec", "-delete"}},
 		}},
 	})
-	ev, err := NewEvaluator(t.Context(), "test-server", cp)
+	ev, err := NewCedarEvaluator(t.Context(), "test-server", cp)
 	if err != nil {
-		t.Fatalf("NewEvaluator: %v", err)
+		t.Fatalf("NewCedarEvaluator: %v", err)
 	}
 	cwd, _ := os.Getwd()
 
@@ -418,9 +418,9 @@ func TestFilesystemPackage(t *testing.T) {
 	if !slicesContains(cp.PolicyPackages, "filesystem") {
 		t.Fatalf("packages = %v, want filesystem included", cp.PolicyPackages)
 	}
-	ev, err := NewEvaluator(t.Context(), "test-server", cp)
+	ev, err := NewCedarEvaluator(t.Context(), "test-server", cp)
 	if err != nil {
-		t.Fatalf("NewEvaluator: %v", err)
+		t.Fatalf("NewCedarEvaluator: %v", err)
 	}
 	cwd, _ := os.Getwd()
 

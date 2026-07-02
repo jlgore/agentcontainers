@@ -20,9 +20,9 @@ func evalDeniedBinary(t *testing.T, ceiling []string, override map[string]any) D
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
-	ev, err := NewEvaluator(t.Context(), "srv", cp)
+	ev, err := NewCedarEvaluator(t.Context(), "srv", cp)
 	if err != nil {
-		t.Fatalf("NewEvaluator: %v", err)
+		t.Fatalf("NewCedarEvaluator: %v", err)
 	}
 	ctx := map[string]any{"correlationId": "c1"}
 	if override != nil {

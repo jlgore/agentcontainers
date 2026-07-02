@@ -106,19 +106,25 @@ func waived(reason string, cleared map[string]struct{}) bool {
 	return false
 }
 
-// anySliceOfMaps coerces a []any of map[string]any (e.g. requested_uris).
+// anySliceOfMaps coerces requested_uris to []map[string]any. It accepts both
+// the native []map[string]any the proxy builds (extractRequestedURIs) and the
+// []any a JSON-decoded context carries — the OPA engine normalized these via
+// rego.EvalInput; the native Cedar evaluator must handle both directly.
 func anySliceOfMaps(v any) []map[string]any {
-	xs, ok := v.([]any)
-	if !ok {
+	switch xs := v.(type) {
+	case []map[string]any:
+		return xs
+	case []any:
+		out := make([]map[string]any, 0, len(xs))
+		for _, x := range xs {
+			if m, ok := x.(map[string]any); ok {
+				out = append(out, m)
+			}
+		}
+		return out
+	default:
 		return nil
 	}
-	out := make([]map[string]any, 0, len(xs))
-	for _, x := range xs {
-		if m, ok := x.(map[string]any); ok {
-			out = append(out, m)
-		}
-	}
-	return out
 }
 
 func str(v any) string {

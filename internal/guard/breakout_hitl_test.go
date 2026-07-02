@@ -58,9 +58,9 @@ func newBreakoutHITLService(t *testing.T, broker *approval.ToolCallBroker) *Serv
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
-	ev, err := mcpproxy.NewEvaluator(context.Background(), "agent", cp)
+	ev, err := mcpproxy.NewCedarEvaluator(context.Background(), "agent", cp)
 	if err != nil {
-		t.Fatalf("NewEvaluator: %v", err)
+		t.Fatalf("NewCedarEvaluator: %v", err)
 	}
 	return New(Options{Evaluator: ev, OutputFlags: cp.OutputFlags, Broker: broker})
 }

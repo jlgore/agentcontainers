@@ -22,9 +22,9 @@ func evalWithURIsPolicy(t *testing.T, cfgPolicy *config.MCPServerPolicy, request
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
-	ev, err := NewEvaluator(t.Context(), "srv", cp)
+	ev, err := NewCedarEvaluator(t.Context(), "srv", cp)
 	if err != nil {
-		t.Fatalf("NewEvaluator: %v", err)
+		t.Fatalf("NewCedarEvaluator: %v", err)
 	}
 	d, err := ev.Evaluate(t.Context(), map[string]any{
 		"server": "srv",

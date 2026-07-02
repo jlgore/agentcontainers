@@ -145,9 +145,9 @@ func evalBreakout(t *testing.T, eng PolicyEngine, cmd []string, outFlags []strin
 
 // TestBreakoutMatrixOracle is the Layer-1 deterministic gate for the breakout
 // experiment: every `score: oracle` case must reach its declared verdict through
-// the real guard evaluation path, AND the Cedar (default) and OPA engines must
-// agree on verdict and reasons. This locks in the headline test-5 result — an
-// allowlisted interpreter still cannot run inline code — model-free, on every PR.
+// the real guard evaluation path (embedded Cedar engine). This locks in the
+// headline test-5 result — an allowlisted interpreter still cannot run inline
+// code — model-free, on every PR.
 func TestBreakoutMatrixOracle(t *testing.T) {
 	fx := loadBreakoutFixture(t)
 	cp, outFlags := fx.compile(t)
@@ -155,10 +155,6 @@ func TestBreakoutMatrixOracle(t *testing.T) {
 	cedar, err := NewCedarEvaluator(t.Context(), "breakout", cp)
 	if err != nil {
 		t.Fatalf("NewCedarEvaluator: %v", err)
-	}
-	opa, err := NewEvaluator(t.Context(), "breakout", cp)
-	if err != nil {
-		t.Fatalf("NewEvaluator: %v", err)
 	}
 
 	oracleRan, sawTest5 := 0, false
@@ -181,21 +177,12 @@ func TestBreakoutMatrixOracle(t *testing.T) {
 
 		t.Run(tc.ID+"/"+tc.Name, func(t *testing.T) {
 			cAllow, cReasons := evalBreakout(t, cedar, tc.Command, outFlags)
-			oAllow, oReasons := evalBreakout(t, opa, tc.Command, outFlags)
 
 			// 1) Verdict must match the fixture's explicit expectation.
 			if cAllow != wantAllow {
 				t.Errorf("cedar allowed=%v want %v (reasons %v)", cAllow, wantAllow, cReasons)
 			}
-			// 2) Both engines must agree — the Cedar-first migration's core gate.
-			if cAllow != oAllow {
-				t.Errorf("ENGINE MISMATCH: cedar=%v opa=%v (cedar %v / opa %v)",
-					cAllow, oAllow, cReasons, oReasons)
-			}
-			if a, b := sortedCopy(cReasons), sortedCopy(oReasons); !equalStrings(a, b) {
-				t.Errorf("REASON MISMATCH:\n cedar: %v\n opa:   %v", a, b)
-			}
-			// 3) A deny must fire for the RIGHT mechanism, not incidentally.
+			// 2) A deny must fire for the RIGHT mechanism, not incidentally.
 			if !wantAllow && tc.ReasonContains != "" && !anyReasonContains(cReasons, tc.ReasonContains) {
 				t.Errorf("missing expected reason %q in %v", tc.ReasonContains, cReasons)
 			}
@@ -208,5 +195,5 @@ func TestBreakoutMatrixOracle(t *testing.T) {
 	if !sawTest5 {
 		t.Error("breakout matrix is missing the test-5 (interpreter-escape) oracle cases")
 	}
-	t.Logf("breakout oracle: %d score:oracle cases, both engines in agreement", oracleRan)
+	t.Logf("breakout oracle: %d score:oracle cases passed under Cedar", oracleRan)
 }

@@ -77,10 +77,9 @@ func (fx capabilityFixture) compile(t *testing.T) *CompiledPolicy {
 }
 
 // TestCapabilityMatrixOracle is the Layer-1 deterministic policy gate: every
-// case in the capability matrix must reach its declared verdict, AND the
-// embedded Cedar engine (default) and the legacy OPA engine must agree. This is
-// the proof that capabilities are allowed only explicitly — model-free and
-// engine-parity-checked, so it can gate every PR.
+// case in the capability matrix must reach its declared verdict through the
+// embedded Cedar engine. This is the proof that capabilities are allowed only
+// explicitly — model-free, so it can gate every PR.
 func TestCapabilityMatrixOracle(t *testing.T) {
 	fx := loadCapabilityFixture(t)
 	cp := fx.compile(t)
@@ -88,10 +87,6 @@ func TestCapabilityMatrixOracle(t *testing.T) {
 	cedar, err := NewCedarEvaluator(t.Context(), "test-server", cp)
 	if err != nil {
 		t.Fatalf("NewCedarEvaluator: %v", err)
-	}
-	opa, err := NewEvaluator(t.Context(), "test-server", cp)
-	if err != nil {
-		t.Fatalf("NewEvaluator: %v", err)
 	}
 
 	cwd, _ := os.Getwd()
@@ -110,24 +105,12 @@ func TestCapabilityMatrixOracle(t *testing.T) {
 			if err != nil {
 				t.Fatalf("cedar Evaluate: %v", err)
 			}
-			opaDec, err := opa.Evaluate(t.Context(), input)
-			if err != nil {
-				t.Fatalf("opa Evaluate: %v", err)
-			}
 
 			// 1) The verdict must match the fixture's explicit expectation.
 			if cedarDec.Allowed != wantAllow {
 				t.Errorf("cedar allowed=%v want %v (reasons %v)", cedarDec.Allowed, wantAllow, cedarDec.Reasons)
 			}
-			// 2) Both engines must agree — the Cedar-first migration's core gate.
-			if cedarDec.Allowed != opaDec.Allowed {
-				t.Errorf("ENGINE MISMATCH: cedar allowed=%v opa allowed=%v (cedar %v / opa %v)",
-					cedarDec.Allowed, opaDec.Allowed, cedarDec.Reasons, opaDec.Reasons)
-			}
-			if a, b := sortedCopy(cedarDec.Reasons), sortedCopy(opaDec.Reasons); !equalStrings(a, b) {
-				t.Errorf("REASON MISMATCH:\n cedar: %v\n opa:   %v", a, b)
-			}
-			// 3) A deny must fire for the RIGHT mechanism, not incidentally.
+			// 2) A deny must fire for the RIGHT mechanism, not incidentally.
 			if !wantAllow && tc.ReasonContains != "" {
 				if !anyReasonContains(cedarDec.Reasons, tc.ReasonContains) {
 					t.Errorf("missing expected reason %q in %v", tc.ReasonContains, cedarDec.Reasons)

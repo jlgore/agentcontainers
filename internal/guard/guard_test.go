@@ -22,7 +22,7 @@ func newTestService(t *testing.T, broker *approval.ToolCallBroker) *Service {
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
-	ev, err := mcpproxy.NewEvaluator(context.Background(), "agent", cp)
+	ev, err := mcpproxy.NewCedarEvaluator(context.Background(), "agent", cp)
 	if err != nil {
 		t.Fatalf("evaluator: %v", err)
 	}
@@ -214,7 +214,7 @@ func newInlineService(t *testing.T, grace time.Duration, au *audit.Logger) *Serv
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
-	ev, err := mcpproxy.NewEvaluator(context.Background(), "agent", cp)
+	ev, err := mcpproxy.NewCedarEvaluator(context.Background(), "agent", cp)
 	if err != nil {
 		t.Fatalf("evaluator: %v", err)
 	}
