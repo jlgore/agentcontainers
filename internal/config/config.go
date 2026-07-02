@@ -399,24 +399,7 @@ type MCPServerPolicy struct {
 	// argument object with a string "binary" field (plus optional
 	// "extra_args" array) is treated as a shell command.
 	ShellTools map[string]ShellToolSpec `json:"shellTools,omitempty"`
-
-	// Engine selects the authorization backend that evaluates this server's
-	// compiled policy: "cedar" (the default — the embedded in-process cedar-go
-	// engine, no external binary) or "opa" (the legacy in-process Rego engine,
-	// consuming the same compiled data). Empty is treated as "cedar". Both
-	// container and remote servers may set it. The choice only swaps the
-	// decision engine; the YAML→data compilation and the structural
-	// decomposition layer are identical for both, and the two engines reach
-	// byte-identical verdicts and reasons (the policy parity suite).
-	Engine string `json:"engine,omitempty"`
 }
-
-// PolicyEngineOPA and PolicyEngineCedar are the recognized policy.engine
-// values. An empty engine defaults to Cedar.
-const (
-	PolicyEngineOPA   = "opa"
-	PolicyEngineCedar = "cedar"
-)
 
 // ShellToolSpec maps an MCP tool's arguments onto a shell command for
 // policy decomposition. Either CommandArg (a single free-form command
@@ -1139,12 +1122,6 @@ func validateSharedPolicy(p *MCPServerPolicy, field func(string) string) []error
 				errs = append(errs, fmt.Errorf("%s: host must not be empty", field(fmt.Sprintf("policy.network.egress[%d]", i))))
 			}
 		}
-	}
-	switch p.Engine {
-	case "", PolicyEngineOPA, PolicyEngineCedar:
-		// ok — empty defaults to Cedar.
-	default:
-		errs = append(errs, fmt.Errorf("%s: unknown policy engine %q (expected %q or %q)", field("policy.engine"), p.Engine, PolicyEngineOPA, PolicyEngineCedar))
 	}
 	return errs
 }

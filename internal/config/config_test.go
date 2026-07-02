@@ -1513,19 +1513,6 @@ func TestValidate_MCPToolTypeMatrix(t *testing.T) {
 				}},
 			},
 		},
-		{
-			name:     "unknown policy engine is rejected",
-			tool:     MCPToolConfig{Image: "x:1", Policy: &MCPServerPolicy{Engine: "rego"}},
-			wantErrs: []string{`agent.tools.mcp["t"].policy.engine: unknown policy engine "rego"`},
-		},
-		{
-			name: "explicit opa and cedar engines are accepted",
-			tool: MCPToolConfig{Image: "x:1", Policy: &MCPServerPolicy{Engine: "cedar"}},
-		},
-		{
-			name: "empty engine defaults to opa and is accepted",
-			tool: MCPToolConfig{Image: "x:1", Policy: &MCPServerPolicy{Engine: ""}},
-		},
 	}
 
 	for _, tt := range tests {
@@ -2038,6 +2025,29 @@ func TestValidate_UnknownField(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Errorf("Validate() error %q does not mention %q", msg, want)
 		}
+	}
+}
+
+// TestValidate_PolicyEngineFieldRemoved pins the migration behavior: the
+// policy.engine selector was removed when OPA was dropped, so a config that
+// still sets it is now rejected as an unknown field (there is no silent
+// no-op). Cedar is the only engine.
+func TestValidate_PolicyEngineFieldRemoved(t *testing.T) {
+	cfg, err := parseBytes([]byte(`{
+		"image": "ubuntu",
+		"agent": {
+			"tools": { "mcp": { "x": { "image": "x:1", "policy": { "engine": "opa" } } } }
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("parse unexpected error: %v", err)
+	}
+	err = cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() = nil, want unknown-field error for policy.engine")
+	}
+	if !strings.Contains(err.Error(), "policy.engine") {
+		t.Errorf("Validate() error %q does not mention policy.engine", err.Error())
 	}
 }
 
