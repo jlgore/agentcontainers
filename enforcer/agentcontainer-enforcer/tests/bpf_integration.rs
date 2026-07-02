@@ -2124,6 +2124,39 @@ async fn test_cgroup_move_does_not_escape_file_enforcement() {
     );
 }
 
+/// Containment (Part A): an enforced task cannot migrate itself out of the
+/// governed cgroup by WRITING cgroup.procs — the self-migration half of the
+/// cgroup-move escape that subtree-match structurally can't cover (a move into a
+/// sibling/parent, non-descendant cgroup, incl. the unenforced root). Enforced
+/// at file_open, so it holds even where cgroupfs is writable. Reading
+/// cgroup.procs (listing members) stays allowed.
+#[tokio::test]
+#[serial]
+async fn test_enforced_task_cannot_write_cgroup_procs() {
+    if skip_unless_lsm("test_enforced_task_cannot_write_cgroup_procs") {
+        return;
+    }
+    let mgr = BpfPolicyManager::new().expect("BPF programs should load");
+    let cgroup = own_cgroup_path();
+    mgr.register("test-cg-migrate", &cgroup, 0).await.unwrap();
+    assert!(mgr.lsm_status().active, "BPF LSM not attached");
+
+    let procs = format!("{cgroup}/cgroup.procs");
+    let write = std::fs::OpenOptions::new().write(true).open(&procs);
+    let read = std::fs::OpenOptions::new().read(true).open(&procs);
+
+    mgr.unregister("test-cg-migrate").await.unwrap();
+
+    assert!(
+        matches!(&write, Err(e) if e.raw_os_error() == Some(libc::EACCES)),
+        "write-open of cgroup.procs by an enforced task was not denied (EACCES): {write:?}"
+    );
+    assert!(
+        read.is_ok(),
+        "read-open of cgroup.procs should stay allowed: {read:?}"
+    );
+}
+
 /// C9 (hard boundary): with a non-empty exec allowlist applied, an execve of a
 /// NON-allowlisted binary is denied (EACCES) at the bprm_check LSM hook. Also
 /// asserts the BPF LSM actually attached (`lsm_status().active`) — the

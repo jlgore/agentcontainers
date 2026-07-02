@@ -24,8 +24,8 @@ use agentcontainer_common::events::{
     EVENT_CRED_OPEN,
 };
 use agentcontainer_common::maps::{
-    FsInodeKey, KernelOffsets, SecretAclKey, SecretToolKey, DENTRY_NAME_LEN, FS_PERM_WRITE,
-    LSM_ALLOW, LSM_DENY, PROC_SUPER_MAGIC,
+    FsInodeKey, KernelOffsets, SecretAclKey, SecretToolKey, CGROUP2_SUPER_MAGIC, DENTRY_NAME_LEN,
+    FS_PERM_WRITE, LSM_ALLOW, LSM_DENY, PROC_SUPER_MAGIC,
 };
 
 use crate::maps::{
@@ -199,6 +199,74 @@ unsafe fn is_proc_environ(file_ptr: *const u8, offs: &KernelOffsets) -> bool {
         && name_buf[7] == 0
 }
 
+/// Detect a cgroup-migration control file (`cgroup.procs` / `cgroup.threads`) on
+/// a cgroup2 filesystem, by the same s_magic + dentry-name technique as
+/// [`is_proc_environ`]. Writing these files moves a task between cgroups; an
+/// enforced task writing one would migrate itself into a sibling/parent cgroup
+/// and escape enforcement.
+#[inline(always)]
+unsafe fn is_cgroup_migration_file(file_ptr: *const u8, offs: &KernelOffsets) -> bool {
+    let inode_ptr: *const u8 = match read_at(file_ptr, offs.file_f_inode) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    if inode_ptr.is_null() {
+        return false;
+    }
+    let sb_ptr: *const u8 = match read_at(inode_ptr, offs.inode_i_sb) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    if sb_ptr.is_null() {
+        return false;
+    }
+    let s_magic: u64 = match read_at(sb_ptr, offs.sb_s_magic) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if s_magic != CGROUP2_SUPER_MAGIC {
+        return false;
+    }
+
+    let dentry_ptr: *const u8 = match read_at(file_ptr, offs.file_f_path + offs.path_dentry) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    if dentry_ptr.is_null() {
+        return false;
+    }
+    let name_ptr: *const u8 = match read_at(dentry_ptr, offs.dentry_d_name + offs.qstr_name) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    if name_ptr.is_null() {
+        return false;
+    }
+
+    let mut name_buf = [0u8; DENTRY_NAME_LEN];
+    if bpf_probe_read_kernel_buf(name_ptr, &mut name_buf[..DENTRY_NAME_LEN - 1]).is_err() {
+        return false;
+    }
+    name_is(&name_buf, b"cgroup.procs\0") || name_is(&name_buf, b"cgroup.threads\0")
+}
+
+/// Compare a null-padded dentry-name buffer against a null-terminated target.
+/// The `< DENTRY_NAME_LEN` guard gives the verifier a hard loop bound.
+#[inline(always)]
+fn name_is(buf: &[u8; DENTRY_NAME_LEN], target: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i < DENTRY_NAME_LEN {
+        if i >= target.len() {
+            break;
+        }
+        if buf[i] != target[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// Read a byte buffer from kernel memory. Wraps bpf_probe_read_kernel for
 /// copying into a mutable slice.
 #[inline(always)]
@@ -277,6 +345,26 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
 
     // Read file flags (file.f_flags) at its BTF-resolved offset.
     let flags: u32 = unsafe { read_at(file_ptr, offs.file_f_flags)? };
+
+    // Deny an enforced task migrating itself out of the governed cgroup by
+    // WRITING cgroup.procs/cgroup.threads. Subtree-match keeps descendants
+    // governed; this blocks a move into a sibling/parent (non-descendant) cgroup
+    // — the self-migration half of the cgroup-move escape (Escape-the-Box T11
+    // cgroup.procs vector). Reads (listing members) are allowed; only the
+    // migrating write is denied. Kernel-enforced, so it holds even where
+    // cgroupfs is writable (an adversarial substrate). Initial placement is done
+    // by a not-yet-enforced launcher, so legitimate placement still works.
+    let cgroup_write = (flags & 0x01) != 0    // O_WRONLY
+        || (flags & 0x02) != 0                 // O_RDWR
+        || (flags & 0o100) != 0               // O_CREAT
+        || (flags & 0o1000) != 0              // O_TRUNC
+        || (flags & 0o2000) != 0; // O_APPEND
+    if cgroup_write && unsafe { is_cgroup_migration_file(file_ptr, offs) } {
+        bump_fs_stat(agentcontainer_common::events::STAT_FS_BLOCKED);
+        bump_cgroup_stat(cgid, CGROUP_STAT_FS_BLOCKED);
+        emit_fs_block_event(cgid, 0, flags);
+        return Ok(LSM_DENY);
+    }
 
     // Read the superblock to get the device number.
     let sb_ptr: *const u8 = unsafe { read_at(inode_ptr, offs.inode_i_sb)? };

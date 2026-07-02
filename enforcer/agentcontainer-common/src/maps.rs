@@ -220,6 +220,13 @@ pub const LSM_DENY: i32 = -13; // -EACCES
 pub const PROC_SUPER_MAGIC: u64 = 0x9fa0;
 pub const DENTRY_NAME_LEN: usize = 32;
 
+// --- Cgroup v2 ---
+
+/// cgroup2 superblock magic (linux/magic.h CGROUP2_SUPER_MAGIC). Used to detect
+/// writes to cgroup control files (cgroup.procs/cgroup.threads) — a task
+/// migrating itself out of the governed cgroup.
+pub const CGROUP2_SUPER_MAGIC: u64 = 0x63677270;
+
 // --- Kernel struct field offsets (CO-RE substitute) ---
 
 /// Byte offsets of the kernel struct fields the LSM hooks walk, resolved from
