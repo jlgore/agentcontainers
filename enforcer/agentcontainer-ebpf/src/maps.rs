@@ -21,6 +21,40 @@ use agentcontainer_common::maps::{
 #[map]
 pub static ENFORCED_CGROUPS: HashMap<u64, u8> = HashMap::with_max_entries(256, 0);
 
+/// Max cgroup-hierarchy levels walked for subtree enforcement. Container cgroup
+/// depth (kubepods/…/pod/container, or a systemd slice) is well under this; the
+/// bound keeps the ancestor walk verifier-friendly.
+pub const MAX_CGROUP_DEPTH: i32 = 16;
+
+/// The enforced cgroup id governing the current task: its own cgroup if directly
+/// registered, otherwise the nearest ancestor present in `ENFORCED_CGROUPS`
+/// (SUBTREE match). Returning the registered ancestor means a task moved into a
+/// descendant cgroup — `mkdir <enforced>/x; echo $$ > x/cgroup.procs`, the
+/// Escape-the-Box T11 vector — stays governed by that ancestor's policy/stats
+/// instead of escaping enforcement. `None` when neither the task nor any
+/// ancestor is enforced.
+#[inline(always)]
+pub fn enforced_cgroup_for_current() -> Option<u64> {
+    // Fast path: the task's own cgroup is the registered one (the normal
+    // container case) — one lookup, no walk.
+    let cgid = unsafe { aya_ebpf::helpers::bpf_get_current_cgroup_id() };
+    if unsafe { ENFORCED_CGROUPS.get(&cgid) }.is_some() {
+        return Some(cgid);
+    }
+    // Subtree walk: root (level 0) → self. `bpf_get_current_ancestor_cgroup_id`
+    // returns 0 past the task's own depth, so break there.
+    for level in 0..MAX_CGROUP_DEPTH {
+        let id = unsafe { aya_ebpf::helpers::gen::bpf_get_current_ancestor_cgroup_id(level) };
+        if id == 0 {
+            break;
+        }
+        if unsafe { ENFORCED_CGROUPS.get(&id) }.is_some() {
+            return Some(id);
+        }
+    }
+    None
+}
+
 /// Kernel struct field byte-offsets, resolved from BTF and populated by
 /// userspace at startup (before any program is attached). The LSM hooks read
 /// index 0 to walk `linux_binprm`/`file`/`inode`/`super_block` portably across
