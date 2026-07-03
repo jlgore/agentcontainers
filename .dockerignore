@@ -1,0 +1,13 @@
+# Keep the Docker build context lean. These are build artifacts / untracked
+# trees that no image build needs as source — excluding them keeps the context
+# from ballooning to tens of GB (enforcer/target alone is ~44G).
+.git
+**/node_modules
+enforcer/target
+applevm
+docs/node_modules
+docs/.vitepress/cache
+docs/.vitepress/dist
+tmp
+/orchestrator
+*.jsonl
