@@ -26,6 +26,7 @@ func main() {
 
 	w := worker.New(c, cfg.TaskQueue, worker.Options{})
 	w.RegisterWorkflow(MatrixCellWorkflow)
+	w.RegisterWorkflow(EscapeMatrixWorkflow)
 	w.RegisterActivity(&Activities{Cfg: cfg})
 
 	log.Printf("harness-worker up: temporal=%s ns=%s queue=%s vm=%s/%s",

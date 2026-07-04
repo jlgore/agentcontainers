@@ -28,6 +28,10 @@ const SOCK = process.env.APPROVER_SOCKET || `${process.env.HOME}/.ac/guard-appro
 const POLICY = process.env.APPROVER_POLICY || "diligent";
 const LOG = process.env.APPROVER_LOG || "";
 const FATIGUE_N = parseInt(process.env.APPROVER_FATIGUE_N || "3", 10);
+// `fixed` policy: the verdict was decided out-of-band (a human or scripted approver
+// sent it via a Temporal signal) and passed in verbatim. This is the HITL seam —
+// the approver client just relays the control-plane decision to the guard socket.
+const VERDICT = (process.env.APPROVER_VERDICT || "deny").toLowerCase();
 
 // A diligent reviewer refuses writes to evidence, the audit trail, system dirs,
 // and cross-case dirs (anything under /cases that isn't the active case /cases/c).
@@ -40,6 +44,9 @@ function decide(req) {
   const s = (req.argsSummary || "").toLowerCase();
   count++;
   switch (POLICY) {
+    case "fixed":
+      // Honor the signaled verdict verbatim (HITL over the Temporal signal seam).
+      return VERDICT === "allow" ? [true, "signaled: allow"] : [false, "signaled: deny"];
     case "credulous":
       return [true, "looks fine"];
     case "fatigue":

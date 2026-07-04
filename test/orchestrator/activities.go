@@ -27,6 +27,12 @@ type Cell struct {
 	// budget cap) mints this cell's key — per-model budgets. Empty falls back to
 	// the worker's OPENROUTER_ROLE default.
 	OpenRouterRole string
+
+	// ApproverVerdict is set by the workflow for score:hitl cells from the Temporal
+	// approval signal ("allow"|"deny"). It drives breakout-run.sh's `fixed` approver
+	// policy so the honored decision comes from the control plane (a human or scripted
+	// approver via `temporal workflow signal`), not a baked-in persona. Empty otherwise.
+	ApproverVerdict string
 }
 
 // CellResult mirrors one line of the runner's results.jsonl plus a derived
@@ -107,7 +113,42 @@ func (a *Activities) runEnv(cell Cell, scoreOnly bool) string {
 			parts = append(parts, "BREAKOUT_CODEBASE_DIR="+shquote(cell.CodebaseDir))
 		}
 	}
+	if cell.ApproverVerdict != "" {
+		parts = append(parts, "BREAKOUT_APPROVER_VERDICT="+shquote(cell.ApproverVerdict))
+	}
 	return strings.Join(parts, " ")
+}
+
+// CaseScore reads the fixture's score type for this cell's case off the guest
+// (cases.json), so the workflow can tell BEFORE driving whether this is an
+// approval-gated (hitl) case that must block on a Temporal approval signal.
+func (a *Activities) CaseScore(ctx context.Context, cell Cell) (string, error) {
+	host, err := a.guestHost(ctx)
+	if err != nil {
+		return "", err
+	}
+	client, err := dial(a.Cfg, host)
+	if err != nil {
+		return "", err
+	}
+	defer client.Close()
+	out, err := runCmd(client, fmt.Sprintf("cat %s/cases.json", a.Cfg.RemoteDir), "")
+	if err != nil {
+		return "", fmt.Errorf("read cases.json: %s", strings.TrimSpace(out))
+	}
+	var cases []struct {
+		ID    string `json:"id"`
+		Score string `json:"score"`
+	}
+	if err := json.Unmarshal([]byte(out), &cases); err != nil {
+		return "", fmt.Errorf("parse cases.json: %w", err)
+	}
+	for _, c := range cases {
+		if c.ID == cell.CaseID {
+			return c.Score, nil
+		}
+	}
+	return "", nil
 }
 
 // SeedAndDrive runs breakout-run.sh for the single cell (seed → guard → drive →
@@ -236,8 +277,10 @@ func (a *Activities) auditStreams(sess string) map[string]string {
 
 // ShipToLoki pushes the cell's guest audit files to Loki, every line labeled
 // with run_id=workflowId so the guard→enforcer→canary timeline for this run is
-// one correlated query in Grafana.
-func (a *Activities) ShipToLoki(ctx context.Context, cell Cell, workflowID, sess string) error {
+// one correlated query in Grafana. It also emits a single `stream=results` line
+// carrying the gate verdict — with gate/passed as (low-cardinality) labels — so
+// the cross-run gate matrix panel is a plain label query over runs.
+func (a *Activities) ShipToLoki(ctx context.Context, cell Cell, workflowID, sess string, res *CellResult) error {
 	host, err := a.guestHost(ctx)
 	if err != nil {
 		return err
@@ -249,14 +292,8 @@ func (a *Activities) ShipToLoki(ctx context.Context, cell Cell, workflowID, sess
 	defer client.Close()
 
 	base := time.Now().Add(-time.Hour) // keep well inside Loki's ingestion window
-	shipped := 0
-	for stream, path := range a.auditStreams(sess) {
-		out, err := runCmd(client, fmt.Sprintf("cat %s 2>/dev/null || true", path), "")
-		if err != nil || strings.TrimSpace(out) == "" {
-			continue
-		}
-		lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
-		labels := map[string]string{
+	baseLabels := func(stream string) map[string]string {
+		return map[string]string{
 			"job":      "escape-harness",
 			"run_id":   workflowID,
 			"harness":  cell.Harness,
@@ -265,11 +302,36 @@ func (a *Activities) ShipToLoki(ctx context.Context, cell Cell, workflowID, sess
 			"enforcer": fmt.Sprintf("%t", cell.Enforcer),
 			"stream":   stream,
 		}
-		if err := pushLoki(ctx, a.Cfg.LokiURL, labels, lines, base); err != nil {
+	}
+
+	shipped := 0
+	for stream, path := range a.auditStreams(sess) {
+		out, err := runCmd(client, fmt.Sprintf("cat %s 2>/dev/null || true", path), "")
+		if err != nil || strings.TrimSpace(out) == "" {
+			continue
+		}
+		lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+		if err := pushLoki(ctx, a.Cfg.LokiURL, baseLabels(stream), lines, base); err != nil {
 			return err
 		}
 		shipped += len(lines)
 	}
+
+	// The gate verdict as its own queryable stream — drives the gate matrix panel.
+	if res != nil {
+		line, _ := json.Marshal(map[string]any{
+			"run_id": workflowID, "harness": cell.Harness, "model": cell.Model,
+			"case": cell.CaseID, "enforcer": cell.Enforcer,
+			"gate": res.Gate, "passed": res.Passed, "score": res.Score, "note": res.Note,
+		})
+		labels := baseLabels("results")
+		labels["gate"] = res.Gate
+		labels["passed"] = fmt.Sprintf("%t", res.Passed)
+		if err := pushLoki(ctx, a.Cfg.LokiURL, labels, []string{string(line)}, time.Now().Add(-time.Minute)); err != nil {
+			return err
+		}
+	}
+
 	activity.GetLogger(ctx).Info("shipped audit to Loki", "run_id", workflowID, "lines", shipped)
 	return nil
 }
