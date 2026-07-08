@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.1.7](https://github.com/jlgore/agentcontainers/compare/ac-enforcer-v0.1.6...ac-enforcer-v0.1.7) (2026-07-08)
+
+
+### Features
+
+* **enforcer:** auto-freeze agent execution-config on run (SetImmutable) ([d57d0a8](https://github.com/jlgore/agentcontainers/commit/d57d0a8fb7ea997ae79fc46ca403f902ef962ed8))
+* **enforcer:** deny cgroup.procs/threads writes by enforced tasks ([be5a747](https://github.com/jlgore/agentcontainers/commit/be5a7473556ff7fd53e2d06ea185201afd31e122))
+* **enforcer:** DNS re-resolution + overlap-safe transient egress (G4) ([de8f5f7](https://github.com/jlgore/agentcontainers/commit/de8f5f726f1159c58cdf76c8335843eb880e5499))
+* **enforcer:** extend cgroup subtree-match to the LSM hooks ([de78c22](https://github.com/jlgore/agentcontainers/commit/de78c225a1373bd8f468966d95c6cb4aba4a97b5))
+* **enforcer:** G4 URI-scoped transient egress at the kernel (IPv4) ([a2464d2](https://github.com/jlgore/agentcontainers/commit/a2464d2666a71815aea5009c8c08820166de3a26))
+* **enforcer:** IPv6 + dual-stack transient egress (G4) ([a9fc972](https://github.com/jlgore/agentcontainers/commit/a9fc972a8caaa0cdfc795f36a40a7becef40d2fa))
+* **enforcer:** match cgroup subtree for egress, not exact id ([ef61b25](https://github.com/jlgore/agentcontainers/commit/ef61b254a1501f17f243ad1434d560fd0ba8652a))
+* **enforcer:** P3 Level 1 — kernel blocks the exfil that escaped the guard ([7a49f12](https://github.com/jlgore/agentcontainers/commit/7a49f12469b38635a78e468721bc65d13327550b))
+* **escape:** P3 Level 2 — 3-harness live agent under the eBPF enforcer ([f0ec455](https://github.com/jlgore/agentcontainers/commit/f0ec4557068fd4459f24f429f2444f344c5f530b))
+
+
+### Bug Fixes
+
+* **enforcer:** correct IPv4/IPv6 byte order in parse_network_event ([12265ee](https://github.com/jlgore/agentcontainers/commit/12265ee102a27d648c59679021069088037d38d3))
+* **enforcer:** kernel-validation fixes for G4 transient egress tests ([f2b66e4](https://github.com/jlgore/agentcontainers/commit/f2b66e457d94bf19f5b2af64f72f40b7879ad956))
+* **enforcer:** resolve LSM kernel-struct offsets from BTF (portable across 6.x) ([2e0b70f](https://github.com/jlgore/agentcontainers/commit/2e0b70fc5f945f92a2cf431b61f30445a8a902d3))
+
 ## [0.1.6](https://github.com/jlgore/agentcontainers/compare/ac-enforcer-v0.1.5...ac-enforcer-v0.1.6) (2026-06-15)
 
 

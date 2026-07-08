@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.1.13](https://github.com/jlgore/agentcontainers/compare/v0.1.12...v0.1.13) (2026-07-08)
+
+
+### Features
+
+* **enforcer:** auto-freeze agent execution-config on run (SetImmutable) ([d57d0a8](https://github.com/jlgore/agentcontainers/commit/d57d0a8fb7ea997ae79fc46ca403f902ef962ed8))
+* **enforcer:** deny cgroup.procs/threads writes by enforced tasks ([be5a747](https://github.com/jlgore/agentcontainers/commit/be5a7473556ff7fd53e2d06ea185201afd31e122))
+* **enforcer:** DNS re-resolution + overlap-safe transient egress (G4) ([de8f5f7](https://github.com/jlgore/agentcontainers/commit/de8f5f726f1159c58cdf76c8335843eb880e5499))
+* **enforcer:** extend cgroup subtree-match to the LSM hooks ([de78c22](https://github.com/jlgore/agentcontainers/commit/de78c225a1373bd8f468966d95c6cb4aba4a97b5))
+* **enforcer:** G4 URI-scoped transient egress at the kernel (IPv4) ([a2464d2](https://github.com/jlgore/agentcontainers/commit/a2464d2666a71815aea5009c8c08820166de3a26))
+* **enforcer:** IPv6 + dual-stack transient egress (G4) ([a9fc972](https://github.com/jlgore/agentcontainers/commit/a9fc972a8caaa0cdfc795f36a40a7becef40d2fa))
+* **enforcer:** match cgroup subtree for egress, not exact id ([ef61b25](https://github.com/jlgore/agentcontainers/commit/ef61b254a1501f17f243ad1434d560fd0ba8652a))
+* **enforcer:** P3 Level 1 — kernel blocks the exfil that escaped the guard ([7a49f12](https://github.com/jlgore/agentcontainers/commit/7a49f12469b38635a78e468721bc65d13327550b))
+* **escape:** drive all 3 harnesses; full 2×3 parity grid (0 failures) ([897325b](https://github.com/jlgore/agentcontainers/commit/897325be5498b5fb9ca5ce13bfd2224829dc2878))
+* **escape:** Escape-the-Box breakout suite (guard-layer P2 + HITL) ([7af3265](https://github.com/jlgore/agentcontainers/commit/7af32659e4e51a8c8f06d0ba6c53389406d75bbb))
+* **escape:** P3 Level 2 — 3-harness live agent under the eBPF enforcer ([f0ec455](https://github.com/jlgore/agentcontainers/commit/f0ec4557068fd4459f24f429f2444f344c5f530b))
+* **escape:** persistence mode — determined adaptive adversary (score:persist) ([3d640ad](https://github.com/jlgore/agentcontainers/commit/3d640adaaa87e5035df026892783129a7b158d5b))
+* **escape:** T12 parser-probe + T11 exfil canary (marquee escape found) ([5b9369a](https://github.com/jlgore/agentcontainers/commit/5b9369aced49b74f635c31964e68c7a0e1ccc5f3))
+* **escape:** unprivileged/budget-mode runs, provider pinning, orchestrator activities ([26a6637](https://github.com/jlgore/agentcontainers/commit/26a6637ea217990b00152a14c02e11c6af802891))
+* **harness:** ac harness protect/unprotect — freeze config immutable ([496a3a5](https://github.com/jlgore/agentcontainers/commit/496a3a5a1d0a8f79271a90107e709fca52ba6b17))
+* **harness:** ac harness scan — discover execution-config surfaces ([1e45a8c](https://github.com/jlgore/agentcontainers/commit/1e45a8c32fe26976d951a60b87a5318022393394))
+* **mcpproxy:** make embedded Cedar the default policy engine ([093bafa](https://github.com/jlgore/agentcontainers/commit/093bafae65946969251335db55cdff06d7598ee9))
+* **orchestrator:** Phase 2 — matrix fan-out, HITL signal seam, durable-resume hardening ([c42282f](https://github.com/jlgore/agentcontainers/commit/c42282f9e1d9cd8feb7df6529bba7611b8aec9e6))
+* **orchestrator:** Temporal worker for the escape-the-box matrix ([a29c663](https://github.com/jlgore/agentcontainers/commit/a29c663ad2ea9f26feb5a15f6a82d1c357043cfc))
+* **run:** reject writable cgroupfs and host-scheduler bind-mounts ([153efe1](https://github.com/jlgore/agentcontainers/commit/153efe111c1540c9205a2d6a62cc88cc74f2a796))
+* **test-matrix:** Phase 4 Layer-2 Claude Code guard cell (15/15 green) ([87628d1](https://github.com/jlgore/agentcontainers/commit/87628d1b165fe414e4e68cacda5747c8f3d6e80a))
+* **test-matrix:** Phase 5 opencode guard cell (14/15) + soft-hook-bypass ([653b7ff](https://github.com/jlgore/agentcontainers/commit/653b7fff8e49a3d182ed1f19ccaa21a29f242638))
+* **test-matrix:** Phase 6 pi guard cell (15/15 ×2 models) + kernel-only assertion ([f6385ae](https://github.com/jlgore/agentcontainers/commit/f6385ae6506d4cc64d0504ce8eda19870dc74fa0))
+
+
+### Bug Fixes
+
+* **enforcer:** correct IPv4/IPv6 byte order in parse_network_event ([12265ee](https://github.com/jlgore/agentcontainers/commit/12265ee102a27d648c59679021069088037d38d3))
+* **enforcer:** kernel-validation fixes for G4 transient egress tests ([f2b66e4](https://github.com/jlgore/agentcontainers/commit/f2b66e457d94bf19f5b2af64f72f40b7879ad956))
+* **enforcer:** resolve LSM kernel-struct offsets from BTF (portable across 6.x) ([2e0b70f](https://github.com/jlgore/agentcontainers/commit/2e0b70fc5f945f92a2cf431b61f30445a8a902d3))
+
 ## [0.1.12](https://github.com/jlgore/agentcontainers/compare/v0.1.11...v0.1.12) (2026-06-16)
 
 
