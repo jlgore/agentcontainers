@@ -450,3 +450,49 @@ give durability at cell granularity. (3) Per-round visibility — the only real 
 served by Loki (`.<harness>.rN.json` transcripts + the `enforcer.log` NET-BLOCK stream give
 per-attempt granularity). **Revisit if** we need to retry a single round independently, tune per-round
 timeouts, or gate a round on HITL.
+
+---
+
+## 11. Substrate axis — container substrate (added 2026-07-05)
+
+The escape matrix now runs against agentcontainers hosted in **two** ways: the
+original KubeVirt VM *and* a privileged **container** (pod). Hosting is a matrix
+**axis**, not a fork — the drive path (SSH → `breakout-run.sh` → guard/enforcer →
+scorer → Loki) is byte-for-byte identical; only guest-host resolution and the
+reset-recovery step dispatch on the substrate.
+
+| | `vm` substrate | `container` substrate |
+|---|---|---|
+| Guest | KubeVirt VMI `ac-matrix-vm` | privileged pod `ac-matrix-ctr` (Deployment) |
+| Host resolve | VMI pod IP (KubeVirt API) | pod IP (core API, `app=ac-matrix-ctr`) |
+| Recovery | `restartVM` (KubeVirt) | delete pod → Deployment recreates (seconds) |
+| Kernel/enforcer | full VM kernel | node kernel via privileged pod + `lsm=…,bpf` |
+
+**Why:** the VM proved the boundary on a full kernel; the container proves it under
+the deployment shape most users actually run (a pod sharing the node kernel). A
+regression that only appears under one hosting model is what the two-substrate grid
+catches. The container also resets far faster (pod recreate vs VM reboot).
+
+**Worker changes (`test/orchestrator/`, `go build`/`vet` clean):**
+- `Cell.Substrate` (`vm`|`container`, empty ⇒ worker `SUBSTRATE` default `vm`).
+- `guestHost` dispatches: VMI IP vs `podIP(ns, selector)` (new in `kube.go`, returns
+  only a Running+Ready non-terminating pod so a reset in flight is never picked up).
+- `ResetVM` → `ResetSubstrate` (dispatches `resetVM` / `resetContainer`; the latter
+  `deletePods` by selector then waits for a fresh Ready+reachable pod). `ResetVM`
+  kept as a registered alias so pre-existing histories replay.
+- `MatrixSpec.Substrates` axis in `buildCells`; `slug()` appends the substrate
+  segment only when set (vm-only grids keep their historical child ids → stable resume).
+- Config: `SUBSTRATE`, `POD_NAMESPACE`, `POD_SELECTOR`.
+
+**Substrate image + manifest (`test/escape/container/`):** self-contained image
+(agentcontainer + enforcer bin/ELF + all three harnesses + adapters/managed configs
++ derived `guard-policy.yaml`/`cases.json`), privileged `Deployment` (cgroup/bpffs/
+btf hostPaths, `Recreate`, `replicas:1`), `up.sh` (reuses the VM's SSH key), README.
+
+**Remaining human/out-of-band steps:**
+- [ ] **Build + push** the substrate image to the jlgore fork's ghcr (manual, no auto-push):
+      `docker build -f test/escape/container/Dockerfile -t ghcr.io/jlgore/agentcontainers-escape-substrate:latest . && docker push …`
+- [ ] **Worker RBAC (talos-gitops):** add `pods: [get,list,delete]` to
+      `infrastructure/base/harness-worker/rbac.yaml` (VMI get + VM restart already present).
+- [ ] **Bring up** `test/escape/container/up.sh` on the BPF-LSM node, then drive one
+      `Substrate:"container"` cell before fanning the grid out with `Substrates:["vm","container"]`.

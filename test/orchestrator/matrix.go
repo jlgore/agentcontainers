@@ -32,7 +32,12 @@ type MatrixSpec struct {
 	CaseIDs   []string // fixture case ids; empty => defaultGatingCases
 	// EnforcerModes selects the enforcer axis: [false] off-only, [true] on-only,
 	// [false,true] both. Empty defaults to [false] (guard-layer only).
-	EnforcerModes   []bool
+	EnforcerModes []bool
+	// Substrates selects where each cell runs: "vm" (KubeVirt), "container"
+	// (privileged pod), or both. Empty defaults to [""] — each cell inherits the
+	// worker's DefaultSubstrate. Adding "container" fans the SAME grid across the
+	// container substrate so a regression is caught on both hosting models.
+	Substrates      []string
 	AgentTimeoutSec int
 	MaxRounds       int
 	CodebaseDir     string // source snapshot on the guest (enforcer cells only)
@@ -41,10 +46,10 @@ type MatrixSpec struct {
 // CellOutcome is one cell's result within a matrix run: either a CellResult or,
 // if the child workflow failed outright (not merely a FAIL gate), the error.
 type CellOutcome struct {
-	Cell   Cell        `json:"cell"`
-	ChildID string     `json:"child_id"`
-	Result *CellResult `json:"result,omitempty"`
-	Err    string      `json:"err,omitempty"`
+	Cell    Cell        `json:"cell"`
+	ChildID string      `json:"child_id"`
+	Result  *CellResult `json:"result,omitempty"`
+	Err     string      `json:"err,omitempty"`
 }
 
 // MatrixResult aggregates the whole grid for one run.
@@ -52,7 +57,7 @@ type MatrixResult struct {
 	RunID    string        `json:"run_id"`
 	Total    int           `json:"total"`
 	Passed   int           `json:"passed"`
-	Failed   int           `json:"failed"`  // child workflow errored (infra), not a FAIL gate
+	Failed   int           `json:"failed"` // child workflow errored (infra), not a FAIL gate
 	Outcomes []CellOutcome `json:"outcomes"`
 }
 
@@ -72,13 +77,18 @@ var defaultGatingCases = []string{
 var slugStrip = regexp.MustCompile(`[^a-zA-Z0-9]+`)
 
 // slug builds a deterministic, DNS/Temporal-safe id fragment for this cell so the
-// child workflow id is stable across replays (harness-model-case-enf).
+// child workflow id is stable across replays (harness-model-case-enf[-substrate]).
+// The substrate segment is only appended when set, so existing vm-only grids keep
+// their historical child ids (stable resume).
 func (c Cell) slug() string {
 	enf := "ne"
 	if c.Enforcer {
 		enf = "enf"
 	}
 	raw := fmt.Sprintf("%s-%s-%s-%s", c.Harness, c.Model, c.CaseID, enf)
+	if c.Substrate != "" {
+		raw += "-" + c.Substrate
+	}
 	s := slugStrip.ReplaceAllString(raw, "-")
 	return strings.Trim(strings.ToLower(s), "-")
 }
@@ -96,25 +106,32 @@ func buildCells(spec MatrixSpec) []Cell {
 	if len(enfModes) == 0 {
 		enfModes = []bool{false}
 	}
+	substrates := spec.Substrates
+	if len(substrates) == 0 {
+		substrates = []string{""} // inherit the worker's DefaultSubstrate
+	}
 	var cells []Cell
 	for _, m := range spec.Models {
 		for _, h := range spec.Harnesses {
 			for _, caseID := range cases {
 				for _, enf := range enfModes {
-					cell := Cell{
-						Harness:         h,
-						Provider:        m.Provider,
-						Model:           m.Model,
-						CaseID:          caseID,
-						Enforcer:        enf,
-						AgentTimeoutSec: spec.AgentTimeoutSec,
-						MaxRounds:       spec.MaxRounds,
-						OpenRouterRole:  m.OpenRouterRole,
+					for _, sub := range substrates {
+						cell := Cell{
+							Harness:         h,
+							Provider:        m.Provider,
+							Model:           m.Model,
+							CaseID:          caseID,
+							Enforcer:        enf,
+							Substrate:       sub,
+							AgentTimeoutSec: spec.AgentTimeoutSec,
+							MaxRounds:       spec.MaxRounds,
+							OpenRouterRole:  m.OpenRouterRole,
+						}
+						if enf {
+							cell.CodebaseDir = spec.CodebaseDir
+						}
+						cells = append(cells, cell)
 					}
-					if enf {
-						cell.CodebaseDir = spec.CodebaseDir
-					}
-					cells = append(cells, cell)
 				}
 			}
 		}
@@ -123,10 +140,13 @@ func buildCells(spec MatrixSpec) []Cell {
 }
 
 // EscapeMatrixWorkflow fans the grid out across one child MatrixCellWorkflow per
-// cell. Because every cell mutates the ONE shared ac-matrix guest in place, cells
-// run STRICTLY SEQUENTIALLY (breakout-run.sh re-seeds per cell, but two cells on
-// one VM would collide). Concurrency would require provisioning multiple VMIs;
-// this is the single, documented knob to change if that happens.
+// cell. Because every cell mutates the ONE shared guest per substrate in place,
+// cells run STRICTLY SEQUENTIALLY (breakout-run.sh re-seeds per cell, but two
+// cells on one guest would collide). This holds even across the substrate axis:
+// the vm and container substrates are distinct guests and could in principle run
+// concurrently, but the single shared-guest-per-substrate invariant keeps the
+// loop sequential. Concurrency would require multiple guests per substrate; that
+// is the single, documented knob to change if it happens.
 //
 // Durability: child workflow ids are deterministic (runID.slug), so if the worker
 // dies mid-grid the parent replays from history — children that already completed

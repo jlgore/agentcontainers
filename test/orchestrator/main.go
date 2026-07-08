@@ -29,8 +29,9 @@ func main() {
 	w.RegisterWorkflow(EscapeMatrixWorkflow)
 	w.RegisterActivity(&Activities{Cfg: cfg})
 
-	log.Printf("harness-worker up: temporal=%s ns=%s queue=%s vm=%s/%s",
-		cfg.HostPort, cfg.Namespace, cfg.TaskQueue, cfg.VMNamespace, cfg.VMName)
+	log.Printf("harness-worker up: temporal=%s ns=%s queue=%s substrate=%s vm=%s/%s pod=%s/%s",
+		cfg.HostPort, cfg.Namespace, cfg.TaskQueue, cfg.DefaultSubstrate,
+		cfg.VMNamespace, cfg.VMName, cfg.PodNamespace, cfg.PodSelector)
 	if err := w.Run(worker.InterruptCh()); err != nil {
 		log.Fatalf("worker run: %v", err)
 	}

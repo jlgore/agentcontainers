@@ -10,6 +10,12 @@ import (
 	"go.temporal.io/sdk/activity"
 )
 
+// Substrate names how the escape harness is hosted for a cell.
+const (
+	SubstrateVM        = "vm"        // KubeVirt VMI; recovery = VM restart
+	SubstrateContainer = "container" // privileged pod; recovery = delete + recreate
+)
+
 // Cell is one point of the escape matrix: a single fixture case run under one
 // harness/model, optionally under the eBPF enforcer.
 type Cell struct {
@@ -18,6 +24,11 @@ type Cell struct {
 	Model    string // e.g. z-ai/glm-5.2
 	CaseID   string // fixture case id → CASE_FILTER (the ONE case this cell runs)
 	Enforcer bool   // BREAKOUT_ENFORCER=1 (kernel egress boundary)
+
+	// Substrate hosts this cell: "vm" (KubeVirt VMI) or "container" (privileged
+	// pod). Empty falls back to the worker's DefaultSubstrate. The drive path is
+	// identical (SSH); only guest-host resolution and reset-recovery differ.
+	Substrate string
 
 	AgentTimeoutSec int // BREAKOUT_AGENT_TIMEOUT
 	MaxRounds       int // BREAKOUT_MAX_ROUNDS (budget loop); 0/1 = single-shot
@@ -54,9 +65,22 @@ type Activities struct {
 	Cfg Config
 }
 
+// substrate resolves the cell's substrate, falling back to the worker default.
+func (a *Activities) substrate(cell Cell) string {
+	if cell.Substrate != "" {
+		return cell.Substrate
+	}
+	if a.Cfg.DefaultSubstrate != "" {
+		return a.Cfg.DefaultSubstrate
+	}
+	return SubstrateVM
+}
+
 // guestHost returns the address to SSH to: an explicit GUEST_HOST override, else
-// the live VMI pod IP resolved from the KubeVirt API.
-func (a *Activities) guestHost(ctx context.Context) (string, error) {
+// the live guest IP — the VMI pod IP for the "vm" substrate, or the substrate
+// pod's IP for the "container" substrate. Both resolve through the in-cluster
+// API; the SSH drive path downstream is identical.
+func (a *Activities) guestHost(ctx context.Context, cell Cell) (string, error) {
 	if a.Cfg.GuestHost != "" {
 		return a.Cfg.GuestHost, nil
 	}
@@ -64,13 +88,16 @@ func (a *Activities) guestHost(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if a.substrate(cell) == SubstrateContainer {
+		return kc.podIP(ctx, a.Cfg.PodNamespace, a.Cfg.PodSelector)
+	}
 	return kc.vmiIP(ctx, a.Cfg.VMNamespace, a.Cfg.VMName)
 }
 
 // CheckGuest is a cheap, aggressively-retried probe: SSH up and confirm the
 // runner is present. A dial failure surfaces as guest-fatal.
 func (a *Activities) CheckGuest(ctx context.Context, cell Cell) error {
-	host, err := a.guestHost(ctx)
+	host, err := a.guestHost(ctx, cell)
 	if err != nil {
 		return err
 	}
@@ -123,7 +150,7 @@ func (a *Activities) runEnv(cell Cell, scoreOnly bool) string {
 // (cases.json), so the workflow can tell BEFORE driving whether this is an
 // approval-gated (hitl) case that must block on a Temporal approval signal.
 func (a *Activities) CaseScore(ctx context.Context, cell Cell) (string, error) {
-	host, err := a.guestHost(ctx)
+	host, err := a.guestHost(ctx, cell)
 	if err != nil {
 		return "", err
 	}
@@ -156,7 +183,7 @@ func (a *Activities) CaseScore(ctx context.Context, cell Cell) (string, error) {
 // clean run (even if the gate is FAIL — that is a valid verdict, not an error);
 // returns guest-fatal only when the guest is unreachable or produced no result.
 func (a *Activities) SeedAndDrive(ctx context.Context, cell Cell) (*CellResult, error) {
-	host, err := a.guestHost(ctx)
+	host, err := a.guestHost(ctx, cell)
 	if err != nil {
 		return nil, err
 	}
@@ -219,7 +246,7 @@ func (a *Activities) SeedAndDrive(ctx context.Context, cell Cell) (*CellResult, 
 // idempotent, no model calls, fast. Proves scoring is a separable, replayable
 // step decoupled from the expensive drive.
 func (a *Activities) ScoreCase(ctx context.Context, cell Cell) (*CellResult, error) {
-	host, err := a.guestHost(ctx)
+	host, err := a.guestHost(ctx, cell)
 	if err != nil {
 		return nil, err
 	}
@@ -281,7 +308,7 @@ func (a *Activities) auditStreams(sess string) map[string]string {
 // carrying the gate verdict — with gate/passed as (low-cardinality) labels — so
 // the cross-run gate matrix panel is a plain label query over runs.
 func (a *Activities) ShipToLoki(ctx context.Context, cell Cell, workflowID, sess string, res *CellResult) error {
-	host, err := a.guestHost(ctx)
+	host, err := a.guestHost(ctx, cell)
 	if err != nil {
 		return err
 	}
@@ -339,7 +366,7 @@ func (a *Activities) ShipToLoki(ctx context.Context, cell Cell, workflowID, sess
 // Teardown is best-effort hygiene between cells: kill any stray canary/approver
 // listeners so they cannot bleed into a later cell.
 func (a *Activities) Teardown(ctx context.Context, cell Cell) error {
-	host, err := a.guestHost(ctx)
+	host, err := a.guestHost(ctx, cell)
 	if err != nil {
 		return nil // best effort
 	}
@@ -352,17 +379,35 @@ func (a *Activities) Teardown(ctx context.Context, cell Cell) error {
 	return nil
 }
 
-// ResetVM restarts the KubeVirt VM and waits until the VMI is Running+Ready,
-// then confirms SSH is back. This is the durable recovery step the workflow runs
-// when a cell wrecks the guest. Heartbeated across the (minutes-long) boot.
-func (a *Activities) ResetVM(ctx context.Context, cell Cell) error {
+// ResetSubstrate is the durable recovery step the workflow runs when a cell
+// wrecks the guest. It dispatches on the cell's substrate: restart the KubeVirt
+// VM, or delete the substrate pod so its Deployment recreates a clean one. Both
+// paths wait until the guest is Ready and SSH is back, heartbeating across the
+// wait. Idempotent — safe to retry.
+func (a *Activities) ResetSubstrate(ctx context.Context, cell Cell) error {
 	if a.Cfg.GuestHost != "" {
-		return fmt.Errorf("ResetVM requires in-cluster KubeVirt API access; not available with GUEST_HOST override")
+		return fmt.Errorf("ResetSubstrate requires in-cluster API access; not available with GUEST_HOST override")
 	}
 	kc, err := newK8sClient()
 	if err != nil {
 		return err
 	}
+	if a.substrate(cell) == SubstrateContainer {
+		return a.resetContainer(ctx, kc)
+	}
+	return a.resetVM(ctx, kc)
+}
+
+// ResetVM is retained as a registered alias so pre-existing workflow histories
+// (which scheduled an activity named "ResetVM") still resolve on replay. It
+// delegates to the substrate-aware reset.
+func (a *Activities) ResetVM(ctx context.Context, cell Cell) error {
+	return a.ResetSubstrate(ctx, cell)
+}
+
+// resetVM restarts the KubeVirt VM and waits until the VMI is Running+Ready,
+// then confirms SSH is back. Heartbeated across the (minutes-long) boot.
+func (a *Activities) resetVM(ctx context.Context, kc *k8sClient) error {
 	log := activity.GetLogger(ctx)
 	log.Warn("resetting VM", "vm", a.Cfg.VMName)
 	if err := kc.restartVM(ctx, a.Cfg.VMNamespace, a.Cfg.VMName); err != nil {
@@ -387,4 +432,33 @@ func (a *Activities) ResetVM(ctx context.Context, cell Cell) error {
 		}
 	}
 	return fmt.Errorf("VM %s not Ready+reachable within timeout", a.Cfg.VMName)
+}
+
+// resetContainer deletes the substrate pod(s) matching the selector so the
+// Deployment recreates a clean one, then waits until a new pod is Ready and SSH
+// answers. Far faster than a VM reboot (seconds, not minutes) but the same
+// contract: return only once the guest is a clean, reachable baseline.
+func (a *Activities) resetContainer(ctx context.Context, kc *k8sClient) error {
+	log := activity.GetLogger(ctx)
+	log.Warn("resetting container substrate", "ns", a.Cfg.PodNamespace, "selector", a.Cfg.PodSelector)
+	if err := kc.deletePods(ctx, a.Cfg.PodNamespace, a.Cfg.PodSelector); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(4 * time.Minute)
+	for time.Now().Before(deadline) {
+		activity.RecordHeartbeat(ctx, "waiting for a fresh Ready pod")
+		if host, err := kc.podIP(ctx, a.Cfg.PodNamespace, a.Cfg.PodSelector); err == nil {
+			if client, err := dial(a.Cfg, host); err == nil {
+				_ = client.Close()
+				log.Info("container substrate back up", "host", host)
+				return nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+	}
+	return fmt.Errorf("no Ready+reachable substrate pod (%s/%s) within timeout", a.Cfg.PodNamespace, a.Cfg.PodSelector)
 }

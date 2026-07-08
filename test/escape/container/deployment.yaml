@@ -1,0 +1,86 @@
+# Escape-the-Box CONTAINER substrate — a privileged pod twin of ac-matrix-vm.
+# The Temporal harness-worker resolves this pod's IP (labelSelector app=ac-matrix-ctr)
+# and SSHes in to drive breakout-run.sh, exactly as it does the VMI. Recovery =
+# delete the pod; this Deployment recreates a clean one (ResetSubstrate, container path).
+#
+# A Deployment (not a bare Pod) is what makes pod-delete-as-reset work: kill the
+# pod and the controller brings back a pristine replica. Keep replicas: 1 — cells
+# share the one guest and run strictly sequentially (see EscapeMatrixWorkflow).
+#
+#   ./up.sh                 # generate key, create Secret + apply this (renders the image)
+# or manually:
+#   sed 's#REPLACE_WITH_IMAGE#ghcr.io/jlgore/agentcontainers-escape-substrate:latest#' \
+#     deployment.yaml | kubectl apply -f -
+#
+# Requirements on the scheduled node (same one ac-matrix-vm runs on): cgroup v2,
+# and lsm=…,bpf for the enforcer cells (LSM-dependent egress blocks self-skip
+# without CONFIG_BPF_LSM; guard-layer cells run regardless).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ac-matrix-ctr
+  namespace: ac-matrix
+  labels:
+    app: ac-matrix-ctr
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # never two guests at once (shared, sequential cells)
+  selector:
+    matchLabels:
+      app: ac-matrix-ctr
+  template:
+    metadata:
+      labels:
+        app: ac-matrix-ctr
+    spec:
+      # Schedule onto the BPF-LSM node (the one ac-matrix-vm uses). Set to your
+      # node; leave commented to let the scheduler pick any BPF-capable node.
+      # nodeSelector:
+      #   kubernetes.io/hostname: talos-node
+      hostPID: true # host process view for enforcer cgroup own-resolution
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: substrate
+          image: REPLACE_WITH_IMAGE
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 22
+              name: ssh
+          securityContext:
+            privileged: true # BPF map/prog load + attach + cgroup writes (enforcer)
+          readinessProbe:
+            tcpSocket:
+              port: 22
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          volumeMounts:
+            - name: ssh-key
+              mountPath: /run/ssh
+              readOnly: true
+            - name: cgroup
+              mountPath: /sys/fs/cgroup # rw: the enforcer registers/attaches cgroups
+            - name: bpffs
+              mountPath: /sys/fs/bpf
+            - name: btf
+              mountPath: /sys/kernel/btf
+              readOnly: true
+      volumes:
+        - name: ssh-key
+          secret:
+            secretName: ac-matrix-ctr-ssh # key: authorized_keys (worker's pubkey)
+            items:
+              - key: authorized_keys
+                path: authorized_keys
+        - name: cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
+        - name: bpffs
+          hostPath:
+            path: /sys/fs/bpf
+            type: Directory
+        - name: btf
+          hostPath:
+            path: /sys/kernel/btf
+            type: Directory

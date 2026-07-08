@@ -49,3 +49,6 @@ enforcer/target/
 
 # sift-platform demo runtime state (up.sh)
 examples/sift-platform/.run/
+
+# stray orchestrator worker binary (build with: go build ./test/orchestrator)
+/orchestrator

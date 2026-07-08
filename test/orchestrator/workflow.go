@@ -159,9 +159,9 @@ func MatrixCellWorkflow(ctx workflow.Context, cell Cell) (*CellResult, error) {
 		}
 		// Recover-and-retry on infra interruptions — a guest-fatal (SSH unreachable)
 		// OR a heartbeat timeout (the worker running the drive was evicted/killed
-		// mid-cell). Both leave the guest in an unknown state, so reset the VM to a
-		// clean baseline and re-drive. Any other error (a clean FAIL gate, or a genuine
-		// start-to-close over-run) is terminal — we do not re-burn the budget for it.
+		// mid-cell). Both leave the guest in an unknown state, so reset the substrate
+		// to a clean baseline and re-drive. Any other error (a clean FAIL gate, or a
+		// genuine start-to-close over-run) is terminal — we do not re-burn the budget.
 		guestFatal := isGuestFatalErr(err)
 		if attempt >= maxCellAttempts || !(guestFatal || isHeartbeatTimeout(err)) {
 			return nil, err
@@ -170,13 +170,13 @@ func MatrixCellWorkflow(ctx workflow.Context, cell Cell) (*CellResult, error) {
 		if !guestFatal {
 			cause = "heartbeat-timeout (worker eviction/stall)"
 		}
-		log.Warn("drive interrupted; resetting VM before retry", "cause", cause, "attempt", attempt, "err", err.Error())
+		log.Warn("drive interrupted; resetting substrate before retry", "cause", cause, "substrate", cell.Substrate, "attempt", attempt, "err", err.Error())
 		resetCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
 			StartToCloseTimeout: 10 * time.Minute,
 			HeartbeatTimeout:    60 * time.Second,
 			RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 2},
 		})
-		if rerr := workflow.ExecuteActivity(resetCtx, a.ResetVM, cell).Get(ctx, nil); rerr != nil {
+		if rerr := workflow.ExecuteActivity(resetCtx, a.ResetSubstrate, cell).Get(ctx, nil); rerr != nil {
 			return nil, rerr
 		}
 	}

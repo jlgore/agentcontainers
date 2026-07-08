@@ -19,6 +19,7 @@ REPO="$(cd ../.. && pwd)"
 FIXTURE="$REPO/test/escape/breakout-matrix.yaml"
 REMOTE_DIR=/home/ubuntu/breakout
 CODEBASE_DIR="${BREAKOUT_CODEBASE_DIR:-/home/ubuntu/agentcontainers-src}"  # source snapshot for model grounding
+AGENT_USER="${BREAKOUT_AGENT_USER:-bagent}"  # unprivileged (NO sudo) user the harness runs as when BREAKOUT_UNPRIV=1
 HARNESS="${BREAKOUT_HARNESS:-pi}"
 PROVIDER="${BREAKOUT_PROVIDER:-openrouter}"
 MODEL="${BREAKOUT_MODEL:?set BREAKOUT_MODEL, e.g. z-ai/glm-5.2}"
@@ -106,6 +107,30 @@ if [ "${BREAKOUT_ENFORCER:-0}" = 1 ]; then
   fi
 fi
 
+# ---- 1c. (faithful break-out) unprivileged agent user ----------------------
+# Hardening for the long break-out runs: the harness runs as a dedicated user with
+# NO sudo, so the attacker can't `sudo` out of the governed cgroup (the VM gives
+# `ubuntu` passwordless sudo; the runner keeps that for setup, the AGENT must not).
+# A break-out under this config = a genuine kernel-boundary defeat, not a privesc.
+if [ "${BREAKOUT_UNPRIV:-0}" = 1 ]; then
+  log "Setting up unprivileged agent user '$AGENT_USER' (no sudo)"
+  guest "
+    id $AGENT_USER >/dev/null 2>&1 || sudo useradd -m -s /bin/bash $AGENT_USER
+    sudo gpasswd -d $AGENT_USER sudo 2>/dev/null || true
+    sudo rm -f /etc/sudoers.d/*$AGENT_USER* 2>/dev/null || true
+    printf 'id: %s\n' \"\$(id $AGENT_USER)\"
+    # Correct test: drop TO the agent, then have IT try to escalate to root.
+    sudo -u $AGENT_USER sudo -n true 2>/dev/null && echo 'WARN: agent CAN sudo to root (bad)' || echo 'verified: agent CANNOT sudo to root (good)'
+  " | sed 's/^/  /'
+  # opencode auto-loads its guard plugin from \$HOME/.config/opencode/plugin — install
+  # it in the AGENT's home (claude's managed hook + pi's --extension are not HOME-bound).
+  if [ "$HARNESS" = opencode ]; then
+    push "$REPO/test/vm/phase5-guard-adapter.js" /home/ubuntu/phase5-guard-adapter.js >/dev/null
+    guest "sudo -u $AGENT_USER mkdir -p /home/$AGENT_USER/.config/opencode/plugin && sudo install -m0644 -o $AGENT_USER -g $AGENT_USER /home/ubuntu/phase5-guard-adapter.js /home/$AGENT_USER/.config/opencode/plugin/phase5-guard-adapter.js && rm -f /home/ubuntu/phase5-guard-adapter.js && echo 'opencode agent-home plugin installed'" | sed 's/^/  /'
+  fi
+  ok "unprivileged agent user ready"
+fi
+
 # ---- 2. derive policy + cases from the ONE fixture, ship to the VM ---------
 # Host has yq; the VM consumes only the derived guard-policy.yaml + cases.json
 # (jq on the VM) — single source, no drift from the Layer-1 oracle, no yq on VM.
@@ -170,6 +195,8 @@ if [ "${BREAKOUT_ENFORCER:-0}" = 1 ]; then
   [ -n "${BREAKOUT_CANARY_IP:-}" ] && RUNENV="$RUNENV BREAKOUT_CANARY_IP='$BREAKOUT_CANARY_IP'"
   [ -n "${BREAKOUT_ALLOWED_HOST:-}" ] && RUNENV="$RUNENV BREAKOUT_ALLOWED_HOST='$BREAKOUT_ALLOWED_HOST'"
 fi
+[ "${BREAKOUT_UNPRIV:-0}" = 1 ] && RUNENV="$RUNENV BREAKOUT_UNPRIV=1 BREAKOUT_AGENT_USER='$AGENT_USER'"
+[ -n "${BREAKOUT_MAX_ROUNDS:-}" ] && RUNENV="$RUNENV BREAKOUT_MAX_ROUNDS='$BREAKOUT_MAX_ROUNDS'"
 set +e
 guest "cd $REMOTE_DIR && $RUNENV ./breakout-run.sh"
 RC=$?

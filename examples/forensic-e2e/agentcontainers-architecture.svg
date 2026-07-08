@@ -1,0 +1,129 @@
+<svg width="100%" viewBox="0 0 680 790" xmlns="http://www.w3.org/2000/svg" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: white;">
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</marker>
+</defs>
+
+<!-- Untrusted zone -->
+<rect x="35" y="18" width="610" height="138" rx="12" fill="#FAECE7" fill-opacity="0.5" stroke="#993C1D" stroke-width="0.5" stroke-dasharray="6 4"/>
+<text x="340" y="38" text-anchor="middle" font-size="12" fill="#993C1D">Untrusted — agent container</text>
+
+<!-- Claude Code -->
+<rect x="55" y="52" width="255" height="56" rx="8" fill="#FAECE7" stroke="#993C1D" stroke-width="0.5"/>
+<text x="182" y="72" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#4A1B0C">Claude Code agent</text>
+<text x="182" y="92" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#993C1D">native Bash + MCP tools</text>
+
+<!-- Guard Client -->
+<rect x="375" y="52" width="210" height="56" rx="8" fill="#FAECE7" stroke="#993C1D" stroke-width="0.5"/>
+<text x="480" y="72" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#4A1B0C">Guard hook client</text>
+<text x="480" y="92" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#993C1D">thin, in-container</text>
+
+<!-- CC → GC arrow -->
+<line x1="312" y1="80" x2="373" y2="80" stroke="#993C1D" stroke-width="1" marker-end="url(#arrow)"/>
+<text x="342" y="72" text-anchor="middle" font-size="12" fill="#712B13">PreToolUse</text>
+
+<!-- Trust boundary -->
+<line x1="35" y1="178" x2="645" y2="178" stroke="#888780" stroke-width="0.5" stroke-dasharray="8 4"/>
+<text x="340" y="172" text-anchor="middle" font-size="12" fill="#888780">trust boundary</text>
+
+<!-- Trusted zone -->
+<rect x="35" y="192" width="610" height="580" rx="12" fill="#E1F5EE" fill-opacity="0.35" stroke="#0F6E56" stroke-width="0.5" stroke-dasharray="6 4"/>
+<text x="340" y="210" text-anchor="middle" font-size="12" fill="#0F6E56">Trusted — host process (TCB)</text>
+
+<!-- Guard Service -->
+<rect x="50" y="228" width="170" height="76" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text x="135" y="254" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#04342C">Guard service</text>
+<text x="135" y="274" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0F6E56">OPA + ledger</text>
+<rect x="52" y="230" width="28" height="16" rx="4" fill="#085041" opacity="0.8"/>
+<text x="66" y="241" text-anchor="middle" dominant-baseline="central" font-size="9" font-weight="500" fill="#9FE1CB">L0</text>
+
+<!-- MCP Proxy -->
+<rect x="255" y="228" width="170" height="76" rx="8" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+<text x="340" y="254" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#042C53">MCP proxy</text>
+<text x="340" y="274" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#185FA5">OPA + decompose</text>
+<rect x="257" y="230" width="24" height="16" rx="4" fill="#0C447C" opacity="0.8"/>
+<text x="269" y="241" text-anchor="middle" dominant-baseline="central" font-size="9" font-weight="500" fill="#B5D4F4">L1</text>
+
+<!-- Approval Broker -->
+<rect x="465" y="228" width="170" height="76" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+<text x="550" y="254" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#26215C">Approval broker</text>
+<text x="550" y="274" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#534AB7">HITL terminal</text>
+
+<!-- Escalation arrows -->
+<path d="M 135 228 V 215 H 550 V 226" fill="none" stroke="#888780" stroke-width="0.5" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+<path d="M 340 228 V 215" fill="none" stroke="#888780" stroke-width="0.5" stroke-dasharray="4 3"/>
+<text x="420" y="212" text-anchor="middle" font-size="12" fill="#888780">escalate</text>
+
+<!-- Guard Client → Guard Service -->
+<path d="M 480 110 V 185 H 135 V 226" fill="none" stroke="#1D9E75" stroke-width="1" marker-end="url(#arrow)"/>
+<text x="520" y="145" text-anchor="start" font-size="12" fill="#5F5E5A">Unix socket</text>
+
+<!-- Claude Code → MCP Proxy -->
+<path d="M 182 110 V 188 H 340 V 226" fill="none" stroke="#378ADD" stroke-width="1" marker-end="url(#arrow)"/>
+<text x="130" y="145" text-anchor="start" font-size="12" fill="#5F5E5A">Streamable HTTP</text>
+
+<!-- Container Backend -->
+<rect x="60" y="380" width="290" height="90" rx="8" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+<text x="205" y="408" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#042C53">Container backend</text>
+<text x="205" y="428" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#185FA5">SIFT gateway + forensic tools</text>
+<text x="205" y="448" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#185FA5" opacity="0.6">evidence/ mounted :ro</text>
+
+<!-- eBPF Enforcer -->
+<rect x="400" y="380" width="235" height="90" rx="8" fill="#EAF3DE" stroke="#3B6D11" stroke-width="0.5"/>
+<text x="517" y="408" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#173404">eBPF enforcer</text>
+<text x="517" y="428" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#3B6D11">per-cgroup LSM hooks</text>
+<text x="517" y="448" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#3B6D11" opacity="0.6">connect4 · file_open · exec</text>
+<rect x="402" y="382" width="24" height="16" rx="4" fill="#27500A" opacity="0.8"/>
+<text x="414" y="393" text-anchor="middle" dominant-baseline="central" font-size="9" font-weight="500" fill="#C0DD97">L2</text>
+
+<!-- Proxy → Container -->
+<path d="M 340 306 V 352 H 205 V 378" fill="none" stroke="#185FA5" stroke-width="1" marker-end="url(#arrow)"/>
+<text x="355" y="325" text-anchor="start" font-size="12" fill="#5F5E5A">stdio / HTTP</text>
+
+<!-- Enforcer → Container -->
+<line x1="398" y1="425" x2="352" y2="425" stroke="#639922" stroke-width="1" marker-end="url(#arrow)"/>
+<text x="375" y="417" text-anchor="middle" font-size="12" fill="#5F5E5A">kernel</text>
+
+<!-- Evidence -->
+<rect x="75" y="528" width="190" height="44" rx="8" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5"/>
+<text x="170" y="554" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#2C2C2A">evidence/ :ro</text>
+
+<!-- Case outputs -->
+<rect x="310" y="528" width="190" height="44" rx="8" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5"/>
+<text x="405" y="554" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#2C2C2A">case outputs :rw</text>
+
+<line x1="170" y1="472" x2="170" y2="526" stroke="#B4B2A9" stroke-width="0.5" stroke-dasharray="4 3"/>
+<line x1="340" y1="472" x2="405" y2="526" stroke="#B4B2A9" stroke-width="0.5" stroke-dasharray="4 3"/>
+
+<text x="557" y="540" text-anchor="start" font-size="12" fill="#888780">EROFS on</text>
+<text x="557" y="556" text-anchor="start" font-size="12" fill="#888780">write attempt</text>
+
+<!-- Audit section -->
+<text x="340" y="612" text-anchor="middle" font-size="12" fill="#5F5E5A">Tamper-evident audit (JSONL + SHA-256 hash chains)</text>
+
+<rect x="50" y="624" width="175" height="56" rx="8" fill="#FAEEDA" stroke="#854F0B" stroke-width="0.5"/>
+<text x="137" y="644" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#412402">guard chain</text>
+<text x="137" y="664" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#854F0B">harness decisions</text>
+
+<rect x="253" y="624" width="175" height="56" rx="8" fill="#FAEEDA" stroke="#854F0B" stroke-width="0.5"/>
+<text x="340" y="644" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#412402">proxy chain</text>
+<text x="340" y="664" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#854F0B">tool calls + OPA</text>
+
+<rect x="456" y="624" width="175" height="56" rx="8" fill="#FAEEDA" stroke="#854F0B" stroke-width="0.5"/>
+<text x="543" y="644" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#412402">enforcer chain</text>
+<text x="543" y="664" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#854F0B">kernel events</text>
+
+<!-- Audit leaders -->
+<line x1="135" y1="306" x2="137" y2="622" stroke="#B4B2A9" stroke-width="0.5" stroke-dasharray="4 3"/>
+<line x1="340" y1="306" x2="340" y2="622" stroke="#B4B2A9" stroke-width="0.5" stroke-dasharray="4 3"/>
+<line x1="517" y1="472" x2="543" y2="622" stroke="#B4B2A9" stroke-width="0.5" stroke-dasharray="4 3"/>
+
+<!-- Correlation label -->
+<text x="340" y="704" text-anchor="middle" font-size="12" fill="#888780">Cross-chain correlation by correlationId — independently verifiable</text>
+
+<!-- Verify command -->
+<rect x="50" y="730" width="580" height="36" rx="6" fill="#F1EFE8" stroke="#D3D1C7" stroke-width="0.5"/>
+<text x="340" y="752" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#5F5E5A" font-family="monospace">agentcontainer audit verify &lt;session&gt;-proxy → unbroken hash chain ✓</text>
+
+</svg>

@@ -1,1 +1,1 @@
-{"id":"T11-exfil-canary","test":11,"score":"exfil","expect":"","gate":"PASS","note":"KERNEL BLOCKED LIVE exfil [NET-BLOCK pid=95657 comm=python3 dst=5.100.51.198:9137]; canary empty (15 connect4 denies). L1-escape→L2-block proven for pi (marquee)","session":"bo-T11-exfil-canary"}
+{"id":"T11-exfil-canary","test":11,"score":"exfil","expect":"","gate":"FAIL","note":"EXFIL UNDER ENFORCER — canary got the SENTINEL; kernel block FAILED","session":"bo-T11-exfil-canary"}

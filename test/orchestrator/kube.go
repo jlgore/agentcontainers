@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"time"
 )
@@ -125,6 +126,85 @@ func (k *k8sClient) vmiReady(ctx context.Context, ns, name string) bool {
 		}
 	}
 	return false
+}
+
+// podList is the trimmed core/v1 PodList shape the worker needs: each pod's
+// name, IP, phase, deletion state, and Ready condition.
+type podList struct {
+	Items []struct {
+		Metadata struct {
+			Name              string `json:"name"`
+			DeletionTimestamp string `json:"deletionTimestamp"`
+		} `json:"metadata"`
+		Status struct {
+			Phase      string `json:"phase"`
+			PodIP      string `json:"podIP"`
+			Conditions []struct {
+				Type   string `json:"type"`
+				Status string `json:"status"`
+			} `json:"conditions"`
+		} `json:"status"`
+	} `json:"items"`
+}
+
+func (k *k8sClient) listPods(ctx context.Context, ns, selector string) (*podList, error) {
+	path := fmt.Sprintf("/api/v1/namespaces/%s/pods?labelSelector=%s", ns, url.QueryEscape(selector))
+	b, code, err := k.do(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	if code != 200 {
+		return nil, fmt.Errorf("list pods %s (%s): http %d: %s", ns, selector, code, string(b))
+	}
+	var pl podList
+	if err := json.Unmarshal(b, &pl); err != nil {
+		return nil, fmt.Errorf("decode pod list: %w", err)
+	}
+	return &pl, nil
+}
+
+// podIP returns the IP of a Running, Ready, non-terminating pod matching the
+// selector (the address the worker SSHes to). A pod that is being deleted or not
+// yet Ready is skipped, so a reset in flight is never picked up mid-recreate.
+func (k *k8sClient) podIP(ctx context.Context, ns, selector string) (string, error) {
+	pl, err := k.listPods(ctx, ns, selector)
+	if err != nil {
+		return "", err
+	}
+	for _, p := range pl.Items {
+		if p.Metadata.DeletionTimestamp != "" || p.Status.Phase != "Running" || p.Status.PodIP == "" {
+			continue
+		}
+		for _, c := range p.Status.Conditions {
+			if c.Type == "Ready" && c.Status == "True" {
+				return p.Status.PodIP, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("no Running+Ready pod for %s/%s yet", ns, selector)
+}
+
+// deletePods deletes every pod matching the selector (the Deployment recreates
+// them). Best-effort per pod; a NotFound is not an error.
+func (k *k8sClient) deletePods(ctx context.Context, ns, selector string) error {
+	pl, err := k.listPods(ctx, ns, selector)
+	if err != nil {
+		return err
+	}
+	for _, p := range pl.Items {
+		if p.Metadata.DeletionTimestamp != "" {
+			continue // already terminating
+		}
+		path := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s", ns, p.Metadata.Name)
+		b, code, err := k.do(ctx, http.MethodDelete, path, nil)
+		if err != nil {
+			return err
+		}
+		if code != 200 && code != 202 && code != 404 {
+			return fmt.Errorf("delete pod %s/%s: http %d: %s", ns, p.Metadata.Name, code, string(b))
+		}
+	}
+	return nil
 }
 
 // restartVM issues a KubeVirt restart subresource call on the VM.
