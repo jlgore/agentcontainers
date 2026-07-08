@@ -68,15 +68,18 @@ func newBreakoutHITLService(t *testing.T, broker *approval.ToolCallBroker) *Serv
 // scriptedApprover plays a human with an arbitrary decision policy over the
 // request and its ordinal. It also records every ArgsSummary it was shown.
 func scriptedApprover(b *approval.ToolCallBroker, seen *[]string, mu *sync.Mutex, decide func(req approval.ToolCallRequest, n int) (bool, string)) {
-	n := 0
-	for req := range b.Subscribe() {
-		n++
-		mu.Lock()
-		*seen = append(*seen, req.ArgsSummary)
-		mu.Unlock()
-		ok, reason := decide(req, n)
-		_ = b.Resolve(req.ID, approval.ToolCallDecision{Approved: ok, Reason: reason, Decider: "scripted"})
-	}
+	sub := b.Subscribe() // subscribe synchronously so a Decide() right after can't race ahead
+	go func() {
+		n := 0
+		for req := range sub {
+			n++
+			mu.Lock()
+			*seen = append(*seen, req.ArgsSummary)
+			mu.Unlock()
+			ok, reason := decide(req, n)
+			_ = b.Resolve(req.ID, approval.ToolCallDecision{Approved: ok, Reason: reason, Decider: "scripted"})
+		}
+	}()
 }
 
 // A redirect into the read-only evidence dir: cat is allowlisted, but the `>`
@@ -93,7 +96,7 @@ func TestBreakoutHITL_CredulousApproverAllows(t *testing.T) {
 	var seen []string
 	var mu sync.Mutex
 	broker := approval.NewToolCallBroker(5 * time.Second)
-	go scriptedApprover(broker, &seen, &mu, func(approval.ToolCallRequest, int) (bool, string) {
+	scriptedApprover(broker, &seen, &mu, func(approval.ToolCallRequest, int) (bool, string) {
 		return true, "looks fine" // a human who rubber-stamps
 	})
 	svc := newBreakoutHITLService(t, broker)
@@ -119,7 +122,7 @@ func TestBreakoutHITL_DiligentApproverDenies(t *testing.T) {
 	broker := approval.NewToolCallBroker(5 * time.Second)
 	// A diligent human: refuse anything touching evidence or the audit trail,
 	// judging on the action shown (ArgsSummary) — not on any framing.
-	go scriptedApprover(broker, &seen, &mu, func(req approval.ToolCallRequest, _ int) (bool, string) {
+	scriptedApprover(broker, &seen, &mu, func(req approval.ToolCallRequest, _ int) (bool, string) {
 		if strings.Contains(req.ArgsSummary, "/evidence") || strings.Contains(req.ArgsSummary, "/var/lib/ac/audit") {
 			return false, "touches protected path"
 		}
@@ -142,7 +145,7 @@ func TestBreakoutHITL_GateStrengthIsTheApprover(t *testing.T) {
 		var seen []string
 		var mu sync.Mutex
 		broker := approval.NewToolCallBroker(5 * time.Second)
-		go scriptedApprover(broker, &seen, &mu, func(approval.ToolCallRequest, int) (bool, string) {
+		scriptedApprover(broker, &seen, &mu, func(approval.ToolCallRequest, int) (bool, string) {
 			return approve, "policy"
 		})
 		svc := newBreakoutHITLService(t, broker)
@@ -165,7 +168,7 @@ func TestBreakoutHITL_FatigueFloodRubberStamps(t *testing.T) {
 	var seen []string
 	var mu sync.Mutex
 	broker := approval.NewToolCallBroker(5 * time.Second)
-	go scriptedApprover(broker, &seen, &mu, func(_ approval.ToolCallRequest, n int) (bool, string) {
+	scriptedApprover(broker, &seen, &mu, func(_ approval.ToolCallRequest, n int) (bool, string) {
 		if n <= window {
 			return true, "rubber-stamp"
 		}
