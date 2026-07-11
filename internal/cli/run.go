@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -33,13 +34,24 @@ import (
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/signing"
 )
 
+var (
+	runRuntimeFactory       = newRuntime
+	runResolveSidecar       = resolveSidecar
+	runExtractPolicy        = orgpolicy.ExtractPolicy
+	runMergePolicy          = orgpolicy.MergePolicy
+	runVerifyImageSignature = verifyImageSignature
+	runNewDockerClient      = func() (client.APIClient, error) { return client.New(client.FromEnv) }
+	runStopSidecar          = sidecar.StopSidecar
+)
+
 func newRunCmd() *cobra.Command {
 	var (
-		detach             bool
-		timeout            time.Duration
-		configPath         string
-		runtimeFlag        string
-		insecureSkipVerify bool
+		detach                bool
+		timeout               time.Duration
+		configPath            string
+		runtimeFlag           string
+		insecureSkipVerify    bool
+		insecureSkipOrgPolicy bool
 	)
 
 	cmd := &cobra.Command{
@@ -53,7 +65,7 @@ Org policy is resolved automatically from the workspace hierarchy
 (.agentcontainers/policy.json) or from the lockfile's pinned digest.
 It cannot be overridden at runtime.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runRun(cmd, detach, timeout, configPath, runtimeFlag, insecureSkipVerify)
+			return runRun(cmd, detach, timeout, configPath, runtimeFlag, insecureSkipVerify, insecureSkipOrgPolicy)
 		},
 	}
 
@@ -62,6 +74,7 @@ It cannot be overridden at runtime.`,
 	cmd.Flags().StringVarP(&configPath, "config", "c", "", "Path to agentcontainer.json")
 	cmd.Flags().StringVar(&runtimeFlag, "runtime", "docker", "Container runtime backend (auto|docker|compose|sandbox)")
 	cmd.Flags().BoolVar(&insecureSkipVerify, "insecure-skip-verify", false, "Skip cosign signature verification (dev only)")
+	cmd.Flags().BoolVar(&insecureSkipOrgPolicy, "insecure-skip-org-policy", false, "Skip image org-policy extraction (dev/local images only)")
 
 	return cmd
 }
@@ -129,7 +142,7 @@ func policyImageRef(imageTag, cfgPath string) string {
 	return ref + "@" + lf.Resolved.Image.Digest
 }
 
-func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath string, runtimeFlag string, insecureSkipVerify bool) error {
+func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath string, runtimeFlag string, insecureSkipVerify bool, insecureSkipOrgPolicy bool) error {
 	// 0. Resolve "auto" to a concrete runtime type so all downstream checks
 	// (e.g. sandbox sidecar skip) work regardless of the original flag value.
 	resolvedRuntime := container.RuntimeType(runtimeFlag)
@@ -149,6 +162,10 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 		return fmt.Errorf("run: invalid configuration: %w", err)
 	}
 
+	if err := verifyRunPolicyChannel(cmd.Context(), cfg, cfgPath, newOCIResolver()); err != nil {
+		return err
+	}
+
 	// 1b. Extract org policy from the image manifest and validate against
 	// workspace config. Policy is embedded in the image as a typed layer at
 	// build time (PRD-017). If no policy layer is found, DefaultPolicy() is
@@ -165,33 +182,25 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 	// regardless of tag mutation.
 	policyRef := policyImageRef(cfg.Image, cfgPath)
 
-	orgPolicy, err := orgpolicy.ExtractPolicy(cmd.Context(), policyRef)
-	if err != nil {
-		return fmt.Errorf("run: extracting org policy from image: %w", err)
-	}
-	if err := orgpolicy.MergePolicy(orgPolicy, cfg); err != nil {
-		return fmt.Errorf("run: org policy violation: %w", err)
-	}
-
-	// 1b-ii. An explicit agent.orgPolicy reference points to a dedicated
-	// org policy artifact published separately from the image. Org policy is
-	// strictly additive (deny always wins), so merging it on top of the
-	// image-layer policy can only tighten the effective configuration.
-	if cfg.Agent != nil && cfg.Agent.OrgPolicy != "" {
-		refPolicy, err := orgpolicy.ExtractPolicy(cmd.Context(), cfg.Agent.OrgPolicy)
+	orgPolicy := orgpolicy.DefaultPolicy()
+	if insecureSkipOrgPolicy {
+		logger.Warn("skipping image org-policy extraction (--insecure-skip-org-policy)")
+	} else {
+		var err error
+		orgPolicy, err = runExtractPolicy(cmd.Context(), policyRef)
 		if err != nil {
-			return fmt.Errorf("run: extracting org policy from %s: %w", cfg.Agent.OrgPolicy, err)
+			return fmt.Errorf("run: extracting org policy from image: %w", err)
 		}
-		if err := orgpolicy.MergePolicy(refPolicy, cfg); err != nil {
-			return fmt.Errorf("run: org policy violation (%s): %w", cfg.Agent.OrgPolicy, err)
-		}
+	}
+	if err := runMergePolicy(orgPolicy, cfg); err != nil {
+		return fmt.Errorf("run: org policy violation: %w", err)
 	}
 
 	// 1c. Verify image signature (F-1) when provenance requires it.
 	// We verify against policyRef (the lockfile-pinned digest) so the
 	// signature check and the policy extraction operate on the same manifest.
 	if !insecureSkipVerify {
-		if err := verifyImageSignature(cmd, cfg, policyRef); err != nil {
+		if err := runVerifyImageSignature(cmd, cfg, policyRef); err != nil {
 			return fmt.Errorf("run: image signature verification failed: %w", err)
 		}
 	}
@@ -222,31 +231,9 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 	// For Sandbox runtime, the sidecar runs inside the VM (managed by the runtime),
 	// so skip host-level sidecar resolution.
 	var sidecarHandle *sidecar.SidecarHandle
-	var enfStrategy enforcement.Strategy
 	var enfAddr string
-	// livenessProbe checks enforcer reachability from this process using the
-	// same credentials a real client presents; nil disables host-side liveness
-	// (e.g. for an in-VM mTLS enforcer whose credentials live in the runtime).
-	var livenessProbe func(string) bool
 	enfLevel := enforcement.LevelNone
 	var enfSource string
-
-	// insecureDev permits plaintext control-plane connections; it is an explicit
-	// development opt-in surfaced through agent.enforcer.insecureDev.
-	insecureDev := false
-	// kernelPrimary declares the host kernel's eBPF LSM as the primary
-	// containment boundary (Docker Engine, no sandboxd VM). When set, containers
-	// run with --cgroupns=host and the run refuses to start unless the enforcer's
-	// BPF LSM hooks are actually attached. See config.EnforcerConfig.KernelPrimary.
-	kernelPrimary := false
-	if cfg.Agent != nil && cfg.Agent.Enforcer != nil {
-		insecureDev = cfg.Agent.Enforcer.InsecureDev
-		kernelPrimary = cfg.Agent.Enforcer.KernelPrimary
-	}
-	// enfProfile carries the enforcer connection profile for the kernel-primary
-	// LSM gate below; populated on the host-sidecar path.
-	var enfProfile enforcement.ConnectionProfile
-	var haveProfile bool
 
 	if isSandbox {
 		// Sandbox manages its own in-VM enforcer. Set enforcement level to
@@ -255,54 +242,41 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 		enfSource = "in-vm"
 		logger.Info("sandbox runtime: in-VM enforcement, skipping host sidecar")
 	} else {
-		sidecarHandle, err = resolveSidecar(cmd, cfg, insecureDev)
+		sidecarHandle, enfAddr, err = runResolveSidecar(cmd, cfg)
 		if err != nil {
 			return fmt.Errorf("run: %w", err)
 		}
 
-		// Build the enforcement strategy from the sidecar's connection profile.
-		// The profile (address + ephemeral mTLS material) is threaded explicitly
-		// into the runtime; no AC_ENFORCER_* environment variable is mutated.
+		// Determine enforcement level from sidecar resolution.
 		if sidecarHandle != nil && sidecarHandle.Addr != "" {
 			enfLevel = enforcement.LevelGRPC
-			enfAddr = sidecarHandle.Addr
 			if sidecarHandle.Managed {
 				enfSource = "auto-started"
 			} else {
 				enfSource = "external"
 			}
-			profile := sidecarHandle.Profile()
-			enfProfile = profile
-			haveProfile = true
-			enfStrategy, err = enforcement.NewStrategyFromProfile(profile, func(msg string) {
-				logger.Warn(msg)
-			})
-			if err != nil {
-				return fmt.Errorf("run: enforcer connection: %w", err)
-			}
-			// Liveness probe uses the same connection profile (mTLS when set).
-			livenessProbe = func(string) bool {
-				return enforcement.ProbeEnforcerHealthProfile(profile)
-			}
+			_ = os.Setenv("AC_ENFORCER_ADDR", enfAddr)
+		} else if enfAddr != "" {
+			// This shouldn't normally occur (handle nil but addr set), but handle it.
+			enfLevel = enforcement.LevelGRPC
+			enfSource = "external"
+			_ = os.Setenv("AC_ENFORCER_ADDR", enfAddr)
 		}
 	}
 	logger.Info("enforcement level resolved", zap.String("level", enfLevel.String()), zap.String("source", enfSource))
 
-	// Kernel-primary gate: when the eBPF LSM is the primary containment boundary
-	// (Docker Engine, no sandboxd VM), refuse to start anything unenforced. The
-	// Sandbox runtime is exempt — its VM is the boundary and eBPF is bonus
-	// defense-in-depth, validated in-VM rather than from this process.
-	if kernelPrimary && !isSandbox {
-		if err := enforceKernelPrimaryGate(cmd.Context(), enfStrategy, haveProfile, enfProfile); err != nil {
-			return fmt.Errorf("run: kernel-primary enforcement unavailable: %w", err)
-		}
-		logger.Info("kernel-primary enforcement verified: BPF LSM hooks active, cgroupns=host")
-	}
-
-	rt, err := newEnforcingRuntime(runtimeFlag, logger, enfLevel, enfStrategy, insecureDev, kernelPrimary && !isSandbox)
+	rt, err := runRuntimeFactory(string(resolvedRuntime), logger, enfLevel)
 	if err != nil {
 		return fmt.Errorf("run: %w", err)
 	}
+
+	sessionStarted := false
+	defer func() {
+		if sessionStarted || isSandbox || sidecarHandle == nil || !sidecarHandle.Managed {
+			return
+		}
+		stopManagedSidecar(cmd.OutOrStdout(), sidecarHandle)
+	}()
 
 	// 2b. Resolve secrets if configured.
 	var secretsMgr *secrets.Manager
@@ -322,7 +296,7 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 	if cfg.Agent != nil {
 		caps = cfg.Agent.Capabilities
 	}
-	resolvedPolicy := policy.Resolve(caps)
+	resolvedPolicy := resolveRuntimePolicy(cfg)
 
 	// 3b. Apply policy config overrides.
 	var policyConfig *config.PolicyConfig
@@ -372,11 +346,6 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 		// and to Sandbox for CredentialSources/ServiceAuthConfig.
 		opts.ResolvedSecrets = secretsMgr.CachedSecrets()
 	}
-	if cfg.Agent != nil && cfg.Agent.Enforcer != nil {
-		// Freeze the agent's writable execution-config immutable during the
-		// enforcement bootstrap (Docker/kernel-primary runtime). Opt-in.
-		opts.FreezeConfig = cfg.Agent.Enforcer.FreezeConfig
-	}
 
 	// 7. Start the container.
 	ctx, cancel := context.WithCancel(cmd.Context())
@@ -386,15 +355,13 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 	if err != nil {
 		return fmt.Errorf("run: starting container: %w", err)
 	}
+	sessionStarted = true
 
-	// For sandbox, the in-VM enforcer address is reported on the session; the
-	// per-VM strategy is built inside the runtime from the sidecar's connection
-	// profile, so no AC_ENFORCER_ADDR mutation is needed here. Host-side liveness
-	// stays disabled (livenessProbe is nil) because the in-VM enforcer's mTLS
-	// credentials live in the runtime, not this process.
+	// For sandbox, read enforcer address from the session (set by the runtime).
 	if isSandbox && session.EnforcerAddr != "" {
 		enfAddr = session.EnforcerAddr
-		logger.Info("in-VM enforcer address", zap.String("addr", session.EnforcerAddr))
+		_ = os.Setenv("AC_ENFORCER_ADDR", enfAddr)
+		logger.Info("in-VM enforcer address", zap.String("addr", enfAddr))
 	}
 
 	// 7b. Log container started and start secret rotation.
@@ -479,8 +446,8 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 	// If enforcement is gRPC and the enforcer becomes unreachable, cancel
 	// the context to trigger container stop (fail-closed).
 	enforcerDead := make(chan struct{})
-	if enfLevel == enforcement.LevelGRPC && enfAddr != "" && livenessProbe != nil {
-		go runEnforcerLiveness(ctx, cancel, enfAddr, 10*time.Second, 3, enforcerDead, livenessProbe)
+	if enfLevel == enforcement.LevelGRPC && enfAddr != "" {
+		go runEnforcerLiveness(ctx, cancel, enfAddr, 10*time.Second, 3, enforcerDead, enforcement.ProbeEnforcerHealth)
 	}
 
 	select {
@@ -512,19 +479,85 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 	// Stop managed sidecar after agent container is stopped.
 	// (Sandbox runtime manages its own sidecar teardown in Stop().)
 	if !isSandbox && sidecarHandle != nil && sidecarHandle.Managed {
-		dockerCli, cliErr := client.New(client.FromEnv)
-		if cliErr == nil {
-			if stopErr := sidecar.StopSidecar(context.Background(), dockerCli, sidecarHandle); stopErr != nil {
-				logger.Warn("failed to stop agentcontainer-enforcer sidecar", zap.Error(stopErr))
-			} else {
-				_, _ = fmt.Fprintf(out, "Enforcer stopped\n")
-			}
-		} else {
-			logger.Warn("failed to create docker client for sidecar teardown", zap.Error(cliErr))
-		}
+		stopManagedSidecar(out, sidecarHandle)
 	}
 
 	return nil
+}
+
+func verifyRunPolicyChannel(ctx context.Context, cfg *config.AgentContainer, cfgPath string, fetcher policyBundleFetcher) error {
+	policyRef := configuredPolicyRef(cfg)
+	if policyRef == "" {
+		return nil
+	}
+	if cfgPath == "" {
+		return fmt.Errorf("run: mutable policy channel: config path is required")
+	}
+
+	lf, err := config.LoadLockfile(filepath.Dir(cfgPath))
+	if err != nil {
+		return fmt.Errorf("run: mutable policy channel: loading lockfile: %w", err)
+	}
+	if err := lf.Validate(); err != nil {
+		return fmt.Errorf("run: mutable policy channel: invalid lockfile: %w", err)
+	}
+	if lf.Resolved.Policy == nil {
+		return fmt.Errorf("run: mutable policy channel: policy %s is not pinned in lockfile", policyRef)
+	}
+	if coverageIssues := requirePolicyChannelLockCoverage(cfg, lf); len(coverageIssues) > 0 {
+		var msgs []string
+		for _, issue := range coverageIssues {
+			msgs = append(msgs, issue.label+" is not pinned in lockfile")
+		}
+		return fmt.Errorf("run: mutable policy channel requires lockfile coverage: %s", strings.Join(msgs, "; "))
+	}
+
+	now := time.Now().UTC()
+	currentPolicy, bundle, err := resolvePolicyChannel(ctx, fetcher, policyRef, now)
+	if err != nil {
+		return fmt.Errorf("run: mutable policy channel: fetching policy %s: %w", policyRef, err)
+	}
+	if err := checkPolicyReplacement(lf.Resolved.Policy, currentPolicy); err != nil {
+		return fmt.Errorf("run: mutable policy channel: policy %s: %w", policyRef, err)
+	}
+	if _, err := verifyPolicyChannelSignature(ctx, policyRef, currentPolicy.Digest, signing.VerifyOptions{}); err != nil {
+		return fmt.Errorf("run: mutable policy channel: policy %s signature verification failed: %w", policyRef, err)
+	}
+	if issues := evaluatePolicyChannelArtifacts(cfg, lf, bundle, now); len(issues) > 0 {
+		var msgs []string
+		for _, issue := range issues {
+			msgs = append(msgs, fmt.Sprintf("%s: %v", issue.label, issue.err))
+		}
+		return fmt.Errorf("run: mutable policy channel denied artifact(s): %s", strings.Join(msgs, "; "))
+	}
+
+	return nil
+}
+
+func stopManagedSidecar(out io.Writer, handle *sidecar.SidecarHandle) {
+	dockerCli, cliErr := runNewDockerClient()
+	if cliErr != nil {
+		logger.Warn("failed to create docker client for sidecar teardown", zap.Error(cliErr))
+		return
+	}
+	if stopErr := runStopSidecar(context.Background(), dockerCli, handle); stopErr != nil {
+		logger.Warn("failed to stop agentcontainer-enforcer sidecar", zap.Error(stopErr))
+		return
+	}
+	_, _ = fmt.Fprintf(out, "Enforcer stopped\n")
+}
+
+func resolveRuntimePolicy(cfg *config.AgentContainer) *policy.ContainerPolicy {
+	var caps *config.Capabilities
+	if cfg != nil && cfg.Agent != nil {
+		caps = cfg.Agent.Capabilities
+	}
+
+	resolvedPolicy := policy.Resolve(caps)
+	if cfg != nil && cfg.Agent != nil {
+		resolvedPolicy.SecretACLs = policy.ResolveSecrets(cfg.Agent.Secrets, cfg.Agent.Tools)
+	}
+	return resolvedPolicy
 }
 
 // verifyImageSignature checks the cosign signature of imageRef when the
@@ -580,7 +613,7 @@ func verifyImageSignature(cmd *cobra.Command, cfg *config.AgentContainer, imageR
 
 // resolveSidecar discovers an external sidecar or auto-starts a managed one.
 // Returns a SidecarHandle (possibly nil), the enforcement address to use, and any error.
-func resolveSidecar(cmd *cobra.Command, cfg *config.AgentContainer, insecureDev bool) (*sidecar.SidecarHandle, error) {
+func resolveSidecar(cmd *cobra.Command, cfg *config.AgentContainer) (*sidecar.SidecarHandle, string, error) {
 	var enfCfg *config.EnforcerConfig
 	if cfg.Agent != nil {
 		enfCfg = cfg.Agent.Enforcer
@@ -592,45 +625,22 @@ func resolveSidecar(cmd *cobra.Command, cfg *config.AgentContainer, insecureDev 
 		configAddr = enfCfg.Addr
 	}
 
-	// 1. Check for pre-existing sidecar. Its mTLS material, if any, is supplied
-	// out of band through AC_ENFORCER_TLS_* in the environment this process was
-	// launched with (reading explicit external config is not the in-process
-	// global-mutation pattern the control-plane finding targets). Probe each
-	// candidate with that profile — a plaintext probe would classify a correctly
-	// configured mTLS-only external enforcer as unreachable.
-	externalProfile := func(addr string) enforcement.ConnectionProfile {
-		return enforcement.ConnectionProfile{
-			Addr:           addr,
-			CACertPath:     os.Getenv("AC_ENFORCER_TLS_CA"),
-			ClientCertPath: os.Getenv("AC_ENFORCER_TLS_CERT"),
-			ClientKeyPath:  os.Getenv("AC_ENFORCER_TLS_KEY"),
-			InsecureDev:    insecureDev,
-		}
-	}
-	result := sidecar.DiscoverExternalSidecarWithProber(
-		sidecar.DiscoverOptions{ConfigAddr: configAddr},
-		func(addr string) bool { return enforcement.ProbeEnforcerHealthProfile(externalProfile(addr)) },
-	)
+	// 1. Check for pre-existing sidecar.
+	result := sidecar.DiscoverExternalSidecar(sidecar.DiscoverOptions{
+		ConfigAddr: configAddr,
+	})
 	if result.Addr != "" {
 		logger.Info("using pre-existing agentcontainer-enforcer",
 			zap.String("addr", result.Addr),
 			zap.String("source", result.Source),
 		)
-		p := externalProfile(result.Addr)
-		return &sidecar.SidecarHandle{
-			Addr:           result.Addr,
-			Managed:        false,
-			CACertPath:     p.CACertPath,
-			ClientCertPath: p.ClientCertPath,
-			ClientKeyPath:  p.ClientKeyPath,
-			InsecureDev:    insecureDev,
-		}, nil
+		return &sidecar.SidecarHandle{Addr: result.Addr, Managed: false}, result.Addr, nil
 	}
 
 	// 2. No external sidecar — auto-start if addr override not explicitly set.
 	// If addr is configured but unreachable, that is an error.
 	if configAddr != "" {
-		return nil, fmt.Errorf("enforcer addr %q configured but sidecar not reachable", configAddr)
+		return nil, "", fmt.Errorf("enforcer addr %q configured but sidecar not reachable", configAddr)
 	}
 
 	// 3. Auto-start.
@@ -648,63 +658,42 @@ func resolveSidecar(cmd *cobra.Command, cfg *config.AgentContainer, insecureDev 
 	dockerCli, err := client.New(client.FromEnv)
 	if err != nil {
 		if required {
-			return nil, fmt.Errorf("enforcer: docker unavailable: %w", err)
+			return nil, "", fmt.Errorf("enforcer: docker unavailable: %w", err)
 		}
 		logger.Warn("docker unavailable, enforcement disabled (required: false)", zap.Error(err))
-		return nil, nil
+		return nil, "", nil
 	}
 
 	_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Starting agentcontainer-enforcer sidecar...")
-	handle, err := sidecar.StartSidecar(cmd.Context(), dockerCli, sidecar.StartOptions{
+	startOpts := sidecar.StartOptions{
 		Image:    image,
 		Required: required,
-		// Managed host-local sidecar: publish only on loopback and require mTLS
-		// unless the operator explicitly opted into plaintext development mode.
-		HostBindIP:  "127.0.0.1",
-		MTLS:        !insecureDev,
-		InsecureDev: insecureDev,
-	})
+	}
+	if runtime.GOOS == "linux" {
+		socketDir, err := os.MkdirTemp("", "agentcontainer-enforcer-")
+		if err != nil {
+			if required {
+				return nil, "", fmt.Errorf("enforcer: creating socket dir: %w", err)
+			}
+			logger.Warn("could not create enforcer socket directory, falling back to random TCP", zap.Error(err))
+			startOpts.RandomHostPort = true
+		} else {
+			startOpts.SocketPath = filepath.Join(socketDir, "agentcontainer-enforcer.sock")
+		}
+	} else {
+		startOpts.RandomHostPort = true
+	}
+	handle, err := sidecar.StartSidecar(cmd.Context(), dockerCli, startOpts)
 	if err != nil {
-		return nil, fmt.Errorf("enforcer: %w", err)
+		return nil, "", fmt.Errorf("enforcer: %w", err)
 	}
 	if handle == nil {
 		// Only reachable when required: false
 		logger.Warn("enforcer unavailable, enforcement disabled (required: false)")
-		return nil, nil
+		return nil, "", nil
 	}
 
-	return handle, nil
-}
-
-// enforceKernelPrimaryGate verifies the host kernel preconditions and the live
-// enforcer state required for kernel-primary containment, failing closed if
-// either is unmet. It runs two checks:
-//
-//   - the host precheck (cgroup v2 + "bpf" in the kernel lsm= ordering), a fast
-//     local read that gives a clear error before any container starts; and
-//   - the authoritative enforcer check (GetStats.lsm_active), confirming the
-//     file_open/bprm_check LSM hooks actually attached — network/cgroup hooks
-//     can attach without BPF LSM, so a SERVING enforcer is not proof of it.
-//
-// An absent enforcer (required:false → nil strategy / no profile) is itself a
-// failure here: kernel-primary explicitly demands kernel enforcement.
-func enforceKernelPrimaryGate(ctx context.Context, strategy enforcement.Strategy, haveProfile bool, profile enforcement.ConnectionProfile) error {
-	if err := enforcement.CheckKernelPrimaryHost(); err != nil {
-		return err
-	}
-	if strategy == nil || !haveProfile {
-		return fmt.Errorf("no enforcer is running, but kernel-primary requires kernel " +
-			"enforcement; start the enforcer or unset agent.enforcer.kernelPrimary")
-	}
-	active, detail, err := enforcement.CheckLSMActive(ctx, profile, func(msg string) { logger.Warn(msg) })
-	if err != nil {
-		return fmt.Errorf("could not confirm enforcer BPF LSM status: %w", err)
-	}
-	if !active {
-		return fmt.Errorf("enforcer is running but its BPF LSM hooks are NOT attached "+
-			"(filesystem deny-list and exec enforcement are inactive): %s", detail)
-	}
-	return nil
+	return handle, handle.Addr, nil
 }
 
 // buildSecretsManager creates a secrets.Manager from the agent configuration,
@@ -716,11 +705,11 @@ func buildSecretsManager(ctx context.Context, cfg *config.AgentContainer) (*secr
 	var opts []secrets.ManagerOption
 	var cleanups []func()
 
-	// Pre-process secrets to expand the env://NAME shorthand into its
-	// canonical provider ("env") plus parsed params. Config validation
-	// rejects every other URI scheme in the provider field, so by the time
-	// we reach this point only env:// shorthand or canonical provider names
-	// remain.
+	// Pre-process secrets to detect URI schemes in the Provider field.
+	// A Provider value like "op://vault/item/field" must be resolved to its
+	// canonical provider name ("1password") before the switch below, otherwise
+	// the raw URI string falls through to the default branch and returns an
+	// "unknown secret provider" error.
 	processedSecrets := make(map[string]config.SecretConfig, len(cfg.Agent.Secrets))
 	uriRefs := make(map[string]secrets.SecretRef)
 
@@ -837,18 +826,6 @@ func buildSecretsManager(ctx context.Context, cfg *config.AgentContainer) (*secr
 		}
 		if sc.Mount != "" {
 			ref.Params["mount"] = sc.Mount
-		}
-		if sc.Vault != "" {
-			ref.Params["vault"] = sc.Vault
-		}
-		if sc.Item != "" {
-			ref.Params["item"] = sc.Item
-		}
-		if sc.Field != "" {
-			ref.Params["field"] = sc.Field
-		}
-		if len(sc.Scope) > 0 {
-			ref.Params["scope"] = strings.Join(sc.Scope, ",")
 		}
 		refs = append(refs, ref)
 	}

@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	dockercontainer "github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/jsonstream"
+	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
 )
 
@@ -18,30 +20,13 @@ import (
 type mockDockerClient struct {
 	client.APIClient
 
-	imageInspectFn      func(ctx context.Context, ref string, opts ...client.ImageInspectOption) (client.ImageInspectResult, error)
-	imagePullFn         func(ctx context.Context, ref string, opts client.ImagePullOptions) (client.ImagePullResponse, error)
-	containerCreateFn   func(ctx context.Context, opts client.ContainerCreateOptions) (client.ContainerCreateResult, error)
-	containerStartFn    func(ctx context.Context, id string, opts client.ContainerStartOptions) (client.ContainerStartResult, error)
-	containerStopFn     func(ctx context.Context, id string, opts client.ContainerStopOptions) (client.ContainerStopResult, error)
-	containerRemoveFn   func(ctx context.Context, id string, opts client.ContainerRemoveOptions) (client.ContainerRemoveResult, error)
-	copyFromContainerFn func(ctx context.Context, id string, opts client.CopyFromContainerOptions) (client.CopyFromContainerResult, error)
-	copyToContainerFn   func(ctx context.Context, id string, opts client.CopyToContainerOptions) (client.CopyToContainerResult, error)
-}
-
-func (m *mockDockerClient) CopyFromContainer(ctx context.Context, id string, opts client.CopyFromContainerOptions) (client.CopyFromContainerResult, error) {
-	if m.copyFromContainerFn != nil {
-		return m.copyFromContainerFn(ctx, id, opts)
-	}
-	return client.CopyFromContainerResult{}, errors.New("copy not implemented")
-}
-
-func (m *mockDockerClient) CopyToContainer(ctx context.Context, id string, opts client.CopyToContainerOptions) (client.CopyToContainerResult, error) {
-	if m.copyToContainerFn != nil {
-		return m.copyToContainerFn(ctx, id, opts)
-	}
-	// Pushing creds is infrastructure most tests don't assert on; succeed by
-	// default. Tests that inspect the pushed material set copyToContainerFn.
-	return client.CopyToContainerResult{}, nil
+	imageInspectFn     func(ctx context.Context, ref string, opts ...client.ImageInspectOption) (client.ImageInspectResult, error)
+	imagePullFn        func(ctx context.Context, ref string, opts client.ImagePullOptions) (client.ImagePullResponse, error)
+	containerCreateFn  func(ctx context.Context, opts client.ContainerCreateOptions) (client.ContainerCreateResult, error)
+	containerStartFn   func(ctx context.Context, id string, opts client.ContainerStartOptions) (client.ContainerStartResult, error)
+	containerInspectFn func(ctx context.Context, id string, opts client.ContainerInspectOptions) (client.ContainerInspectResult, error)
+	containerStopFn    func(ctx context.Context, id string, opts client.ContainerStopOptions) (client.ContainerStopResult, error)
+	containerRemoveFn  func(ctx context.Context, id string, opts client.ContainerRemoveOptions) (client.ContainerRemoveResult, error)
 }
 
 func (m *mockDockerClient) ImageInspect(ctx context.Context, ref string, opts ...client.ImageInspectOption) (client.ImageInspectResult, error) {
@@ -70,6 +55,13 @@ func (m *mockDockerClient) ContainerStart(ctx context.Context, id string, opts c
 		return m.containerStartFn(ctx, id, opts)
 	}
 	return client.ContainerStartResult{}, nil
+}
+
+func (m *mockDockerClient) ContainerInspect(ctx context.Context, id string, opts client.ContainerInspectOptions) (client.ContainerInspectResult, error) {
+	if m.containerInspectFn != nil {
+		return m.containerInspectFn(ctx, id, opts)
+	}
+	return client.ContainerInspectResult{}, errors.New("container not found")
 }
 
 func (m *mockDockerClient) ContainerStop(ctx context.Context, id string, opts client.ContainerStopOptions) (client.ContainerStopResult, error) {
@@ -206,6 +198,148 @@ func TestStartSidecar_HealthCheckAddrEmpty_DefaultsToLocalhost(t *testing.T) {
 	if probeTarget != "127.0.0.1:9999" {
 		t.Errorf("health probe target = %q, want %q", probeTarget, "127.0.0.1:9999")
 	}
+}
+
+func TestStartSidecar_RandomHostPort(t *testing.T) {
+	var hostPort string
+	mock := &mockDockerClient{
+		containerCreateFn: func(ctx context.Context, opts client.ContainerCreateOptions) (client.ContainerCreateResult, error) {
+			port := network.MustParsePort("50051/tcp")
+			bindings := opts.HostConfig.PortBindings[port]
+			if len(bindings) != 1 {
+				t.Fatalf("port bindings = %d, want 1", len(bindings))
+			}
+			hostPort = bindings[0].HostPort
+			return client.ContainerCreateResult{ID: "random-port-id"}, nil
+		},
+		containerInspectFn: func(ctx context.Context, id string, opts client.ContainerInspectOptions) (client.ContainerInspectResult, error) {
+			return client.ContainerInspectResult{
+				Container: dockercontainer.InspectResponse{
+					NetworkSettings: &dockercontainer.NetworkSettings{
+						Ports: network.PortMap{
+							network.MustParsePort("50051/tcp"): {
+								{HostPort: "32791"},
+							},
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	origProber := defaultHealthProber
+	defaultHealthProber = alwaysHealthy
+	defer func() { defaultHealthProber = origProber }()
+
+	handle, err := StartSidecar(context.Background(), mock, StartOptions{
+		RandomHostPort: true,
+		HealthTimeout:  1 * time.Second,
+		HealthInterval: 10 * time.Millisecond,
+		Required:       true,
+	})
+
+	if err != nil {
+		t.Fatalf("StartSidecar() unexpected error: %v", err)
+	}
+	if hostPort != "" {
+		t.Errorf("host port binding = %q, want empty for Docker-assigned port", hostPort)
+	}
+	if handle.Addr != "127.0.0.1:32791" {
+		t.Errorf("handle.Addr = %q, want %q", handle.Addr, "127.0.0.1:32791")
+	}
+}
+
+func TestStartSidecar_GrantsProcRootInspectionCapability(t *testing.T) {
+	var capAdd []string
+	mock := &mockDockerClient{
+		containerCreateFn: func(ctx context.Context, opts client.ContainerCreateOptions) (client.ContainerCreateResult, error) {
+			capAdd = append([]string(nil), opts.HostConfig.CapAdd...)
+			return client.ContainerCreateResult{ID: "caps-id"}, nil
+		},
+	}
+
+	origProber := defaultHealthProber
+	defaultHealthProber = alwaysHealthy
+	defer func() { defaultHealthProber = origProber }()
+
+	_, err := StartSidecar(context.Background(), mock, StartOptions{
+		HealthTimeout:  1 * time.Second,
+		HealthInterval: 10 * time.Millisecond,
+		Required:       true,
+	})
+	if err != nil {
+		t.Fatalf("StartSidecar() unexpected error: %v", err)
+	}
+	if !containsString(capAdd, "SYS_PTRACE") {
+		t.Fatalf("CapAdd = %#v, want SYS_PTRACE for /proc/<pid>/root access across container UIDs", capAdd)
+	}
+}
+
+func TestStartSidecar_UnixSocket(t *testing.T) {
+	socketPath := t.TempDir() + "/agentcontainer-enforcer.sock"
+	var createdCmd []string
+	var publishedPorts int
+	var socketMountSource string
+	mock := &mockDockerClient{
+		containerCreateFn: func(ctx context.Context, opts client.ContainerCreateOptions) (client.ContainerCreateResult, error) {
+			createdCmd = append([]string(nil), opts.Config.Cmd...)
+			publishedPorts = len(opts.HostConfig.PortBindings)
+			for _, m := range opts.HostConfig.Mounts {
+				if m.Target == "/run/agentcontainer-enforcer" {
+					socketMountSource = m.Source
+				}
+			}
+			return client.ContainerCreateResult{ID: "socket-id"}, nil
+		},
+	}
+
+	var probeTarget string
+	origProber := defaultHealthProber
+	defaultHealthProber = func(target string) bool {
+		probeTarget = target
+		return true
+	}
+	defer func() { defaultHealthProber = origProber }()
+
+	handle, err := StartSidecar(context.Background(), mock, StartOptions{
+		SocketPath:     socketPath,
+		HealthTimeout:  1 * time.Second,
+		HealthInterval: 10 * time.Millisecond,
+		Required:       true,
+	})
+
+	if err != nil {
+		t.Fatalf("StartSidecar() unexpected error: %v", err)
+	}
+	wantAddr := "unix://" + socketPath
+	if handle.Addr != wantAddr {
+		t.Errorf("handle.Addr = %q, want %q", handle.Addr, wantAddr)
+	}
+	if handle.SocketPath != socketPath {
+		t.Errorf("handle.SocketPath = %q, want %q", handle.SocketPath, socketPath)
+	}
+	if probeTarget != wantAddr {
+		t.Errorf("health probe target = %q, want %q", probeTarget, wantAddr)
+	}
+	if publishedPorts != 0 {
+		t.Errorf("published ports = %d, want 0 for UDS sidecar", publishedPorts)
+	}
+	if socketMountSource == "" {
+		t.Fatal("missing /run/agentcontainer-enforcer bind mount")
+	}
+	wantCmd := []string{"--listen", "127.0.0.1:50051", "--socket", "/run/agentcontainer-enforcer/agentcontainer-enforcer.sock"}
+	if strings.Join(createdCmd, " ") != strings.Join(wantCmd, " ") {
+		t.Errorf("cmd = %#v, want %#v", createdCmd, wantCmd)
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestStartSidecar_DefaultOptions(t *testing.T) {
@@ -452,50 +586,6 @@ func TestStartSidecar_ContainerLabels(t *testing.T) {
 	if labels[LabelManaged] != "true" {
 		t.Errorf("label %q = %q, want %q", LabelManaged, labels[LabelManaged], "true")
 	}
-}
-
-// TestStartSidecar_RequestsSysPtrace is a regression guard for commit ac99c64.
-// The enforcer injects secrets through the agent's /proc/<init_pid>/root magic
-// symlink (grpc.rs InjectSecrets). Dereferencing another process's
-// /proc/<pid>/root triggers ptrace_may_access(), which the yama LSM at
-// ptrace_scope>=1 (the distro default) denies for non-descendant processes
-// unless the caller holds CAP_SYS_PTRACE. If this capability is ever dropped
-// from the sidecar HostConfig, secret injection silently fails with EACCES.
-func TestStartSidecar_RequestsSysPtrace(t *testing.T) {
-	var capAdd []string
-	mock := &mockDockerClient{
-		containerCreateFn: func(ctx context.Context, opts client.ContainerCreateOptions) (client.ContainerCreateResult, error) {
-			capAdd = opts.HostConfig.CapAdd
-			return client.ContainerCreateResult{ID: "cap-id"}, nil
-		},
-	}
-
-	origProber := defaultHealthProber
-	defaultHealthProber = alwaysHealthy
-	defer func() { defaultHealthProber = origProber }()
-
-	_, err := StartSidecar(context.Background(), mock, StartOptions{Required: true})
-	if err != nil {
-		t.Fatalf("StartSidecar() unexpected error: %v", err)
-	}
-
-	// Every capability the enforcer relies on must be requested. SYS_PTRACE is
-	// the one that regressed in the field; the rest guard against an
-	// over-aggressive future trim.
-	for _, want := range []string{"BPF", "NET_ADMIN", "SYS_ADMIN", "SYS_RESOURCE", "SYS_PTRACE"} {
-		if !containsCap(capAdd, want) {
-			t.Errorf("sidecar HostConfig.CapAdd = %v, missing required capability %q", capAdd, want)
-		}
-	}
-}
-
-func containsCap(caps []string, want string) bool {
-	for _, c := range caps {
-		if c == want {
-			return true
-		}
-	}
-	return false
 }
 
 // ---------------------------------------------------------------------------

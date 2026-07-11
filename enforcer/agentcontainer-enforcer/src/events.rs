@@ -63,12 +63,6 @@ impl EventBus {
     /// If `container_id` is empty, the subscriber receives all events.
     /// Returns an mpsc receiver; the filtering task runs in the background
     /// and stops when the receiver is dropped.
-    ///
-    /// When the subscriber falls behind the broadcast buffer, the dropped
-    /// events are gone — but the loss itself is delivered in-band as a
-    /// synthetic [`EventDomain::Stream`] gap-marker event (mirroring the
-    /// proxy's stream_gap audit entries), so a forensic reader can
-    /// distinguish "quiet container" from "events lost to backpressure".
     pub fn subscribe(&self, container_id: &str) -> mpsc::Receiver<EnforcementEvent> {
         let mut rx = self.tx.subscribe();
         let (tx, out) = mpsc::channel::<EnforcementEvent>(256);
@@ -87,12 +81,6 @@ impl EventBus {
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!(lagged = n, "event subscriber lagged, {} events dropped", n);
-                        // The drop count is bus-wide (pre-filter): with a
-                        // container filter some lost events may not have
-                        // matched, so it is an upper bound for the subscriber.
-                        if tx.send(gap_marker_event(&filter, n)).await.is_err() {
-                            break;
-                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         break;
@@ -102,32 +90,6 @@ impl EventBus {
         });
 
         out
-    }
-}
-
-/// Build the synthetic event recording that `dropped` events were lost to
-/// broadcast backpressure before reaching this subscriber. It rides the
-/// normal event path into the consumer's audit chain (enforcer.jsonl), so
-/// the gap is tamper-evident rather than a process-local warn line.
-///
-/// `timestamp_ns` is zero: kernel event timestamps are bpf_ktime ns, and no
-/// kernel clock reading exists for a userspace drop. The audit logger stamps
-/// its own wall-clock time on the entry.
-fn gap_marker_event(filter: &str, dropped: u64) -> EnforcementEvent {
-    let mut details = HashMap::new();
-    details.insert("event".into(), "stream_gap".into());
-    details.insert("scope".into(), "enforcer-event-bus".into());
-    details.insert("dropped".into(), dropped.to_string());
-    EnforcementEvent {
-        timestamp_ns: 0,
-        cgroup_id: 0,
-        correlation_id: String::new(),
-        container_id: filter.to_string(),
-        domain: EventDomain::Stream,
-        verdict: EventVerdict::Allow,
-        pid: 0,
-        comm: String::new(),
-        details,
     }
 }
 
@@ -187,20 +149,15 @@ pub fn parse_network_event(raw: &bpf::NetworkEvent, container_id: &str) -> Enfor
     details.insert("dst_port".into(), format!("{}", raw.dst_port));
 
     if raw.ip_version == 4 {
-        // dst_ip4 is the socket __be32 (network byte order) stored verbatim by the
-        // eBPF hook (connect.rs: `dst_ip4 = (*sock_addr).user_ip4`). On a
-        // little-endian host its integer value is byte-swapped from the address, so
-        // `from_be` is required to recover host order before Ipv4Addr lays out the
-        // octets — `from(dst_ip4.to_be_bytes())` here reversed them (e.g.
-        // 198.51.100.5 -> 5.100.51.198).
-        let ip = std::net::Ipv4Addr::from(u32::from_be(raw.dst_ip4));
+        // BPF stores IPv4 as network-order (big-endian) bytes in a u32.
+        let ip = std::net::Ipv4Addr::from(raw.dst_ip4.to_be_bytes());
         details.insert("dst_ip".into(), ip.to_string());
     } else if raw.ip_version == 6 {
-        // dst_ip6 is four __be32 words (network order). Recover each word's network
-        // bytes with from_be -> to_be_bytes, then concatenate in address order.
+        // BPF stores IPv6 as 16 network-order bytes cast to [u32; 4].
         let mut octets = [0u8; 16];
         for (i, word) in raw.dst_ip6.iter().enumerate() {
-            octets[i * 4..i * 4 + 4].copy_from_slice(&u32::from_be(*word).to_be_bytes());
+            let bytes = word.to_be_bytes();
+            octets[i * 4..i * 4 + 4].copy_from_slice(&bytes);
         }
         let ip = std::net::Ipv6Addr::from(octets);
         details.insert("dst_ip".into(), ip.to_string());
@@ -208,8 +165,6 @@ pub fn parse_network_event(raw: &bpf::NetworkEvent, container_id: &str) -> Enfor
 
     EnforcementEvent {
         timestamp_ns: raw.timestamp_ns,
-        cgroup_id: raw.cgroup_id,
-        correlation_id: String::new(),
         container_id: container_id.to_string(),
         domain: EventDomain::Network,
         verdict,
@@ -232,8 +187,6 @@ pub fn parse_fs_event(raw: &bpf::FsEvent, container_id: &str) -> EnforcementEven
 
     EnforcementEvent {
         timestamp_ns: raw.timestamp_ns,
-        cgroup_id: raw.cgroup_id,
-        correlation_id: String::new(),
         container_id: container_id.to_string(),
         domain: EventDomain::Filesystem,
         verdict,
@@ -257,8 +210,6 @@ pub fn parse_exec_event(raw: &bpf::ExecEvent, container_id: &str) -> Enforcement
 
     EnforcementEvent {
         timestamp_ns: raw.timestamp_ns,
-        cgroup_id: raw.cgroup_id,
-        correlation_id: String::new(),
         container_id: container_id.to_string(),
         domain: EventDomain::Process,
         verdict,
@@ -292,14 +243,100 @@ pub fn parse_cred_event(raw: &bpf::CredEvent, container_id: &str) -> Enforcement
 
     EnforcementEvent {
         timestamp_ns: raw.timestamp_ns,
-        cgroup_id: raw.cgroup_id,
-        correlation_id: String::new(),
         container_id: container_id.to_string(),
         domain: EventDomain::Credential,
         verdict,
         pid: raw.pid,
         comm: bytes_to_string(&raw.comm),
         details,
+    }
+}
+
+/// Parse a raw BPF [`bpf::BindEvent`] into an [`EnforcementEvent`].
+pub fn parse_bind_event(raw: &bpf::BindEvent, container_id: &str) -> EnforcementEvent {
+    let verdict = match raw.verdict {
+        1 => EventVerdict::Block,
+        _ => EventVerdict::Allow,
+    };
+
+    let proto_str = match raw.protocol {
+        6 => "tcp",
+        17 => "udp",
+        _ => "unknown",
+    };
+
+    let mut details = HashMap::new();
+    details.insert("port".into(), format!("{}", raw.port));
+    details.insert("protocol".into(), proto_str.into());
+
+    EnforcementEvent {
+        timestamp_ns: raw.timestamp_ns,
+        container_id: container_id.to_string(),
+        domain: EventDomain::Bind,
+        verdict,
+        pid: raw.pid,
+        comm: bytes_to_string(&raw.comm),
+        details,
+    }
+}
+
+/// Parse a raw BPF [`bpf::ReverseShellEvent`] into an [`EnforcementEvent`].
+pub fn parse_reverse_shell_event(
+    raw: &bpf::ReverseShellEvent,
+    container_id: &str,
+) -> EnforcementEvent {
+    let verdict = match raw.verdict {
+        1 => EventVerdict::Block,
+        _ => EventVerdict::Allow,
+    };
+
+    let mut details = HashMap::new();
+    details.insert("oldfd".into(), format!("{}", raw.oldfd));
+    details.insert("newfd".into(), format!("{}", raw.newfd));
+
+    EnforcementEvent {
+        timestamp_ns: raw.timestamp_ns,
+        container_id: container_id.to_string(),
+        domain: EventDomain::ReverseShell,
+        verdict,
+        pid: raw.pid,
+        comm: bytes_to_string(&raw.comm),
+        details,
+    }
+}
+
+/// Local mirror of the BPF-side MemfdEvent struct.
+///
+/// This struct is defined locally in the BPF program (`agentcontainer-ebpf`)
+/// rather than in `agentcontainer-common` because it is a detection-only event
+/// with no shared map key/value usage. We duplicate the layout here so the
+/// ring buffer reader can deserialize it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MemfdEvent {
+    pub timestamp_ns: u64,
+    pub pid: u32,
+    pub uid: u32,
+    pub event_type: u32,
+    pub verdict: u32,
+    pub comm: [u8; bpf::COMM_MAX],
+}
+
+/// Parse a raw [`MemfdEvent`] into an [`EnforcementEvent`].
+pub fn parse_memfd_event(raw: &MemfdEvent, container_id: &str) -> EnforcementEvent {
+    let verdict = match raw.verdict {
+        1 => EventVerdict::Block,
+        _ => EventVerdict::Allow,
+    };
+
+    EnforcementEvent {
+        timestamp_ns: raw.timestamp_ns,
+        container_id: container_id.to_string(),
+        domain: EventDomain::Memfd,
+        verdict,
+        pid: raw.pid,
+        comm: bytes_to_string(&raw.comm),
+        details: HashMap::new(),
     }
 }
 
@@ -311,9 +348,9 @@ pub fn parse_cred_event(raw: &bpf::CredEvent, container_id: &str) -> Enforcement
 pub fn parse_dns_event(raw: &bpf::DnsEvent, container_id: &str) -> EnforcementEvent {
     let mut details = HashMap::new();
 
-    // The readable domain is attached by the reader (which matched this
-    // event's wire-format question name against the tracked set). Record
-    // type / TTL / resolved IP are filled here.
+    // Domain hash as hex string.
+    let hash_hex: String = raw.domain_hash.iter().map(|b| format!("{b:02x}")).collect();
+    details.insert("domain_hash".into(), hash_hex);
 
     // Record type.
     let record_type = match raw.record_type {
@@ -337,8 +374,6 @@ pub fn parse_dns_event(raw: &bpf::DnsEvent, container_id: &str) -> EnforcementEv
 
     EnforcementEvent {
         timestamp_ns: raw.timestamp_ns,
-        cgroup_id: raw.cgroup_id,
-        correlation_id: String::new(),
         container_id: container_id.to_string(),
         domain: EventDomain::Network,
         verdict: EventVerdict::Allow,
@@ -368,12 +403,8 @@ mod tests {
             uid: 1000,
             event_type: bpf::EventType::NetworkConnect as u32,
             verdict: bpf::Verdict::Block as u32,
-            cgroup_id: 1001,
-            // The kernel hook stores user_ip4 as a __be32 (network byte order); on a
-            // little-endian host that is the address byte-swapped. `.to_be()` produces
-            // exactly that wire value for 10.0.0.1 (0x0100000a on LE), matching what
-            // the eBPF program emits — so this exercises the real from_be parse path.
-            dst_ip4: u32::from(std::net::Ipv4Addr::new(10, 0, 0, 1)).to_be(),
+            // BPF stores 10.0.0.1 in network byte order (big-endian).
+            dst_ip4: 0x0a000001,
             dst_ip6: [0; 4],
             dst_port: 443,
             protocol: 6, // TCP
@@ -392,7 +423,6 @@ mod tests {
             uid: 1000,
             event_type: bpf::EventType::FsOpen as u32,
             verdict: bpf::Verdict::Allow as u32,
-            cgroup_id: 1002,
             inode: 12345,
             flags: 0x0002,
             _pad: 0,
@@ -412,7 +442,7 @@ mod tests {
             uid: 0,
             event_type: bpf::EventType::ProcessExec as u32,
             verdict: bpf::Verdict::Block as u32,
-            cgroup_id: 1003,
+            cgroup_id: 0,
             inode: 99999,
             comm,
             binary,
@@ -441,9 +471,8 @@ mod tests {
     fn test_parse_network_event_ipv6() {
         let mut raw = sample_network_event();
         raw.ip_version = 6;
-        // ::1 — the low word is the __be32 of network bytes [0,0,0,1], i.e.
-        // 0x01000000 on a little-endian host (`1u32.to_be()`), as the eBPF hook emits.
-        raw.dst_ip6 = [0, 0, 0, 1u32.to_be()];
+        // ::1 — 15 zero bytes then 0x01, stored as big-endian u32 words.
+        raw.dst_ip6 = [0, 0, 0, 0x00000001];
 
         let ev = parse_network_event(&raw, "ctr-v6");
         assert_eq!(ev.details.get("dst_ip").unwrap(), "::1");
@@ -477,22 +506,20 @@ mod tests {
 
     #[test]
     fn test_parse_dns_event() {
-        let mut qname = [0u8; bpf::DNS_QNAME_MAX];
-        let wire = b"\x07example\x03com";
-        qname[..wire.len()].copy_from_slice(wire);
         let raw = bpf::DnsEvent {
             timestamp_ns: 5_000_000,
             pid: 300,
             uid: 1000,
             event_type: bpf::EventType::DnsResponse as u32,
             ttl: 3600,
-            cgroup_id: 1004,
+            domain_hash: [
+                0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54,
+                0x32, 0x10,
+            ],
             addr_v4: [93, 184, 216, 34], // 93.184.216.34
             addr_v6: [0; 16],
             record_type: 1, // A
-            qname_len: wire.len() as u8,
-            _pad: [0; 2],
-            qname,
+            _pad: [0; 3],
         };
 
         let ev = parse_dns_event(&raw, "ctr-dns");
@@ -503,7 +530,10 @@ mod tests {
         assert_eq!(ev.pid, 300);
         assert_eq!(ev.timestamp_ns, 5_000_000);
 
-        // The readable domain is attached by the reader, not parse_dns_event.
+        assert_eq!(
+            ev.details.get("domain_hash").unwrap(),
+            "abcdef0123456789fedcba9876543210"
+        );
         assert_eq!(ev.details.get("record_type").unwrap(), "A");
         assert_eq!(ev.details.get("ttl").unwrap(), "3600");
         assert_eq!(ev.details.get("resolved_ip").unwrap(), "93.184.216.34");
@@ -585,8 +615,6 @@ mod tests {
 
         let event = EnforcementEvent {
             timestamp_ns: 42,
-            cgroup_id: 1,
-            correlation_id: String::new(),
             container_id: "ctr-1".into(),
             domain: EventDomain::Network,
             verdict: EventVerdict::Allow,
@@ -615,8 +643,6 @@ mod tests {
 
         let make_event = |cid: &str, ts: u64| EnforcementEvent {
             timestamp_ns: ts,
-            cgroup_id: ts,
-            correlation_id: String::new(),
             container_id: cid.into(),
             domain: EventDomain::Filesystem,
             verdict: EventVerdict::Block,
@@ -669,59 +695,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_event_bus_lag_delivers_gap_marker() {
-        let bus = EventBus::new();
-        let mut rx = bus.subscribe("");
-
-        // On the current-thread test runtime the spawned filter task cannot
-        // run until this task awaits, so every publish lands in the broadcast
-        // buffer first — overflowing it forces a real Lagged(n) on the
-        // subscriber's first recv.
-        let overflow = 10u64;
-        for ts in 0..(BROADCAST_CAPACITY as u64 + overflow) {
-            bus.publish(EnforcementEvent {
-                timestamp_ns: ts + 1,
-                cgroup_id: 1,
-                correlation_id: String::new(),
-                container_id: "ctr-lag".into(),
-                domain: EventDomain::Network,
-                verdict: EventVerdict::Allow,
-                pid: 1,
-                comm: "x".into(),
-                details: HashMap::new(),
-            });
-        }
-
-        let first = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-            .await
-            .expect("timed out")
-            .expect("channel closed");
-
-        // The loss must be reported in-band, before any post-gap event.
-        assert_eq!(first.domain, EventDomain::Stream);
-        assert_eq!(first.details.get("event").unwrap(), "stream_gap");
-        assert_eq!(first.details.get("scope").unwrap(), "enforcer-event-bus");
-        let dropped: u64 = first.details.get("dropped").unwrap().parse().unwrap();
-        assert!(dropped >= 1, "gap marker must carry a positive drop count");
-
-        // The stream resumes with the oldest retained event — nothing else
-        // is silently skipped after the marker.
-        let next = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-            .await
-            .expect("timed out")
-            .expect("channel closed");
-        assert_eq!(next.domain, EventDomain::Network);
-        assert_eq!(next.timestamp_ns, dropped + 1);
-    }
-
-    #[tokio::test]
     async fn test_event_bus_no_receivers_does_not_panic() {
         let bus = EventBus::new();
         // Publishing with no subscribers should not panic.
         bus.publish(EnforcementEvent {
             timestamp_ns: 0,
-            cgroup_id: 0,
-            correlation_id: String::new(),
             container_id: String::new(),
             domain: EventDomain::Network,
             verdict: EventVerdict::Allow,

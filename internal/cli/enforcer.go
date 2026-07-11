@@ -34,52 +34,42 @@ and process enforcement for agent containers.`,
 
 func newEnforcerStartCmd() *cobra.Command {
 	var (
-		image       string
-		port        int
-		insecureDev bool
+		image string
+		port  int
 	)
 
 	cmd := &cobra.Command{
 		Use:   "start",
 		Short: "Start the agentcontainer-enforcer sidecar container",
 		Long: `Pull and start the agentcontainer-enforcer container with the required capabilities
-and mounts for BPF enforcement. The control plane is published on 127.0.0.1
-only and secured with ephemeral mutual TLS; the command prints the
-AC_ENFORCER_* exports a subsequent 'agentcontainer run' needs to connect.
-After starting, it probes the gRPC health endpoint to verify readiness.`,
+and mounts for BPF enforcement. After starting, the command probes the
+gRPC health endpoint to verify the enforcer is ready.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runEnforcerStart(cmd, image, port, insecureDev)
+			return runEnforcerStart(cmd, image, port)
 		},
 	}
 
 	cmd.Flags().StringVar(&image, "image", sidecar.DefaultEnforcerImage, "agentcontainer-enforcer OCI image reference")
 	cmd.Flags().IntVar(&port, "port", sidecar.DefaultPort, "gRPC listen port")
-	cmd.Flags().BoolVar(&insecureDev, "insecure-dev", false, "Run the control plane in plaintext without mTLS (development only)")
 
 	return cmd
 }
 
 func newEnforcerStopCmd() *cobra.Command {
 	var force bool
-	var purge bool
 
 	cmd := &cobra.Command{
 		Use:   "stop",
 		Short: "Stop the agentcontainer-enforcer sidecar container",
-		Long: `Stop and remove the agentcontainer-enforcer container.
-
-The persistent mTLS credentials in ~/.ac/enforcer-creds are left in place so a
-later 'enforcer start' reuses them. Pass --purge to delete them and force fresh
-credentials to be generated on the next start (credential rotation).`,
-		Args: cobra.NoArgs,
+		Long:  `Stop and remove the agentcontainer-enforcer container.`,
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runEnforcerStop(cmd, force, purge)
+			return runEnforcerStop(cmd, force)
 		},
 	}
 
 	cmd.Flags().BoolVar(&force, "force", false, "Force remove the container")
-	cmd.Flags().BoolVar(&purge, "purge", false, "Also delete the persistent mTLS credentials (forces regeneration on next start)")
 
 	return cmd
 }
@@ -104,7 +94,7 @@ var newDockerClient = func() (client.APIClient, error) {
 	return client.New(client.FromEnv)
 }
 
-func runEnforcerStart(cmd *cobra.Command, image string, port int, insecureDev bool) error {
+func runEnforcerStart(cmd *cobra.Command, image string, port int) error {
 	ctx := cmd.Context()
 	out := cmd.OutOrStdout()
 
@@ -119,11 +109,6 @@ func runEnforcerStart(cmd *cobra.Command, image string, port int, insecureDev bo
 		Image:    image,
 		Port:     port,
 		Required: true,
-		// Publish on loopback only and require ephemeral mTLS by default, so the
-		// control plane is never exposed plaintext on all interfaces.
-		HostBindIP:  "127.0.0.1",
-		MTLS:        !insecureDev,
-		InsecureDev: insecureDev,
 	})
 	if err != nil {
 		return fmt.Errorf("enforcer start: %w", err)
@@ -133,26 +118,10 @@ func runEnforcerStart(cmd *cobra.Command, image string, port int, insecureDev bo
 	}
 
 	_, _ = fmt.Fprintf(out, "Enforcer started\n  Address: 127.0.0.1:%d\n  Container: %s\n", port, shortID(handle.ContainerID))
-	if insecureDev {
-		_, _ = fmt.Fprintf(out, "  WARNING: --insecure-dev set; control plane is PLAINTEXT (development only)\n")
-		_, _ = fmt.Fprintf(out, "\nExport before 'agentcontainer run':\n  export AC_ENFORCER_ADDR=127.0.0.1:%d\n", port)
-		return nil
-	}
-	// The client credentials live at a single stable host path
-	// (~/.ac/enforcer-creds) and are reused across restarts, so these export
-	// lines never change between runs. Print them for a later 'agentcontainer
-	// run' / 'mcp start' to connect over mTLS as an external sidecar.
-	_, _ = fmt.Fprintf(out, "  mTLS: enabled (persistent creds)\n\nExport before 'agentcontainer run':\n"+
-		"  export AC_ENFORCER_ADDR=127.0.0.1:%d\n"+
-		"  export AC_ENFORCER_TLS_CA=%s\n"+
-		"  export AC_ENFORCER_TLS_CERT=%s\n"+
-		"  export AC_ENFORCER_TLS_KEY=%s\n"+
-		"\nCredentials persist across restarts; rotate them with 'agentcontainer enforcer stop --purge'.\n",
-		port, handle.CACertPath, handle.ClientCertPath, handle.ClientKeyPath)
 	return nil
 }
 
-func runEnforcerStop(cmd *cobra.Command, force, purge bool) error {
+func runEnforcerStop(cmd *cobra.Command, force bool) error {
 	ctx := cmd.Context()
 	out := cmd.OutOrStdout()
 
@@ -161,43 +130,35 @@ func runEnforcerStop(cmd *cobra.Command, force, purge bool) error {
 		return fmt.Errorf("enforcer stop: creating docker client: %w", err)
 	}
 
-	// Check if the container exists first. With --purge we still want to delete
-	// the credentials even if the container is already gone, so a missing
-	// container is only fatal without --purge.
+	// Check if the container exists first.
 	result, err := cli.ContainerInspect(ctx, sidecar.ContainerName, client.ContainerInspectOptions{})
-	switch {
-	case err != nil && !purge:
+	if err != nil {
 		return fmt.Errorf("enforcer stop: container %q not found: %w", sidecar.ContainerName, err)
-	case err != nil:
-		_, _ = fmt.Fprintln(out, "agentcontainer-enforcer is not running")
-	default:
-		containerID := result.Container.ID
-		if force {
-			// Force remove directly without graceful stop.
-			if _, err := cli.ContainerRemove(ctx, containerID, client.ContainerRemoveOptions{
-				Force:         true,
-				RemoveVolumes: true,
-			}); err != nil {
-				return fmt.Errorf("enforcer stop: removing container: %w", err)
-			}
-		} else {
-			// Synthetic handle for managed teardown. StopSidecar intentionally
-			// leaves the host credentials in place for reuse.
-			handle := &sidecar.SidecarHandle{ContainerID: containerID, Managed: true}
-			if err := sidecar.StopSidecar(ctx, cli, handle); err != nil {
-				return fmt.Errorf("enforcer stop: %w", err)
-			}
-		}
-		_, _ = fmt.Fprintln(out, "agentcontainer-enforcer stopped")
 	}
 
-	if purge {
-		if err := sidecar.PurgeCreds(); err != nil {
-			return fmt.Errorf("enforcer stop: purging credentials: %w", err)
-		}
-		_, _ = fmt.Fprintln(out, "Purged mTLS credentials; fresh certs will be generated on next start")
+	containerID := result.Container.ID
+
+	// Use StopSidecar with a synthetic handle for managed teardown.
+	handle := &sidecar.SidecarHandle{
+		ContainerID: containerID,
+		Managed:     true,
 	}
 
+	if force {
+		// Force remove directly without graceful stop.
+		if _, err := cli.ContainerRemove(ctx, containerID, client.ContainerRemoveOptions{
+			Force:         true,
+			RemoveVolumes: true,
+		}); err != nil {
+			return fmt.Errorf("enforcer stop: removing container: %w", err)
+		}
+	} else {
+		if err := sidecar.StopSidecar(ctx, cli, handle); err != nil {
+			return fmt.Errorf("enforcer stop: %w", err)
+		}
+	}
+
+	_, _ = fmt.Fprintln(out, "agentcontainer-enforcer stopped")
 	return nil
 }
 
@@ -240,26 +201,11 @@ func runEnforcerStatus(cmd *cobra.Command) error {
 		}
 	}
 
-	// Probe gRPC health if the container is running. A managed enforcer requires
-	// mTLS, so present the same client credentials a real client uses (from
-	// AC_ENFORCER_TLS_* or the stable host creds dir); otherwise a plaintext
-	// probe would always report UNHEALTHY against a perfectly healthy enforcer.
+	// Probe gRPC health if the container is running.
 	if state.Running {
 		port := enforcerPortFromInspect(info)
 		target := fmt.Sprintf("127.0.0.1:%d", port)
-		ca, cert, key := resolveEnforcerClientCreds(false)
-		profile := enforcement.ConnectionProfile{
-			Addr:           target,
-			CACertPath:     ca,
-			ClientCertPath: cert,
-			ClientKeyPath:  key,
-		}
-		var healthy bool
-		if profile.HasMTLS() {
-			healthy = enforcement.ProbeEnforcerHealthProfile(profile)
-		} else {
-			healthy = enforcement.ProbeEnforcerHealth(target)
-		}
+		healthy := enforcement.ProbeEnforcerHealth(target)
 		if healthy {
 			_, _ = fmt.Fprintln(out, "Health:     SERVING")
 		} else {

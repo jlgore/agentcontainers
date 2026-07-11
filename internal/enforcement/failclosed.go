@@ -17,16 +17,6 @@ func (s *FailClosedStrategy) Apply(_ context.Context, _ string, _ uint32, _ *pol
 	return errors.New("enforcement: no enforcement mechanism available, refusing to start (fail-closed)")
 }
 
-// ApplyBasePolicy returns an error because no enforcement mechanism is available.
-func (s *FailClosedStrategy) ApplyBasePolicy(_ context.Context, _ string, _ uint32, _ *policy.ContainerPolicy) error {
-	return errors.New("enforcement: no enforcement mechanism available, refusing to start (fail-closed)")
-}
-
-// ApplyCredentialACLs returns an error because no enforcement mechanism is available.
-func (s *FailClosedStrategy) ApplyCredentialACLs(_ context.Context, _ string, _ *policy.ContainerPolicy) error {
-	return errors.New("enforcement: no enforcement mechanism available, refusing to install credential ACLs (fail-closed)")
-}
-
 // Update returns an error because no enforcement mechanism is available.
 func (s *FailClosedStrategy) Update(_ context.Context, _ string, _ *policy.ContainerPolicy) error {
 	return errors.New("enforcement: no enforcement mechanism available (fail-closed)")
@@ -40,11 +30,6 @@ func (s *FailClosedStrategy) Remove(_ context.Context, _ string) error {
 // InjectSecrets returns an error because no enforcement mechanism is available.
 func (s *FailClosedStrategy) InjectSecrets(_ context.Context, _ string, _ map[string]*secrets.Secret) error {
 	return errors.New("enforcement: not available: cannot inject secrets (fail-closed)")
-}
-
-// SetImmutable returns an error because no enforcement mechanism is available.
-func (s *FailClosedStrategy) SetImmutable(_ context.Context, _ string, _ []string, _ bool) error {
-	return errors.New("enforcement: not available: cannot freeze execution-config (fail-closed)")
 }
 
 // Events returns nil because there is no enforcement to emit events.

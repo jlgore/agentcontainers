@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -79,36 +80,28 @@ func WithInsecure() GRPCOption {
 // Returns an error if any file cannot be read or the certificate pool cannot
 // be built.
 func WithMTLSConfig(certFile, keyFile, caFile string) (GRPCOption, error) {
-	tlsConf, err := buildMTLSConfig(certFile, keyFile, caFile, "")
-	if err != nil {
-		return nil, err
-	}
-	return WithTLSConfig(tlsConf), nil
-}
-
-// buildMTLSConfig builds a client mTLS config. serverName, when non-empty,
-// overrides the hostname verified against the server certificate's SANs — needed
-// when dialing an address (e.g. a sandbox VM IP) that is not itself in the
-// cert's SAN list but which presents a cert for a known name (localhost).
-func buildMTLSConfig(certFile, keyFile, caFile, serverName string) (*tls.Config, error) {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		return nil, fmt.Errorf("mtls: load client cert/key: %w", err)
 	}
+
 	caPEM, err := os.ReadFile(caFile)
 	if err != nil {
 		return nil, fmt.Errorf("mtls: read CA cert: %w", err)
 	}
+
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(caPEM) {
 		return nil, fmt.Errorf("mtls: failed to parse CA cert from %s", caFile)
 	}
-	return &tls.Config{
+
+	tlsConf := &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		RootCAs:      pool,
 		MinVersion:   tls.VersionTLS13,
-		ServerName:   serverName,
-	}, nil
+	}
+
+	return WithTLSConfig(tlsConf), nil
 }
 
 // tlsPoolFromPEM parses a PEM-encoded CA certificate into a cert pool.
@@ -158,157 +151,6 @@ func GRPCOptsFromEnv() ([]GRPCOption, error) {
 	return []GRPCOption{WithInsecure()}, nil
 }
 
-// ConnectionProfile is the complete set of information needed to reach an
-// agentcontainer-enforcer endpoint and authenticate to it. It is threaded
-// explicitly from sidecar startup into every enforcer client (runtime, MCP
-// proxy, health probe), replacing the previous AC_ENFORCER_* process-global
-// environment coupling.
-type ConnectionProfile struct {
-	// Addr is the gRPC endpoint, e.g. "127.0.0.1:50051".
-	Addr string
-
-	// CACertPath, ClientCertPath, and ClientKeyPath are PEM file paths for
-	// mutual TLS. When all three are set the connection uses mTLS. When empty
-	// the connection is plaintext, which is permitted only for a loopback Addr
-	// unless InsecureDev is set.
-	CACertPath     string
-	ClientCertPath string
-	ClientKeyPath  string
-
-	// ServerName overrides the hostname verified against the enforcer
-	// certificate's SANs. It is required when Addr is not itself in the cert's
-	// SAN list — e.g. a sandbox VM IP, where the enforcer presents a cert for
-	// "localhost"/"127.0.0.1". Empty means verify against Addr's host.
-	ServerName string
-
-	// InsecureDev permits a plaintext connection to a non-loopback endpoint.
-	// It is an explicit development-only opt-in; a prominent warning is logged
-	// whenever it takes effect. Without it, a non-loopback endpoint with no
-	// mTLS material is rejected rather than silently downgraded to plaintext.
-	InsecureDev bool
-}
-
-// HasMTLS reports whether the profile carries a complete mTLS credential set.
-func (p ConnectionProfile) HasMTLS() bool {
-	return p.CACertPath != "" && p.ClientCertPath != "" && p.ClientKeyPath != ""
-}
-
-// isLoopbackEndpoint reports whether addr names a loopback host. A target with
-// no host part (e.g. ":50051") is treated as loopback. Unix sockets, if ever
-// passed, are also loopback.
-func isLoopbackEndpoint(addr string) bool {
-	host := addr
-	if h, _, err := net.SplitHostPort(addr); err == nil {
-		host = h
-	}
-	if host == "" || host == "localhost" {
-		return true
-	}
-	if ip := net.ParseIP(host); ip != nil {
-		return ip.IsLoopback()
-	}
-	return false
-}
-
-// optionsFromProfile builds the gRPC dial options implied by a connection
-// profile, enforcing the TLS policy:
-//   - complete mTLS material → mutual TLS;
-//   - loopback endpoint with no material → plaintext (host-local trust);
-//   - non-loopback endpoint with no material → plaintext only with an explicit
-//     InsecureDev opt-in (logged), otherwise an error.
-//
-// It never silently downgrades a TLS-credentialed profile to plaintext.
-func optionsFromProfile(p ConnectionProfile, warn func(string)) ([]GRPCOption, error) {
-	if p.HasMTLS() {
-		tlsConf, err := buildMTLSConfig(p.ClientCertPath, p.ClientKeyPath, p.CACertPath, p.ServerName)
-		if err != nil {
-			return nil, err
-		}
-		return []GRPCOption{WithTLSConfig(tlsConf)}, nil
-	}
-	if isLoopbackEndpoint(p.Addr) {
-		return []GRPCOption{WithInsecure()}, nil
-	}
-	if p.InsecureDev {
-		if warn != nil {
-			warn(fmt.Sprintf("SECURITY: connecting to enforcer at %s over PLAINTEXT via insecure-dev opt-in — control-plane traffic, credentials, and policy are unauthenticated and unencrypted; do not use outside development", p.Addr))
-		}
-		return []GRPCOption{WithInsecure()}, nil
-	}
-	return nil, fmt.Errorf("enforcer endpoint %q is not loopback and no mTLS credentials were supplied; provide client cert/key/CA or set the enforcer insecure-dev opt-in", p.Addr)
-}
-
-// NewStrategyFromProfile builds a gRPC enforcement strategy for the given
-// connection profile, applying the TLS policy in optionsFromProfile. Unlike
-// NewStrategy it does not consult process-global environment variables. The
-// optional warn callback receives a one-line message when an insecure-dev
-// plaintext downgrade takes effect.
-func NewStrategyFromProfile(p ConnectionProfile, warn func(string)) (*GRPCStrategy, error) {
-	opts, err := optionsFromProfile(p, warn)
-	if err != nil {
-		return nil, err
-	}
-	return NewGRPCStrategy(p.Addr, opts...)
-}
-
-// DialEnforcer opens a raw gRPC client connection to an enforcer using the
-// connection profile's TLS policy. It is for callers that need an
-// enforcerapi.EnforcerClient (e.g. the MCP proxy) rather than a Strategy. The
-// returned connection is the caller's to close. It never silently downgrades a
-// credentialed profile to plaintext.
-func DialEnforcer(p ConnectionProfile, warn func(string)) (*grpc.ClientConn, error) {
-	opts, err := optionsFromProfile(p, warn)
-	if err != nil {
-		return nil, err
-	}
-	cfg := defaultGRPCConfig()
-	for _, opt := range opts {
-		opt(cfg)
-	}
-	var dialOpt grpc.DialOption
-	switch {
-	case cfg.insecure:
-		dialOpt = grpc.WithTransportCredentials(insecure.NewCredentials())
-	case cfg.tlsConfig != nil:
-		dialOpt = grpc.WithTransportCredentials(credentials.NewTLS(cfg.tlsConfig))
-	default:
-		dialOpt = grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{}))
-	}
-	conn, err := grpc.NewClient(p.Addr, dialOpt)
-	if err != nil {
-		return nil, fmt.Errorf("dial enforcer %q: %w", p.Addr, err)
-	}
-	return conn, nil
-}
-
-// CheckLSMActive asks the enforcer whether its kernel BPF LSM hooks (file_open,
-// bprm_check) are actually attached. Network/cgroup hooks can attach on kernels
-// without BPF LSM, so the enforcer can be SERVING while filesystem deny-list and
-// exec enforcement are silently inactive. Callers running kernel-primary (Docker
-// Engine, no sandboxd VM) use this to fail loudly rather than start unenforced
-// containers. It returns the active flag, the enforcer's detail string for the
-// negative case, and any RPC error (treated as fail-closed by the caller).
-func CheckLSMActive(ctx context.Context, p ConnectionProfile, warn func(string)) (active bool, detail string, err error) {
-	conn, err := DialEnforcer(p, warn)
-	if err != nil {
-		return false, "", err
-	}
-	defer conn.Close() //nolint:errcheck
-	return lsmStatusFromClient(ctx, enforcerapi.NewEnforcerClient(conn))
-}
-
-// lsmStatusFromClient queries an enforcer client for its BPF LSM status. It is
-// the testable core of CheckLSMActive, separated from connection setup so the
-// gate logic can be exercised against an in-process mock enforcer.
-func lsmStatusFromClient(ctx context.Context, client enforcerapi.EnforcerClient) (active bool, detail string, err error) {
-	// Empty container_id requests aggregate stats; lsm_active is manager-global.
-	resp, err := client.GetStats(ctx, &enforcerapi.GetStatsRequest{ContainerId: ""})
-	if err != nil {
-		return false, "", fmt.Errorf("querying enforcer LSM status: %w", err)
-	}
-	return resp.GetLsmActive(), resp.GetLsmDetail(), nil
-}
-
 // NewGRPCStrategy creates a gRPC-based enforcement strategy that connects
 // to an agentcontainer-enforcer sidecar at the given target address.
 func NewGRPCStrategy(target string, opts ...GRPCOption) (*GRPCStrategy, error) {
@@ -318,6 +160,11 @@ func NewGRPCStrategy(target string, opts ...GRPCOption) (*GRPCStrategy, error) {
 	}
 
 	dialOpts := []grpc.DialOption{}
+	if socketPath, ok := strings.CutPrefix(target, "unix://"); ok {
+		dialOpts = append(dialOpts, grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+		}))
+	}
 	if cfg.insecure {
 		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	} else if cfg.tlsConfig != nil {
@@ -343,20 +190,8 @@ func NewGRPCStrategy(target string, opts ...GRPCOption) (*GRPCStrategy, error) {
 	}, nil
 }
 
-// Apply registers the container and applies base policy followed by credential
-// ACLs. Used by runtimes that do not inject secrets through the enforcer; the
-// Docker path uses the split ApplyBasePolicy / InjectSecrets / ApplyCredentialACLs
-// instead so ACLs are installed after the secret files exist.
+// Apply registers the container with the enforcer sidecar and applies all policies.
 func (s *GRPCStrategy) Apply(ctx context.Context, containerID string, initPID uint32, p *policy.ContainerPolicy) error {
-	if err := s.ApplyBasePolicy(ctx, containerID, initPID, p); err != nil {
-		return err
-	}
-	return s.ApplyCredentialACLs(ctx, containerID, p)
-}
-
-// ApplyBasePolicy registers the container and applies network, filesystem, and
-// process policy — everything except credential ACLs.
-func (s *GRPCStrategy) ApplyBasePolicy(ctx context.Context, containerID string, initPID uint32, p *policy.ContainerPolicy) error {
 	// Resolve the cgroup path for this container.
 	cgroupPath, err := ResolveCgroupPath(containerID)
 	if err != nil {
@@ -404,6 +239,18 @@ func (s *GRPCStrategy) ApplyBasePolicy(ctx context.Context, containerID string, 
 		return fmt.Errorf("grpc strategy: process policy failed: %s", procResp.GetError())
 	}
 
+	// Apply credential policy (Phase 6).
+	if len(p.SecretACLs) > 0 {
+		credReq := translateCredentialPolicy(containerID, p)
+		credResp, err := s.client.ApplyCredentialPolicy(ctx, credReq)
+		if err != nil {
+			return fmt.Errorf("grpc strategy: apply credential policy: %w", err)
+		}
+		if !credResp.GetSuccess() {
+			return fmt.Errorf("grpc strategy: credential policy failed: %s", credResp.GetError())
+		}
+	}
+
 	// Start event streaming for this container.
 	// Non-fatal: a missing event stream degrades observability but does not
 	// compromise enforcement. Log the error so operators can diagnose it.
@@ -411,24 +258,6 @@ func (s *GRPCStrategy) ApplyBasePolicy(ctx context.Context, containerID string, 
 		fmt.Printf("enforcement: event stream for container %s failed to start: %v\n", containerID, err)
 	}
 
-	return nil
-}
-
-// ApplyCredentialACLs installs the secret credential ACLs. Must be called after
-// the secret files have been injected. A no-op when the policy declares no
-// secret ACLs.
-func (s *GRPCStrategy) ApplyCredentialACLs(ctx context.Context, containerID string, p *policy.ContainerPolicy) error {
-	if len(p.SecretACLs) == 0 {
-		return nil
-	}
-	credReq := translateCredentialPolicy(containerID, p)
-	credResp, err := s.client.ApplyCredentialPolicy(ctx, credReq)
-	if err != nil {
-		return fmt.Errorf("grpc strategy: apply credential policy: %w", err)
-	}
-	if !credResp.GetSuccess() {
-		return fmt.Errorf("grpc strategy: credential policy failed: %s", credResp.GetError())
-	}
 	return nil
 }
 
@@ -529,28 +358,6 @@ func (s *GRPCStrategy) InjectSecrets(ctx context.Context, containerID string, re
 	return nil
 }
 
-// SetImmutable freezes (on=true) or unfreezes (on=false) the given
-// agent-namespace paths via the enforcer sidecar, which sets FS_IMMUTABLE_FL on
-// /proc/<init_pid>/root<path> for each. A path that does not exist in the agent
-// image is skipped by the enforcer, not an error.
-func (s *GRPCStrategy) SetImmutable(ctx context.Context, containerID string, paths []string, on bool) error {
-	if len(paths) == 0 {
-		return nil
-	}
-	resp, err := s.client.SetImmutable(ctx, &enforcerapi.SetImmutableRequest{
-		ContainerId: containerID,
-		Paths:       paths,
-		Immutable:   on,
-	})
-	if err != nil {
-		return fmt.Errorf("grpc strategy: set immutable: %w", err)
-	}
-	if !resp.GetSuccess() {
-		return fmt.Errorf("grpc strategy: set immutable failed: %s", resp.GetError())
-	}
-	return nil
-}
-
 // Events returns the audit event channel for the given container.
 func (s *GRPCStrategy) Events(containerID string) <-chan Event {
 	s.mu.Lock()
@@ -561,6 +368,14 @@ func (s *GRPCStrategy) Events(containerID string) <-chan Event {
 // Level returns LevelGRPC.
 func (s *GRPCStrategy) Level() Level {
 	return s.level
+}
+
+// Client exposes the underlying enforcer gRPC client so callers that need to
+// issue enforcer RPCs directly (e.g. the MCP proxy's tool-call correlation and
+// audit stream) can reuse this strategy's dialled, TLS-configured connection
+// instead of opening a second one.
+func (s *GRPCStrategy) Client() enforcerapi.EnforcerClient {
+	return s.client
 }
 
 // Close closes the gRPC connection.
@@ -615,11 +430,18 @@ func (s *GRPCStrategy) startEventStream(containerID string) error {
 			}
 
 			event := translateEvent(protoEvent)
+			s.mu.Lock()
+			ch, ok := s.events[containerID]
+			if !ok {
+				s.mu.Unlock()
+				return
+			}
 			select {
-			case eventCh <- event:
+			case ch <- event:
 			default:
 				// Channel full, drop event
 			}
+			s.mu.Unlock()
 		}
 	}()
 
@@ -636,17 +458,10 @@ func translateNetworkPolicy(containerID string, p *policy.ContainerPolicy) *enfo
 	}
 
 	for _, rule := range p.AllowedEgressRules {
-		// Default an omitted protocol to tcp, matching the MCP-proxy egress
-		// path. Otherwise the enforcer logs "unknown protocol" and silently
-		// drops the rule, so the intended allow never takes effect.
-		proto := rule.Protocol
-		if proto == "" {
-			proto = "tcp"
-		}
 		req.EgressRules = append(req.EgressRules, &enforcerapi.EgressRule{
 			Host:     rule.Host,
 			Port:     uint32(rule.Port),
-			Protocol: proto,
+			Protocol: rule.Protocol,
 		})
 	}
 

@@ -7,9 +7,8 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net/netip"
 	"os"
-	"path"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -40,29 +39,11 @@ const (
 	// LabelComponent identifies the container as an enforcer component.
 	LabelComponent = "dev.agentcontainer/component"
 
-	// LabelManaged indicates the container was started by ac (not pre-existing).
+	// LabelManaged indicates the container was started by agentcontainer (not pre-existing).
 	LabelManaged = "dev.agentcontainer/managed"
-
-	// credsContainerDir is the in-container directory the enforcer writes its
-	// ephemeral mTLS material to (passed via --creds-dir).
-	credsContainerDir = "/creds"
-
-	// EnforcerCertServerName is a SAN the enforcer's ephemeral server cert
-	// always carries (see the enforcer's generate_session_certs). Use it as the
-	// TLS ServerName when dialing the enforcer at an address not in the SAN list
-	// (e.g. a sandbox VM IP).
-	EnforcerCertServerName = "localhost"
-
-	// Client-side credential filenames written by the enforcer into credsContainerDir.
-	clientCertFile = "client.crt"
-	clientKeyFile  = "client.key"
-	clientCAFile   = "client-ca.crt"
 )
 
-// SidecarHandle represents a running or pre-existing sidecar instance, together
-// with the complete connection profile (address + mTLS material) needed to
-// reach it. The profile is threaded explicitly into every enforcer client so no
-// caller has to consult process-global AC_ENFORCER_* environment variables.
+// SidecarHandle represents a running or pre-existing sidecar instance.
 type SidecarHandle struct {
 	// ContainerID is the Docker container ID. Empty for external sidecars.
 	ContainerID string
@@ -70,43 +51,12 @@ type SidecarHandle struct {
 	// Addr is the gRPC endpoint address (e.g., "127.0.0.1:50051").
 	Addr string
 
-	// Managed is true if this sidecar was started by ac (not pre-existing).
+	// Managed is true if this sidecar was started by agentcontainer (not pre-existing).
 	// Only managed sidecars are stopped during teardown.
 	Managed bool
 
-	// CACertPath, ClientCertPath, and ClientKeyPath are host paths to the
-	// ephemeral mTLS material retrieved from the managed enforcer's --creds-dir.
-	// They are empty for plaintext (insecure-dev) or external sidecars whose
-	// credentials are supplied out of band.
-	CACertPath     string
-	ClientCertPath string
-	ClientKeyPath  string
-
-	// InsecureDev records that this endpoint was permitted to run plaintext
-	// without mTLS via an explicit development-only opt-in.
-	InsecureDev bool
-
-	// ServerName overrides the TLS hostname verified against the enforcer
-	// certificate when Addr is not in the cert's SANs (e.g. an in-VM enforcer
-	// reached at the VM IP, presenting a cert for localhost).
-	ServerName string
-
-	// credsDir is the host temp directory holding the retrieved credentials.
-	// It is removed when a managed sidecar is stopped.
-	credsDir string
-}
-
-// Profile returns the enforcement connection profile for this sidecar, suitable
-// for NewStrategyFromProfile / ProbeEnforcerHealthProfile.
-func (h *SidecarHandle) Profile() enforcement.ConnectionProfile {
-	return enforcement.ConnectionProfile{
-		Addr:           h.Addr,
-		CACertPath:     h.CACertPath,
-		ClientCertPath: h.ClientCertPath,
-		ClientKeyPath:  h.ClientKeyPath,
-		ServerName:     h.ServerName,
-		InsecureDev:    h.InsecureDev,
-	}
+	// SocketPath is the host Unix socket path for UDS sidecars.
+	SocketPath string
 }
 
 // StartOptions configures sidecar startup behavior.
@@ -115,8 +65,20 @@ type StartOptions struct {
 	// Default: DefaultEnforcerImage
 	Image string
 
-	// Port is the host TCP port to bind (default: 50051).
+	// Port is the container gRPC listen port (default: 50051).
+	// If HostPort is unset, this is also used as the host-published port for
+	// compatibility with earlier releases.
 	Port int
+
+	// HostPort is the host TCP port to publish. If unset, defaults to Port.
+	HostPort int
+
+	// RandomHostPort publishes Port to an ephemeral Docker-assigned host port.
+	RandomHostPort bool
+
+	// SocketPath is a host Unix socket path for gRPC. When set, the sidecar
+	// bind-mounts its parent directory and does not publish a TCP port.
+	SocketPath string
 
 	// HealthTimeout is how long to wait for SERVING (default: 15s).
 	HealthTimeout time.Duration
@@ -133,29 +95,6 @@ type StartOptions struct {
 	// For in-VM sidecars, set this to "<vm_ip>:<port>" so the host can reach
 	// the enforcer inside the VM.
 	HealthCheckAddr string
-
-	// HostBindIP restricts the published gRPC port to a single host interface.
-	// Host-local managed sidecars set this to "127.0.0.1" so the control plane
-	// is never exposed on all interfaces. Leave empty for in-VM sidecars, which
-	// must be reachable from the host at the VM's IP.
-	HostBindIP string
-
-	// Mutual TLS. When true (the default for managed sidecars), the enforcer is
-	// started with --creds-dir, generating ephemeral mTLS material that is
-	// retrieved over the Docker API and returned in the SidecarHandle. When
-	// false, the enforcer runs plaintext — permitted only as an explicit
-	// development opt-in (see InsecureDev).
-	MTLS bool
-
-	// InsecureDev records that plaintext operation was explicitly requested.
-	// It is propagated to the returned handle's connection profile so a
-	// non-loopback plaintext endpoint is permitted rather than rejected.
-	InsecureDev bool
-
-	// ServerName overrides the TLS hostname verified against the enforcer
-	// certificate. Set it for an in-VM sidecar reached at the VM IP (the cert
-	// covers localhost/127.0.0.1, not the VM IP). Empty for host-local sidecars.
-	ServerName string
 }
 
 func (o *StartOptions) applyDefaults() {
@@ -164,6 +103,9 @@ func (o *StartOptions) applyDefaults() {
 	}
 	if o.Port == 0 {
 		o.Port = DefaultPort
+	}
+	if o.HostPort == 0 && !o.RandomHostPort {
+		o.HostPort = o.Port
 	}
 	if o.HealthTimeout == 0 {
 		o.HealthTimeout = DefaultHealthTimeout
@@ -193,22 +135,8 @@ type DiscoverResult struct {
 // This allows injection of a mock for testing.
 type HealthProber func(target string) bool
 
-// ProfileProber checks if an enforcer endpoint is healthy using a full
-// connection profile (so an mTLS-only endpoint is probed with its credentials).
-type ProfileProber func(p enforcement.ConnectionProfile) bool
-
-// defaultHealthProber uses the enforcement package's plaintext health probe.
+// defaultHealthProber uses the enforcement package's health probe.
 var defaultHealthProber HealthProber = enforcement.ProbeEnforcerHealth
-
-// defaultProfileProber probes with the profile's mTLS credentials when present,
-// and otherwise delegates to defaultHealthProber so a plaintext endpoint shares
-// the same (test-swappable) probe seam.
-var defaultProfileProber ProfileProber = func(p enforcement.ConnectionProfile) bool {
-	if p.HasMTLS() {
-		return enforcement.ProbeEnforcerHealthProfile(p)
-	}
-	return defaultHealthProber(p.Addr)
-}
 
 // StartSidecar pulls (if necessary) and starts the agentcontainer-enforcer container,
 // then polls the gRPC health endpoint until SERVING or timeout.
@@ -229,36 +157,42 @@ func StartSidecar(ctx context.Context, dockerClient client.APIClient, opts Start
 	}
 
 	// 2. Create the container.
-	portStr := fmt.Sprintf("%d", opts.Port)
-	exposedPort := network.MustParsePort(portStr + "/tcp")
-
-	// Command: bind to all interfaces *inside* the container netns (host port
-	// publication is what restricts external reach — see PortBindings below).
-	// In mTLS mode the host generates the credentials and pushes the server
-	// material into credsContainerDir (see pushServerCreds); --tls-cert/--tls-key
-	// /--tls-ca make the enforcer consume them and require client certs on every
-	// RPC. The host keeps the matching client material at the stable path.
-	cmd := []string{"--listen", "0.0.0.0:" + portStr}
-	var creds credPaths
-	if opts.MTLS {
-		var credErr error
-		creds, credErr = ensureHostCreds()
-		if credErr != nil {
+	containerPortStr := fmt.Sprintf("%d", opts.Port)
+	hostPortStr := fmt.Sprintf("%d", opts.HostPort)
+	if opts.RandomHostPort {
+		hostPortStr = ""
+	}
+	exposedPort := network.MustParsePort(containerPortStr + "/tcp")
+	socketPath := opts.SocketPath
+	socketDir := ""
+	containerSocketPath := ""
+	if socketPath != "" {
+		var err error
+		socketPath, err = filepath.Abs(socketPath)
+		if err != nil {
 			if opts.Required {
-				return nil, fmt.Errorf("preparing enforcer credentials: %w", credErr)
+				return nil, fmt.Errorf("resolving socket path: %w", err)
 			}
 			return nil, nil
 		}
-		cmd = append(cmd,
-			"--tls-cert", path.Join(credsContainerDir, serverCertFile),
-			"--tls-key", path.Join(credsContainerDir, serverKeyFile),
-			"--tls-ca", path.Join(credsContainerDir, clientCAFile),
-		)
+		socketDir = filepath.Dir(socketPath)
+		if err := os.MkdirAll(socketDir, 0700); err != nil {
+			if opts.Required {
+				return nil, fmt.Errorf("creating socket directory %s: %w", socketDir, err)
+			}
+			return nil, nil
+		}
+		if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
+			if opts.Required {
+				return nil, fmt.Errorf("removing stale socket %s: %w", socketPath, err)
+			}
+			return nil, nil
+		}
+		containerSocketPath = "/run/agentcontainer-enforcer/" + filepath.Base(socketPath)
 	}
 
 	containerCfg := &container.Config{
 		Image: opts.Image,
-		Cmd:   cmd,
 		ExposedPorts: network.PortSet{
 			exposedPort: {},
 		},
@@ -267,18 +201,11 @@ func StartSidecar(ctx context.Context, dockerClient client.APIClient, opts Start
 			LabelManaged:   "true",
 		},
 	}
-
-	// Publish the gRPC port to a single host interface when requested. Managed
-	// host-local sidecars bind 127.0.0.1 so the control plane is never exposed
-	// on all host interfaces; in-VM sidecars leave HostIP empty so the host can
-	// reach them at the VM's address.
-	portBinding := network.PortBinding{HostPort: portStr}
-	if opts.HostBindIP != "" {
-		hostIP, err := netip.ParseAddr(opts.HostBindIP)
-		if err != nil {
-			return nil, fmt.Errorf("invalid HostBindIP %q: %w", opts.HostBindIP, err)
+	if socketPath != "" {
+		containerCfg.Cmd = []string{
+			"--listen", "127.0.0.1:" + containerPortStr,
+			"--socket", containerSocketPath,
 		}
-		portBinding.HostIP = hostIP
 	}
 
 	hostCfg := &container.HostConfig{
@@ -286,19 +213,8 @@ func StartSidecar(ctx context.Context, dockerClient client.APIClient, opts Start
 			"BPF",
 			"NET_ADMIN",
 			"SYS_ADMIN",
-			"SYS_RESOURCE",
-			// SYS_PTRACE is required to inject secrets: the enforcer writes them
-			// through the agent's /proc/<init_pid>/root magic symlink (see
-			// grpc.rs InjectSecrets). Dereferencing another process's
-			// /proc/<pid>/root triggers ptrace_may_access(), which the yama LSM
-			// at ptrace_scope>=1 (the distro default) denies for non-descendant
-			// processes unless the caller holds CAP_SYS_PTRACE. Without it,
-			// injection fails with EACCES the moment it steps into the agent root.
 			"SYS_PTRACE",
-			// LINUX_IMMUTABLE lets the enforcer set/clear FS_IMMUTABLE_FL on the
-			// agent's execution-config (see grpc.rs SetImmutable). Without it the
-			// FS_IOC_SETFLAGS ioctl fails with EPERM.
-			"LINUX_IMMUTABLE",
+			"SYS_RESOURCE",
 		},
 		PidMode: container.PidMode("host"),
 		Mounts: []mount.Mount{
@@ -313,15 +229,23 @@ func StartSidecar(ctx context.Context, dockerClient client.APIClient, opts Start
 				Source: "/sys/fs/bpf",
 				Target: "/sys/fs/bpf",
 			},
-			// UDS mount deferred to Phase 6 (PRD-015 non-goal).
-			// {Type: mount.TypeBind, Source: "/run/agentcontainer-enforcer", Target: "/run/agentcontainer-enforcer"},
-		},
-		PortBindings: network.PortMap{
-			exposedPort: {portBinding},
 		},
 		RestartPolicy: container.RestartPolicy{
 			Name: container.RestartPolicyUnlessStopped,
 		},
+	}
+	if socketPath == "" {
+		hostCfg.PortBindings = network.PortMap{
+			exposedPort: {
+				{HostPort: hostPortStr},
+			},
+		}
+	} else {
+		hostCfg.Mounts = append(hostCfg.Mounts, mount.Mount{
+			Type:   mount.TypeBind,
+			Source: socketDir,
+			Target: "/run/agentcontainer-enforcer",
+		})
 	}
 
 	resp, err := dockerClient.ContainerCreate(ctx, client.ContainerCreateOptions{
@@ -329,29 +253,17 @@ func StartSidecar(ctx context.Context, dockerClient client.APIClient, opts Start
 		HostConfig: hostCfg,
 		Name:       ContainerName,
 	})
-	addr := opts.HealthCheckAddr
-	if addr == "" {
-		addr = fmt.Sprintf("127.0.0.1:%d", opts.Port)
-	}
-
 	if err != nil {
 		// Handle name conflict: a container named "agentcontainer-enforcer" already exists
 		// (e.g., from a previous crash or concurrent agentcontainer run). Try to adopt it.
 		if isNameConflict(err) {
-			// Probe the existing container with the stable host client material
-			// so the adoption health probe authenticates exactly as a real client
-			// would. A plaintext probe of an mTLS enforcer would always fail and
-			// wrongly destroy a healthy sidecar. A pre-existing enforcer started
-			// with different creds simply fails the probe and is recreated below.
-			adoptHandle := &SidecarHandle{Addr: addr, Managed: false, InsecureDev: opts.InsecureDev, ServerName: opts.ServerName}
-			if opts.MTLS {
-				adoptHandle.CACertPath = creds.clientCA
-				adoptHandle.ClientCertPath = creds.clientCert
-				adoptHandle.ClientKeyPath = creds.clientKey
+			addr := fmt.Sprintf("127.0.0.1:%d", opts.Port)
+			if socketPath != "" {
+				addr = "unix://" + socketPath
 			}
-			if defaultProfileProber(adoptHandle.Profile()) {
+			if !opts.RandomHostPort && defaultHealthProber(addr) {
 				// Existing container is healthy — adopt it as unmanaged.
-				return adoptHandle, nil
+				return &SidecarHandle{Addr: addr, Managed: false, SocketPath: socketPath}, nil
 			}
 			// Existing container is unhealthy — remove it and retry once.
 			_ = removeByName(ctx, dockerClient, ContainerName)
@@ -375,58 +287,69 @@ func StartSidecar(ctx context.Context, dockerClient client.APIClient, opts Start
 		}
 	}
 
-	// 3. Push the server mTLS material into the created (not yet running)
-	// container so the enforcer finds it at its --tls-* paths on startup. Done
-	// over the Docker API (not a bind mount) so it works identically for the
-	// per-VM sandbox socket, where no host directory is shared.
-	if opts.MTLS {
-		if err := pushServerCreds(ctx, dockerClient, resp.ID, creds); err != nil {
-			cleanupContainer(ctx, dockerClient, resp.ID)
-			if opts.Required {
-				return nil, fmt.Errorf("pushing enforcer credentials: %w", err)
-			}
-			return nil, nil
-		}
-	}
-
-	// 4. Start the container.
+	// 3. Start the container.
 	if _, err := dockerClient.ContainerStart(ctx, resp.ID, client.ContainerStartOptions{}); err != nil {
 		// Best-effort cleanup on start failure.
 		_, _ = dockerClient.ContainerRemove(ctx, resp.ID, client.ContainerRemoveOptions{Force: true})
+		cleanupSocket(socketPath)
 		if opts.Required {
 			return nil, fmt.Errorf("starting container: %w", err)
 		}
 		return nil, nil
 	}
 
-	handle := &SidecarHandle{
-		ContainerID: resp.ID,
-		Addr:        addr,
-		Managed:     true,
-		InsecureDev: opts.InsecureDev,
-		ServerName:  opts.ServerName,
+	// 4. Wait for health check.
+	addr := opts.HealthCheckAddr
+	if addr == "" {
+		if socketPath != "" {
+			addr = "unix://" + socketPath
+		} else if opts.RandomHostPort {
+			publishedPort, err := publishedHostPort(ctx, dockerClient, resp.ID, exposedPort)
+			if err != nil {
+				cleanupContainer(ctx, dockerClient, resp.ID)
+				if opts.Required {
+					return nil, fmt.Errorf("resolving random host port: %w", err)
+				}
+				return nil, nil
+			}
+			addr = "127.0.0.1:" + publishedPort
+		} else {
+			addr = fmt.Sprintf("127.0.0.1:%d", opts.HostPort)
+		}
 	}
-	if opts.MTLS {
-		// The client material stays at the stable host path; clients (this
-		// process, a later `ac run`, `mcp start`) read it from there.
-		handle.credsDir = creds.dir
-		handle.CACertPath = creds.clientCA
-		handle.ClientCertPath = creds.clientCert
-		handle.ClientKeyPath = creds.clientKey
-	}
-
-	// 5. Wait for health check, presenting the same credentials a real client uses.
-	if err := WaitHealthyProfile(ctx, handle.Profile(), opts.HealthTimeout, opts.HealthInterval); err != nil {
-		// Health check failed — remove the container. The host credentials are
-		// reusable and persist (rotate explicitly with `enforcer stop --purge`).
+	if err := WaitHealthy(ctx, addr, opts.HealthTimeout, opts.HealthInterval); err != nil {
+		// Health check failed — clean up the container.
 		cleanupContainer(ctx, dockerClient, resp.ID)
+		cleanupSocket(socketPath)
 		if opts.Required {
 			return nil, fmt.Errorf("enforcer failed to reach SERVING: %w", err)
 		}
 		return nil, nil
 	}
 
-	return handle, nil
+	return &SidecarHandle{
+		ContainerID: resp.ID,
+		Addr:        addr,
+		Managed:     true,
+		SocketPath:  socketPath,
+	}, nil
+}
+
+func publishedHostPort(ctx context.Context, dockerClient client.APIClient, containerID string, port network.Port) (string, error) {
+	result, err := dockerClient.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{})
+	if err != nil {
+		return "", fmt.Errorf("inspecting container %s: %w", containerID, err)
+	}
+	if result.Container.NetworkSettings == nil {
+		return "", fmt.Errorf("container %s has no network settings", containerID)
+	}
+	bindings := result.Container.NetworkSettings.Ports[port]
+	for _, binding := range bindings {
+		if binding.HostPort != "" {
+			return binding.HostPort, nil
+		}
+	}
+	return "", fmt.Errorf("container %s has no host port for %s", containerID, port)
 }
 
 // StopSidecar gracefully stops and removes the managed sidecar container.
@@ -452,38 +375,23 @@ func StopSidecar(ctx context.Context, dockerClient client.APIClient, handle *Sid
 		return fmt.Errorf("removing sidecar: %w", err)
 	}
 
-	// The host credentials are deliberately left in place: they are reusable
-	// across restarts. Rotate them explicitly with `enforcer stop --purge`.
+	if handle.SocketPath != "" {
+		cleanupSocket(handle.SocketPath)
+	}
 
 	return nil
+}
+
+func cleanupSocket(path string) {
+	if path != "" {
+		_ = os.Remove(path)
+	}
 }
 
 // WaitHealthy polls the gRPC health endpoint at target until the service
 // reports SERVING or the timeout expires.
 func WaitHealthy(ctx context.Context, target string, timeout, interval time.Duration) error {
 	return WaitHealthyWithProber(ctx, target, timeout, interval, defaultHealthProber)
-}
-
-// WaitHealthyProfile polls the gRPC health endpoint using the connection
-// profile (so an mTLS endpoint is probed with its client credentials) until the
-// service reports SERVING or the timeout expires.
-func WaitHealthyProfile(ctx context.Context, profile enforcement.ConnectionProfile, timeout, interval time.Duration) error {
-	deadline := time.After(timeout)
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-deadline:
-			return fmt.Errorf("timed out waiting for agentcontainer-enforcer health on %s", profile.Addr)
-		case <-ticker.C:
-			if defaultProfileProber(profile) {
-				return nil
-			}
-		}
-	}
 }
 
 // WaitHealthyWithProber polls the gRPC health endpoint using the provided

@@ -2,11 +2,12 @@ package enforcement
 
 import (
 	"context"
+	"net"
 	"os"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	healthgrpc "google.golang.org/grpc/health/grpc_health_v1"
 )
@@ -39,7 +40,7 @@ func (l Level) String() string {
 func DetectLevel() Level {
 	// Check for agentcontainer-enforcer sidecar via gRPC health check.
 	if target := os.Getenv("AC_ENFORCER_ADDR"); target != "" {
-		if ProbeEnforcerHealth(target) {
+		if probeEnforcerHealth(target) {
 			return LevelGRPC
 		}
 	}
@@ -48,45 +49,22 @@ func DetectLevel() Level {
 }
 
 // ProbeEnforcerHealth checks if the agentcontainer-enforcer sidecar is reachable via gRPC.
-// It returns true if the health check succeeds within a 2-second timeout. The
-// connection is plaintext; use ProbeEnforcerHealthProfile to probe a mTLS
-// endpoint with the same credentials a real client would present.
+// It returns true if the health check succeeds within a 2-second timeout.
 func ProbeEnforcerHealth(target string) bool {
-	return probeEnforcerHealth(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	return probeEnforcerHealth(target)
 }
 
-// ProbeEnforcerHealthProfile checks reachability using the profile's TLS
-// configuration, so a managed mTLS-only enforcer (which rejects plaintext) is
-// probed exactly as a normal client connects. It applies the same TLS policy as
-// NewStrategyFromProfile: a non-loopback plaintext endpoint without an
-// insecure-dev opt-in fails the probe.
-func ProbeEnforcerHealthProfile(p ConnectionProfile) bool {
-	opts, err := optionsFromProfile(p, nil)
-	if err != nil {
-		return false
-	}
-	cfg := defaultGRPCConfig()
-	for _, opt := range opts {
-		opt(cfg)
-	}
-	var dialOpt grpc.DialOption
-	switch {
-	case cfg.insecure:
-		dialOpt = grpc.WithTransportCredentials(insecure.NewCredentials())
-	case cfg.tlsConfig != nil:
-		dialOpt = grpc.WithTransportCredentials(credentials.NewTLS(cfg.tlsConfig))
-	default:
-		dialOpt = grpc.WithTransportCredentials(insecure.NewCredentials())
-	}
-	return probeEnforcerHealth(p.Addr, dialOpt)
-}
-
-// probeEnforcerHealth checks if the agentcontainer-enforcer sidecar is reachable
-// via gRPC using the supplied transport credentials.
-func probeEnforcerHealth(target string, creds grpc.DialOption) bool {
+// probeEnforcerHealth checks if the agentcontainer-enforcer sidecar is reachable via gRPC.
+func probeEnforcerHealth(target string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	conn, err := grpc.NewClient(target, creds)
+	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	if socketPath, ok := strings.CutPrefix(target, "unix://"); ok {
+		dialOpts = append(dialOpts, grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+		}))
+	}
+	conn, err := grpc.NewClient(target, dialOpts...)
 	if err != nil {
 		return false
 	}

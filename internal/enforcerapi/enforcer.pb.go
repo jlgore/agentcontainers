@@ -673,6 +673,410 @@ func (x *ProcessPolicyRequest) GetAllowedBinaries() []string {
 	return nil
 }
 
+type DenySetEntry struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	DenySetId     uint32                 `protobuf:"varint,1,opt,name=deny_set_id,json=denySetId,proto3" json:"deny_set_id,omitempty"`
+	BinaryPath    string                 `protobuf:"bytes,2,opt,name=binary_path,json=binaryPath,proto3" json:"binary_path,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DenySetEntry) Reset() {
+	*x = DenySetEntry{}
+	mi := &file_enforcer_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DenySetEntry) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DenySetEntry) ProtoMessage() {}
+
+func (x *DenySetEntry) ProtoReflect() protoreflect.Message {
+	mi := &file_enforcer_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DenySetEntry.ProtoReflect.Descriptor instead.
+func (*DenySetEntry) Descriptor() ([]byte, []int) {
+	return file_enforcer_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *DenySetEntry) GetDenySetId() uint32 {
+	if x != nil {
+		return x.DenySetId
+	}
+	return 0
+}
+
+func (x *DenySetEntry) GetBinaryPath() string {
+	if x != nil {
+		return x.BinaryPath
+	}
+	return ""
+}
+
+type DenySetTransition struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	ParentDenySetId uint32                 `protobuf:"varint,1,opt,name=parent_deny_set_id,json=parentDenySetId,proto3" json:"parent_deny_set_id,omitempty"`
+	ChildBinaryPath string                 `protobuf:"bytes,2,opt,name=child_binary_path,json=childBinaryPath,proto3" json:"child_binary_path,omitempty"`
+	ChildDenySetId  uint32                 `protobuf:"varint,3,opt,name=child_deny_set_id,json=childDenySetId,proto3" json:"child_deny_set_id,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *DenySetTransition) Reset() {
+	*x = DenySetTransition{}
+	mi := &file_enforcer_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DenySetTransition) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DenySetTransition) ProtoMessage() {}
+
+func (x *DenySetTransition) ProtoReflect() protoreflect.Message {
+	mi := &file_enforcer_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DenySetTransition.ProtoReflect.Descriptor instead.
+func (*DenySetTransition) Descriptor() ([]byte, []int) {
+	return file_enforcer_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *DenySetTransition) GetParentDenySetId() uint32 {
+	if x != nil {
+		return x.ParentDenySetId
+	}
+	return 0
+}
+
+func (x *DenySetTransition) GetChildBinaryPath() string {
+	if x != nil {
+		return x.ChildBinaryPath
+	}
+	return ""
+}
+
+func (x *DenySetTransition) GetChildDenySetId() uint32 {
+	if x != nil {
+		return x.ChildDenySetId
+	}
+	return 0
+}
+
+type ApplyDenySetPolicyRequest struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	ContainerId    string                 `protobuf:"bytes,1,opt,name=container_id,json=containerId,proto3" json:"container_id,omitempty"`
+	AllowedEntries []*DenySetEntry        `protobuf:"bytes,2,rep,name=allowed_entries,json=allowedEntries,proto3" json:"allowed_entries,omitempty"`
+	Transitions    []*DenySetTransition   `protobuf:"bytes,3,rep,name=transitions,proto3" json:"transitions,omitempty"`
+	InitPid        uint32                 `protobuf:"varint,4,opt,name=init_pid,json=initPid,proto3" json:"init_pid,omitempty"`
+	InitDenySetId  uint32                 `protobuf:"varint,5,opt,name=init_deny_set_id,json=initDenySetId,proto3" json:"init_deny_set_id,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *ApplyDenySetPolicyRequest) Reset() {
+	*x = ApplyDenySetPolicyRequest{}
+	mi := &file_enforcer_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ApplyDenySetPolicyRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ApplyDenySetPolicyRequest) ProtoMessage() {}
+
+func (x *ApplyDenySetPolicyRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_enforcer_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ApplyDenySetPolicyRequest.ProtoReflect.Descriptor instead.
+func (*ApplyDenySetPolicyRequest) Descriptor() ([]byte, []int) {
+	return file_enforcer_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *ApplyDenySetPolicyRequest) GetContainerId() string {
+	if x != nil {
+		return x.ContainerId
+	}
+	return ""
+}
+
+func (x *ApplyDenySetPolicyRequest) GetAllowedEntries() []*DenySetEntry {
+	if x != nil {
+		return x.AllowedEntries
+	}
+	return nil
+}
+
+func (x *ApplyDenySetPolicyRequest) GetTransitions() []*DenySetTransition {
+	if x != nil {
+		return x.Transitions
+	}
+	return nil
+}
+
+func (x *ApplyDenySetPolicyRequest) GetInitPid() uint32 {
+	if x != nil {
+		return x.InitPid
+	}
+	return 0
+}
+
+func (x *ApplyDenySetPolicyRequest) GetInitDenySetId() uint32 {
+	if x != nil {
+		return x.InitDenySetId
+	}
+	return 0
+}
+
+type UpdateDenySetPolicyRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ContainerId   string                 `protobuf:"bytes,1,opt,name=container_id,json=containerId,proto3" json:"container_id,omitempty"`
+	DenySetId     uint32                 `protobuf:"varint,2,opt,name=deny_set_id,json=denySetId,proto3" json:"deny_set_id,omitempty"`
+	BinaryPath    string                 `protobuf:"bytes,3,opt,name=binary_path,json=binaryPath,proto3" json:"binary_path,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UpdateDenySetPolicyRequest) Reset() {
+	*x = UpdateDenySetPolicyRequest{}
+	mi := &file_enforcer_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UpdateDenySetPolicyRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpdateDenySetPolicyRequest) ProtoMessage() {}
+
+func (x *UpdateDenySetPolicyRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_enforcer_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpdateDenySetPolicyRequest.ProtoReflect.Descriptor instead.
+func (*UpdateDenySetPolicyRequest) Descriptor() ([]byte, []int) {
+	return file_enforcer_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *UpdateDenySetPolicyRequest) GetContainerId() string {
+	if x != nil {
+		return x.ContainerId
+	}
+	return ""
+}
+
+func (x *UpdateDenySetPolicyRequest) GetDenySetId() uint32 {
+	if x != nil {
+		return x.DenySetId
+	}
+	return 0
+}
+
+func (x *UpdateDenySetPolicyRequest) GetBinaryPath() string {
+	if x != nil {
+		return x.BinaryPath
+	}
+	return ""
+}
+
+type BindPolicyRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ContainerId   string                 `protobuf:"bytes,1,opt,name=container_id,json=containerId,proto3" json:"container_id,omitempty"`
+	AllowedBinds  []*BindRule            `protobuf:"bytes,2,rep,name=allowed_binds,json=allowedBinds,proto3" json:"allowed_binds,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BindPolicyRequest) Reset() {
+	*x = BindPolicyRequest{}
+	mi := &file_enforcer_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BindPolicyRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BindPolicyRequest) ProtoMessage() {}
+
+func (x *BindPolicyRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_enforcer_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BindPolicyRequest.ProtoReflect.Descriptor instead.
+func (*BindPolicyRequest) Descriptor() ([]byte, []int) {
+	return file_enforcer_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *BindPolicyRequest) GetContainerId() string {
+	if x != nil {
+		return x.ContainerId
+	}
+	return ""
+}
+
+func (x *BindPolicyRequest) GetAllowedBinds() []*BindRule {
+	if x != nil {
+		return x.AllowedBinds
+	}
+	return nil
+}
+
+type BindRule struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Port          uint32                 `protobuf:"varint,1,opt,name=port,proto3" json:"port,omitempty"`
+	Protocol      string                 `protobuf:"bytes,2,opt,name=protocol,proto3" json:"protocol,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BindRule) Reset() {
+	*x = BindRule{}
+	mi := &file_enforcer_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BindRule) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BindRule) ProtoMessage() {}
+
+func (x *BindRule) ProtoReflect() protoreflect.Message {
+	mi := &file_enforcer_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BindRule.ProtoReflect.Descriptor instead.
+func (*BindRule) Descriptor() ([]byte, []int) {
+	return file_enforcer_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *BindRule) GetPort() uint32 {
+	if x != nil {
+		return x.Port
+	}
+	return 0
+}
+
+func (x *BindRule) GetProtocol() string {
+	if x != nil {
+		return x.Protocol
+	}
+	return ""
+}
+
+type ReverseShellConfigRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ContainerId   string                 `protobuf:"bytes,1,opt,name=container_id,json=containerId,proto3" json:"container_id,omitempty"`
+	Mode          string                 `protobuf:"bytes,2,opt,name=mode,proto3" json:"mode,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReverseShellConfigRequest) Reset() {
+	*x = ReverseShellConfigRequest{}
+	mi := &file_enforcer_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReverseShellConfigRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReverseShellConfigRequest) ProtoMessage() {}
+
+func (x *ReverseShellConfigRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_enforcer_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReverseShellConfigRequest.ProtoReflect.Descriptor instead.
+func (*ReverseShellConfigRequest) Descriptor() ([]byte, []int) {
+	return file_enforcer_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *ReverseShellConfigRequest) GetContainerId() string {
+	if x != nil {
+		return x.ContainerId
+	}
+	return ""
+}
+
+func (x *ReverseShellConfigRequest) GetMode() string {
+	if x != nil {
+		return x.Mode
+	}
+	return ""
+}
+
 type SecretEntry struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
@@ -684,7 +1088,7 @@ type SecretEntry struct {
 
 func (x *SecretEntry) Reset() {
 	*x = SecretEntry{}
-	mi := &file_enforcer_proto_msgTypes[12]
+	mi := &file_enforcer_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -696,7 +1100,7 @@ func (x *SecretEntry) String() string {
 func (*SecretEntry) ProtoMessage() {}
 
 func (x *SecretEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[12]
+	mi := &file_enforcer_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -709,7 +1113,7 @@ func (x *SecretEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SecretEntry.ProtoReflect.Descriptor instead.
 func (*SecretEntry) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{12}
+	return file_enforcer_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *SecretEntry) GetName() string {
@@ -744,7 +1148,7 @@ type InjectSecretsRequest struct {
 
 func (x *InjectSecretsRequest) Reset() {
 	*x = InjectSecretsRequest{}
-	mi := &file_enforcer_proto_msgTypes[13]
+	mi := &file_enforcer_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -756,7 +1160,7 @@ func (x *InjectSecretsRequest) String() string {
 func (*InjectSecretsRequest) ProtoMessage() {}
 
 func (x *InjectSecretsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[13]
+	mi := &file_enforcer_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -769,7 +1173,7 @@ func (x *InjectSecretsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InjectSecretsRequest.ProtoReflect.Descriptor instead.
 func (*InjectSecretsRequest) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{13}
+	return file_enforcer_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *InjectSecretsRequest) GetContainerId() string {
@@ -804,7 +1208,7 @@ type InjectSecretsResponse struct {
 
 func (x *InjectSecretsResponse) Reset() {
 	*x = InjectSecretsResponse{}
-	mi := &file_enforcer_proto_msgTypes[14]
+	mi := &file_enforcer_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -816,7 +1220,7 @@ func (x *InjectSecretsResponse) String() string {
 func (*InjectSecretsResponse) ProtoMessage() {}
 
 func (x *InjectSecretsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[14]
+	mi := &file_enforcer_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -829,7 +1233,7 @@ func (x *InjectSecretsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InjectSecretsResponse.ProtoReflect.Descriptor instead.
 func (*InjectSecretsResponse) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{14}
+	return file_enforcer_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *InjectSecretsResponse) GetSuccess() bool {
@@ -863,7 +1267,7 @@ type CredentialPolicyRequest struct {
 
 func (x *CredentialPolicyRequest) Reset() {
 	*x = CredentialPolicyRequest{}
-	mi := &file_enforcer_proto_msgTypes[15]
+	mi := &file_enforcer_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -875,7 +1279,7 @@ func (x *CredentialPolicyRequest) String() string {
 func (*CredentialPolicyRequest) ProtoMessage() {}
 
 func (x *CredentialPolicyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[15]
+	mi := &file_enforcer_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -888,7 +1292,7 @@ func (x *CredentialPolicyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CredentialPolicyRequest.ProtoReflect.Descriptor instead.
 func (*CredentialPolicyRequest) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{15}
+	return file_enforcer_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *CredentialPolicyRequest) GetContainerId() string {
@@ -916,7 +1320,7 @@ type SecretAcl struct {
 
 func (x *SecretAcl) Reset() {
 	*x = SecretAcl{}
-	mi := &file_enforcer_proto_msgTypes[16]
+	mi := &file_enforcer_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -928,7 +1332,7 @@ func (x *SecretAcl) String() string {
 func (*SecretAcl) ProtoMessage() {}
 
 func (x *SecretAcl) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[16]
+	mi := &file_enforcer_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -941,7 +1345,7 @@ func (x *SecretAcl) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SecretAcl.ProtoReflect.Descriptor instead.
 func (*SecretAcl) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{16}
+	return file_enforcer_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *SecretAcl) GetPath() string {
@@ -991,7 +1395,7 @@ type LoadPolicyBundleRequest struct {
 
 func (x *LoadPolicyBundleRequest) Reset() {
 	*x = LoadPolicyBundleRequest{}
-	mi := &file_enforcer_proto_msgTypes[17]
+	mi := &file_enforcer_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1003,7 +1407,7 @@ func (x *LoadPolicyBundleRequest) String() string {
 func (*LoadPolicyBundleRequest) ProtoMessage() {}
 
 func (x *LoadPolicyBundleRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[17]
+	mi := &file_enforcer_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1016,7 +1420,7 @@ func (x *LoadPolicyBundleRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LoadPolicyBundleRequest.ProtoReflect.Descriptor instead.
 func (*LoadPolicyBundleRequest) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{17}
+	return file_enforcer_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *LoadPolicyBundleRequest) GetContainerId() string {
@@ -1065,7 +1469,7 @@ type LoadPolicyBundleResponse struct {
 
 func (x *LoadPolicyBundleResponse) Reset() {
 	*x = LoadPolicyBundleResponse{}
-	mi := &file_enforcer_proto_msgTypes[18]
+	mi := &file_enforcer_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1077,7 +1481,7 @@ func (x *LoadPolicyBundleResponse) String() string {
 func (*LoadPolicyBundleResponse) ProtoMessage() {}
 
 func (x *LoadPolicyBundleResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[18]
+	mi := &file_enforcer_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1090,7 +1494,7 @@ func (x *LoadPolicyBundleResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LoadPolicyBundleResponse.ProtoReflect.Descriptor instead.
 func (*LoadPolicyBundleResponse) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{18}
+	return file_enforcer_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *LoadPolicyBundleResponse) GetSuccess() bool {
@@ -1128,7 +1532,7 @@ type PolicyResponse struct {
 
 func (x *PolicyResponse) Reset() {
 	*x = PolicyResponse{}
-	mi := &file_enforcer_proto_msgTypes[19]
+	mi := &file_enforcer_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1140,7 +1544,7 @@ func (x *PolicyResponse) String() string {
 func (*PolicyResponse) ProtoMessage() {}
 
 func (x *PolicyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[19]
+	mi := &file_enforcer_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1153,7 +1557,7 @@ func (x *PolicyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PolicyResponse.ProtoReflect.Descriptor instead.
 func (*PolicyResponse) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{19}
+	return file_enforcer_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *PolicyResponse) GetSuccess() bool {
@@ -1186,7 +1590,7 @@ type StreamEventsRequest struct {
 
 func (x *StreamEventsRequest) Reset() {
 	*x = StreamEventsRequest{}
-	mi := &file_enforcer_proto_msgTypes[20]
+	mi := &file_enforcer_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1198,7 +1602,7 @@ func (x *StreamEventsRequest) String() string {
 func (*StreamEventsRequest) ProtoMessage() {}
 
 func (x *StreamEventsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[20]
+	mi := &file_enforcer_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1211,7 +1615,7 @@ func (x *StreamEventsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamEventsRequest.ProtoReflect.Descriptor instead.
 func (*StreamEventsRequest) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{20}
+	return file_enforcer_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *StreamEventsRequest) GetContainerId() string {
@@ -1238,7 +1642,7 @@ type EnforcementEvent struct {
 
 func (x *EnforcementEvent) Reset() {
 	*x = EnforcementEvent{}
-	mi := &file_enforcer_proto_msgTypes[21]
+	mi := &file_enforcer_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1250,7 +1654,7 @@ func (x *EnforcementEvent) String() string {
 func (*EnforcementEvent) ProtoMessage() {}
 
 func (x *EnforcementEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[21]
+	mi := &file_enforcer_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1263,7 +1667,7 @@ func (x *EnforcementEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnforcementEvent.ProtoReflect.Descriptor instead.
 func (*EnforcementEvent) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{21}
+	return file_enforcer_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *EnforcementEvent) GetTimestampNs() uint64 {
@@ -1338,7 +1742,7 @@ type GetStatsRequest struct {
 
 func (x *GetStatsRequest) Reset() {
 	*x = GetStatsRequest{}
-	mi := &file_enforcer_proto_msgTypes[22]
+	mi := &file_enforcer_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1350,7 +1754,7 @@ func (x *GetStatsRequest) String() string {
 func (*GetStatsRequest) ProtoMessage() {}
 
 func (x *GetStatsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[22]
+	mi := &file_enforcer_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1363,7 +1767,7 @@ func (x *GetStatsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetStatsRequest.ProtoReflect.Descriptor instead.
 func (*GetStatsRequest) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{22}
+	return file_enforcer_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *GetStatsRequest) GetContainerId() string {
@@ -1397,7 +1801,7 @@ type StatsResponse struct {
 
 func (x *StatsResponse) Reset() {
 	*x = StatsResponse{}
-	mi := &file_enforcer_proto_msgTypes[23]
+	mi := &file_enforcer_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1409,7 +1813,7 @@ func (x *StatsResponse) String() string {
 func (*StatsResponse) ProtoMessage() {}
 
 func (x *StatsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[23]
+	mi := &file_enforcer_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1422,7 +1826,7 @@ func (x *StatsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatsResponse.ProtoReflect.Descriptor instead.
 func (*StatsResponse) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{23}
+	return file_enforcer_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *StatsResponse) GetNetworkAllowed() uint64 {
@@ -1507,7 +1911,7 @@ type ComponentPolicy struct {
 
 func (x *ComponentPolicy) Reset() {
 	*x = ComponentPolicy{}
-	mi := &file_enforcer_proto_msgTypes[24]
+	mi := &file_enforcer_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1519,7 +1923,7 @@ func (x *ComponentPolicy) String() string {
 func (*ComponentPolicy) ProtoMessage() {}
 
 func (x *ComponentPolicy) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[24]
+	mi := &file_enforcer_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1532,7 +1936,7 @@ func (x *ComponentPolicy) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ComponentPolicy.ProtoReflect.Descriptor instead.
 func (*ComponentPolicy) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{24}
+	return file_enforcer_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *ComponentPolicy) GetNetworkHosts() []string {
@@ -1574,7 +1978,7 @@ type ComponentLimits struct {
 
 func (x *ComponentLimits) Reset() {
 	*x = ComponentLimits{}
-	mi := &file_enforcer_proto_msgTypes[25]
+	mi := &file_enforcer_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1586,7 +1990,7 @@ func (x *ComponentLimits) String() string {
 func (*ComponentLimits) ProtoMessage() {}
 
 func (x *ComponentLimits) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[25]
+	mi := &file_enforcer_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1599,7 +2003,7 @@ func (x *ComponentLimits) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ComponentLimits.ProtoReflect.Descriptor instead.
 func (*ComponentLimits) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{25}
+	return file_enforcer_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *ComponentLimits) GetMemoryBytes() uint64 {
@@ -1635,7 +2039,7 @@ type ToolDefinition struct {
 
 func (x *ToolDefinition) Reset() {
 	*x = ToolDefinition{}
-	mi := &file_enforcer_proto_msgTypes[26]
+	mi := &file_enforcer_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1647,7 +2051,7 @@ func (x *ToolDefinition) String() string {
 func (*ToolDefinition) ProtoMessage() {}
 
 func (x *ToolDefinition) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[26]
+	mi := &file_enforcer_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1660,7 +2064,7 @@ func (x *ToolDefinition) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ToolDefinition.ProtoReflect.Descriptor instead.
 func (*ToolDefinition) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{26}
+	return file_enforcer_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *ToolDefinition) GetComponentName() string {
@@ -1705,7 +2109,7 @@ type LoadComponentRequest struct {
 
 func (x *LoadComponentRequest) Reset() {
 	*x = LoadComponentRequest{}
-	mi := &file_enforcer_proto_msgTypes[27]
+	mi := &file_enforcer_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1717,7 +2121,7 @@ func (x *LoadComponentRequest) String() string {
 func (*LoadComponentRequest) ProtoMessage() {}
 
 func (x *LoadComponentRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[27]
+	mi := &file_enforcer_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1730,7 +2134,7 @@ func (x *LoadComponentRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LoadComponentRequest.ProtoReflect.Descriptor instead.
 func (*LoadComponentRequest) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{27}
+	return file_enforcer_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *LoadComponentRequest) GetContainerId() string {
@@ -1786,7 +2190,7 @@ type LoadComponentResponse struct {
 
 func (x *LoadComponentResponse) Reset() {
 	*x = LoadComponentResponse{}
-	mi := &file_enforcer_proto_msgTypes[28]
+	mi := &file_enforcer_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1798,7 +2202,7 @@ func (x *LoadComponentResponse) String() string {
 func (*LoadComponentResponse) ProtoMessage() {}
 
 func (x *LoadComponentResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[28]
+	mi := &file_enforcer_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1811,7 +2215,7 @@ func (x *LoadComponentResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LoadComponentResponse.ProtoReflect.Descriptor instead.
 func (*LoadComponentResponse) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{28}
+	return file_enforcer_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *LoadComponentResponse) GetSuccess() bool {
@@ -1845,7 +2249,7 @@ type UnloadComponentRequest struct {
 
 func (x *UnloadComponentRequest) Reset() {
 	*x = UnloadComponentRequest{}
-	mi := &file_enforcer_proto_msgTypes[29]
+	mi := &file_enforcer_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1857,7 +2261,7 @@ func (x *UnloadComponentRequest) String() string {
 func (*UnloadComponentRequest) ProtoMessage() {}
 
 func (x *UnloadComponentRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[29]
+	mi := &file_enforcer_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1870,7 +2274,7 @@ func (x *UnloadComponentRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UnloadComponentRequest.ProtoReflect.Descriptor instead.
 func (*UnloadComponentRequest) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{29}
+	return file_enforcer_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *UnloadComponentRequest) GetContainerId() string {
@@ -1895,7 +2299,7 @@ type UnloadComponentResponse struct {
 
 func (x *UnloadComponentResponse) Reset() {
 	*x = UnloadComponentResponse{}
-	mi := &file_enforcer_proto_msgTypes[30]
+	mi := &file_enforcer_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1907,7 +2311,7 @@ func (x *UnloadComponentResponse) String() string {
 func (*UnloadComponentResponse) ProtoMessage() {}
 
 func (x *UnloadComponentResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[30]
+	mi := &file_enforcer_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1920,7 +2324,7 @@ func (x *UnloadComponentResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UnloadComponentResponse.ProtoReflect.Descriptor instead.
 func (*UnloadComponentResponse) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{30}
+	return file_enforcer_proto_rawDescGZIP(), []int{37}
 }
 
 type ListComponentsRequest struct {
@@ -1932,7 +2336,7 @@ type ListComponentsRequest struct {
 
 func (x *ListComponentsRequest) Reset() {
 	*x = ListComponentsRequest{}
-	mi := &file_enforcer_proto_msgTypes[31]
+	mi := &file_enforcer_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1944,7 +2348,7 @@ func (x *ListComponentsRequest) String() string {
 func (*ListComponentsRequest) ProtoMessage() {}
 
 func (x *ListComponentsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[31]
+	mi := &file_enforcer_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1957,7 +2361,7 @@ func (x *ListComponentsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListComponentsRequest.ProtoReflect.Descriptor instead.
 func (*ListComponentsRequest) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{31}
+	return file_enforcer_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *ListComponentsRequest) GetContainerId() string {
@@ -1979,7 +2383,7 @@ type ComponentInfo struct {
 
 func (x *ComponentInfo) Reset() {
 	*x = ComponentInfo{}
-	mi := &file_enforcer_proto_msgTypes[32]
+	mi := &file_enforcer_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1991,7 +2395,7 @@ func (x *ComponentInfo) String() string {
 func (*ComponentInfo) ProtoMessage() {}
 
 func (x *ComponentInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[32]
+	mi := &file_enforcer_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2004,7 +2408,7 @@ func (x *ComponentInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ComponentInfo.ProtoReflect.Descriptor instead.
 func (*ComponentInfo) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{32}
+	return file_enforcer_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *ComponentInfo) GetContainerId() string {
@@ -2044,7 +2448,7 @@ type ListComponentsResponse struct {
 
 func (x *ListComponentsResponse) Reset() {
 	*x = ListComponentsResponse{}
-	mi := &file_enforcer_proto_msgTypes[33]
+	mi := &file_enforcer_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2056,7 +2460,7 @@ func (x *ListComponentsResponse) String() string {
 func (*ListComponentsResponse) ProtoMessage() {}
 
 func (x *ListComponentsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[33]
+	mi := &file_enforcer_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2069,7 +2473,7 @@ func (x *ListComponentsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListComponentsResponse.ProtoReflect.Descriptor instead.
 func (*ListComponentsResponse) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{33}
+	return file_enforcer_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *ListComponentsResponse) GetComponents() []*ComponentInfo {
@@ -2089,7 +2493,7 @@ type ListToolsRequest struct {
 
 func (x *ListToolsRequest) Reset() {
 	*x = ListToolsRequest{}
-	mi := &file_enforcer_proto_msgTypes[34]
+	mi := &file_enforcer_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2101,7 +2505,7 @@ func (x *ListToolsRequest) String() string {
 func (*ListToolsRequest) ProtoMessage() {}
 
 func (x *ListToolsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[34]
+	mi := &file_enforcer_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2114,7 +2518,7 @@ func (x *ListToolsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListToolsRequest.ProtoReflect.Descriptor instead.
 func (*ListToolsRequest) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{34}
+	return file_enforcer_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *ListToolsRequest) GetContainerId() string {
@@ -2140,7 +2544,7 @@ type ListToolsResponse struct {
 
 func (x *ListToolsResponse) Reset() {
 	*x = ListToolsResponse{}
-	mi := &file_enforcer_proto_msgTypes[35]
+	mi := &file_enforcer_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2152,7 +2556,7 @@ func (x *ListToolsResponse) String() string {
 func (*ListToolsResponse) ProtoMessage() {}
 
 func (x *ListToolsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[35]
+	mi := &file_enforcer_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2165,7 +2569,7 @@ func (x *ListToolsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListToolsResponse.ProtoReflect.Descriptor instead.
 func (*ListToolsResponse) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{35}
+	return file_enforcer_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *ListToolsResponse) GetTools() []*ToolDefinition {
@@ -2187,7 +2591,7 @@ type CallToolRequest struct {
 
 func (x *CallToolRequest) Reset() {
 	*x = CallToolRequest{}
-	mi := &file_enforcer_proto_msgTypes[36]
+	mi := &file_enforcer_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2199,7 +2603,7 @@ func (x *CallToolRequest) String() string {
 func (*CallToolRequest) ProtoMessage() {}
 
 func (x *CallToolRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[36]
+	mi := &file_enforcer_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2212,7 +2616,7 @@ func (x *CallToolRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CallToolRequest.ProtoReflect.Descriptor instead.
 func (*CallToolRequest) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{36}
+	return file_enforcer_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *CallToolRequest) GetContainerId() string {
@@ -2256,7 +2660,7 @@ type CallToolResponse struct {
 
 func (x *CallToolResponse) Reset() {
 	*x = CallToolResponse{}
-	mi := &file_enforcer_proto_msgTypes[37]
+	mi := &file_enforcer_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2268,7 +2672,7 @@ func (x *CallToolResponse) String() string {
 func (*CallToolResponse) ProtoMessage() {}
 
 func (x *CallToolResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[37]
+	mi := &file_enforcer_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2281,7 +2685,7 @@ func (x *CallToolResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CallToolResponse.ProtoReflect.Descriptor instead.
 func (*CallToolResponse) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{37}
+	return file_enforcer_proto_rawDescGZIP(), []int{44}
 }
 
 func (x *CallToolResponse) GetSuccess() bool {
@@ -2336,7 +2740,7 @@ type SetImmutableRequest struct {
 
 func (x *SetImmutableRequest) Reset() {
 	*x = SetImmutableRequest{}
-	mi := &file_enforcer_proto_msgTypes[38]
+	mi := &file_enforcer_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2348,7 +2752,7 @@ func (x *SetImmutableRequest) String() string {
 func (*SetImmutableRequest) ProtoMessage() {}
 
 func (x *SetImmutableRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[38]
+	mi := &file_enforcer_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2361,7 +2765,7 @@ func (x *SetImmutableRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetImmutableRequest.ProtoReflect.Descriptor instead.
 func (*SetImmutableRequest) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{38}
+	return file_enforcer_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *SetImmutableRequest) GetContainerId() string {
@@ -2396,7 +2800,7 @@ type SetImmutableResponse struct {
 
 func (x *SetImmutableResponse) Reset() {
 	*x = SetImmutableResponse{}
-	mi := &file_enforcer_proto_msgTypes[39]
+	mi := &file_enforcer_proto_msgTypes[46]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2408,7 +2812,7 @@ func (x *SetImmutableResponse) String() string {
 func (*SetImmutableResponse) ProtoMessage() {}
 
 func (x *SetImmutableResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_enforcer_proto_msgTypes[39]
+	mi := &file_enforcer_proto_msgTypes[46]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2421,7 +2825,7 @@ func (x *SetImmutableResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetImmutableResponse.ProtoReflect.Descriptor instead.
 func (*SetImmutableResponse) Descriptor() ([]byte, []int) {
-	return file_enforcer_proto_rawDescGZIP(), []int{39}
+	return file_enforcer_proto_rawDescGZIP(), []int{46}
 }
 
 func (x *SetImmutableResponse) GetSuccess() bool {
@@ -2493,7 +2897,35 @@ const file_enforcer_proto_rawDesc = "" +
 	"deny_paths\x18\x04 \x03(\tR\tdenyPaths\"d\n" +
 	"\x14ProcessPolicyRequest\x12!\n" +
 	"\fcontainer_id\x18\x01 \x01(\tR\vcontainerId\x12)\n" +
-	"\x10allowed_binaries\x18\x02 \x03(\tR\x0fallowedBinaries\"K\n" +
+	"\x10allowed_binaries\x18\x02 \x03(\tR\x0fallowedBinaries\"O\n" +
+	"\fDenySetEntry\x12\x1e\n" +
+	"\vdeny_set_id\x18\x01 \x01(\rR\tdenySetId\x12\x1f\n" +
+	"\vbinary_path\x18\x02 \x01(\tR\n" +
+	"binaryPath\"\x97\x01\n" +
+	"\x11DenySetTransition\x12+\n" +
+	"\x12parent_deny_set_id\x18\x01 \x01(\rR\x0fparentDenySetId\x12*\n" +
+	"\x11child_binary_path\x18\x02 \x01(\tR\x0fchildBinaryPath\x12)\n" +
+	"\x11child_deny_set_id\x18\x03 \x01(\rR\x0echildDenySetId\"\xa8\x02\n" +
+	"\x19ApplyDenySetPolicyRequest\x12!\n" +
+	"\fcontainer_id\x18\x01 \x01(\tR\vcontainerId\x12R\n" +
+	"\x0fallowed_entries\x18\x02 \x03(\v2).agentcontainers.enforcer.v1.DenySetEntryR\x0eallowedEntries\x12P\n" +
+	"\vtransitions\x18\x03 \x03(\v2..agentcontainers.enforcer.v1.DenySetTransitionR\vtransitions\x12\x19\n" +
+	"\binit_pid\x18\x04 \x01(\rR\ainitPid\x12'\n" +
+	"\x10init_deny_set_id\x18\x05 \x01(\rR\rinitDenySetId\"\x80\x01\n" +
+	"\x1aUpdateDenySetPolicyRequest\x12!\n" +
+	"\fcontainer_id\x18\x01 \x01(\tR\vcontainerId\x12\x1e\n" +
+	"\vdeny_set_id\x18\x02 \x01(\rR\tdenySetId\x12\x1f\n" +
+	"\vbinary_path\x18\x03 \x01(\tR\n" +
+	"binaryPath\"\x82\x01\n" +
+	"\x11BindPolicyRequest\x12!\n" +
+	"\fcontainer_id\x18\x01 \x01(\tR\vcontainerId\x12J\n" +
+	"\rallowed_binds\x18\x02 \x03(\v2%.agentcontainers.enforcer.v1.BindRuleR\fallowedBinds\":\n" +
+	"\bBindRule\x12\x12\n" +
+	"\x04port\x18\x01 \x01(\rR\x04port\x12\x1a\n" +
+	"\bprotocol\x18\x02 \x01(\tR\bprotocol\"R\n" +
+	"\x19ReverseShellConfigRequest\x12!\n" +
+	"\fcontainer_id\x18\x01 \x01(\tR\vcontainerId\x12\x12\n" +
+	"\x04mode\x18\x02 \x01(\tR\x04mode\"K\n" +
 	"\vSecretEntry\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value\x12\x12\n" +
@@ -2627,7 +3059,7 @@ const file_enforcer_proto_rawDesc = "" +
 	"\x14SetImmutableResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\x12#\n" +
-	"\rchanged_count\x18\x03 \x01(\rR\fchangedCount2\x8a\x11\n" +
+	"\rchanged_count\x18\x03 \x01(\rR\fchangedCount2\xfa\x14\n" +
 	"\bEnforcer\x12\x82\x01\n" +
 	"\x11RegisterContainer\x125.agentcontainers.enforcer.v1.RegisterContainerRequest\x1a6.agentcontainers.enforcer.v1.RegisterContainerResponse\x12\x88\x01\n" +
 	"\x13UnregisterContainer\x127.agentcontainers.enforcer.v1.UnregisterContainerRequest\x1a8.agentcontainers.enforcer.v1.UnregisterContainerResponse\x12|\n" +
@@ -2637,7 +3069,11 @@ const file_enforcer_proto_rawDesc = "" +
 	"\x15ApplyFilesystemPolicy\x124.agentcontainers.enforcer.v1.FilesystemPolicyRequest\x1a+.agentcontainers.enforcer.v1.PolicyResponse\x12t\n" +
 	"\x12ApplyProcessPolicy\x121.agentcontainers.enforcer.v1.ProcessPolicyRequest\x1a+.agentcontainers.enforcer.v1.PolicyResponse\x12z\n" +
 	"\x15ApplyCredentialPolicy\x124.agentcontainers.enforcer.v1.CredentialPolicyRequest\x1a+.agentcontainers.enforcer.v1.PolicyResponse\x12v\n" +
-	"\rInjectSecrets\x121.agentcontainers.enforcer.v1.InjectSecretsRequest\x1a2.agentcontainers.enforcer.v1.InjectSecretsResponse\x12\x7f\n" +
+	"\rInjectSecrets\x121.agentcontainers.enforcer.v1.InjectSecretsRequest\x1a2.agentcontainers.enforcer.v1.InjectSecretsResponse\x12y\n" +
+	"\x12ApplyDenySetPolicy\x126.agentcontainers.enforcer.v1.ApplyDenySetPolicyRequest\x1a+.agentcontainers.enforcer.v1.PolicyResponse\x12{\n" +
+	"\x13UpdateDenySetPolicy\x127.agentcontainers.enforcer.v1.UpdateDenySetPolicyRequest\x1a+.agentcontainers.enforcer.v1.PolicyResponse\x12n\n" +
+	"\x0fApplyBindPolicy\x12..agentcontainers.enforcer.v1.BindPolicyRequest\x1a+.agentcontainers.enforcer.v1.PolicyResponse\x12\x85\x01\n" +
+	"\x1eConfigureReverseShellDetection\x126.agentcontainers.enforcer.v1.ReverseShellConfigRequest\x1a+.agentcontainers.enforcer.v1.PolicyResponse\x12\x7f\n" +
 	"\x10LoadPolicyBundle\x124.agentcontainers.enforcer.v1.LoadPolicyBundleRequest\x1a5.agentcontainers.enforcer.v1.LoadPolicyBundleResponse\x12q\n" +
 	"\fStreamEvents\x120.agentcontainers.enforcer.v1.StreamEventsRequest\x1a-.agentcontainers.enforcer.v1.EnforcementEvent0\x01\x12d\n" +
 	"\bGetStats\x12,.agentcontainers.enforcer.v1.GetStatsRequest\x1a*.agentcontainers.enforcer.v1.StatsResponse\x12v\n" +
@@ -2660,7 +3096,7 @@ func file_enforcer_proto_rawDescGZIP() []byte {
 	return file_enforcer_proto_rawDescData
 }
 
-var file_enforcer_proto_msgTypes = make([]protoimpl.MessageInfo, 41)
+var file_enforcer_proto_msgTypes = make([]protoimpl.MessageInfo, 48)
 var file_enforcer_proto_goTypes = []any{
 	(*RegisterContainerRequest)(nil),    // 0: agentcontainers.enforcer.v1.RegisterContainerRequest
 	(*RegisterContainerResponse)(nil),   // 1: agentcontainers.enforcer.v1.RegisterContainerResponse
@@ -2674,89 +3110,107 @@ var file_enforcer_proto_goTypes = []any{
 	(*EgressRule)(nil),                  // 9: agentcontainers.enforcer.v1.EgressRule
 	(*FilesystemPolicyRequest)(nil),     // 10: agentcontainers.enforcer.v1.FilesystemPolicyRequest
 	(*ProcessPolicyRequest)(nil),        // 11: agentcontainers.enforcer.v1.ProcessPolicyRequest
-	(*SecretEntry)(nil),                 // 12: agentcontainers.enforcer.v1.SecretEntry
-	(*InjectSecretsRequest)(nil),        // 13: agentcontainers.enforcer.v1.InjectSecretsRequest
-	(*InjectSecretsResponse)(nil),       // 14: agentcontainers.enforcer.v1.InjectSecretsResponse
-	(*CredentialPolicyRequest)(nil),     // 15: agentcontainers.enforcer.v1.CredentialPolicyRequest
-	(*SecretAcl)(nil),                   // 16: agentcontainers.enforcer.v1.SecretAcl
-	(*LoadPolicyBundleRequest)(nil),     // 17: agentcontainers.enforcer.v1.LoadPolicyBundleRequest
-	(*LoadPolicyBundleResponse)(nil),    // 18: agentcontainers.enforcer.v1.LoadPolicyBundleResponse
-	(*PolicyResponse)(nil),              // 19: agentcontainers.enforcer.v1.PolicyResponse
-	(*StreamEventsRequest)(nil),         // 20: agentcontainers.enforcer.v1.StreamEventsRequest
-	(*EnforcementEvent)(nil),            // 21: agentcontainers.enforcer.v1.EnforcementEvent
-	(*GetStatsRequest)(nil),             // 22: agentcontainers.enforcer.v1.GetStatsRequest
-	(*StatsResponse)(nil),               // 23: agentcontainers.enforcer.v1.StatsResponse
-	(*ComponentPolicy)(nil),             // 24: agentcontainers.enforcer.v1.ComponentPolicy
-	(*ComponentLimits)(nil),             // 25: agentcontainers.enforcer.v1.ComponentLimits
-	(*ToolDefinition)(nil),              // 26: agentcontainers.enforcer.v1.ToolDefinition
-	(*LoadComponentRequest)(nil),        // 27: agentcontainers.enforcer.v1.LoadComponentRequest
-	(*LoadComponentResponse)(nil),       // 28: agentcontainers.enforcer.v1.LoadComponentResponse
-	(*UnloadComponentRequest)(nil),      // 29: agentcontainers.enforcer.v1.UnloadComponentRequest
-	(*UnloadComponentResponse)(nil),     // 30: agentcontainers.enforcer.v1.UnloadComponentResponse
-	(*ListComponentsRequest)(nil),       // 31: agentcontainers.enforcer.v1.ListComponentsRequest
-	(*ComponentInfo)(nil),               // 32: agentcontainers.enforcer.v1.ComponentInfo
-	(*ListComponentsResponse)(nil),      // 33: agentcontainers.enforcer.v1.ListComponentsResponse
-	(*ListToolsRequest)(nil),            // 34: agentcontainers.enforcer.v1.ListToolsRequest
-	(*ListToolsResponse)(nil),           // 35: agentcontainers.enforcer.v1.ListToolsResponse
-	(*CallToolRequest)(nil),             // 36: agentcontainers.enforcer.v1.CallToolRequest
-	(*CallToolResponse)(nil),            // 37: agentcontainers.enforcer.v1.CallToolResponse
-	(*SetImmutableRequest)(nil),         // 38: agentcontainers.enforcer.v1.SetImmutableRequest
-	(*SetImmutableResponse)(nil),        // 39: agentcontainers.enforcer.v1.SetImmutableResponse
-	nil,                                 // 40: agentcontainers.enforcer.v1.EnforcementEvent.DetailsEntry
+	(*DenySetEntry)(nil),                // 12: agentcontainers.enforcer.v1.DenySetEntry
+	(*DenySetTransition)(nil),           // 13: agentcontainers.enforcer.v1.DenySetTransition
+	(*ApplyDenySetPolicyRequest)(nil),   // 14: agentcontainers.enforcer.v1.ApplyDenySetPolicyRequest
+	(*UpdateDenySetPolicyRequest)(nil),  // 15: agentcontainers.enforcer.v1.UpdateDenySetPolicyRequest
+	(*BindPolicyRequest)(nil),           // 16: agentcontainers.enforcer.v1.BindPolicyRequest
+	(*BindRule)(nil),                    // 17: agentcontainers.enforcer.v1.BindRule
+	(*ReverseShellConfigRequest)(nil),   // 18: agentcontainers.enforcer.v1.ReverseShellConfigRequest
+	(*SecretEntry)(nil),                 // 19: agentcontainers.enforcer.v1.SecretEntry
+	(*InjectSecretsRequest)(nil),        // 20: agentcontainers.enforcer.v1.InjectSecretsRequest
+	(*InjectSecretsResponse)(nil),       // 21: agentcontainers.enforcer.v1.InjectSecretsResponse
+	(*CredentialPolicyRequest)(nil),     // 22: agentcontainers.enforcer.v1.CredentialPolicyRequest
+	(*SecretAcl)(nil),                   // 23: agentcontainers.enforcer.v1.SecretAcl
+	(*LoadPolicyBundleRequest)(nil),     // 24: agentcontainers.enforcer.v1.LoadPolicyBundleRequest
+	(*LoadPolicyBundleResponse)(nil),    // 25: agentcontainers.enforcer.v1.LoadPolicyBundleResponse
+	(*PolicyResponse)(nil),              // 26: agentcontainers.enforcer.v1.PolicyResponse
+	(*StreamEventsRequest)(nil),         // 27: agentcontainers.enforcer.v1.StreamEventsRequest
+	(*EnforcementEvent)(nil),            // 28: agentcontainers.enforcer.v1.EnforcementEvent
+	(*GetStatsRequest)(nil),             // 29: agentcontainers.enforcer.v1.GetStatsRequest
+	(*StatsResponse)(nil),               // 30: agentcontainers.enforcer.v1.StatsResponse
+	(*ComponentPolicy)(nil),             // 31: agentcontainers.enforcer.v1.ComponentPolicy
+	(*ComponentLimits)(nil),             // 32: agentcontainers.enforcer.v1.ComponentLimits
+	(*ToolDefinition)(nil),              // 33: agentcontainers.enforcer.v1.ToolDefinition
+	(*LoadComponentRequest)(nil),        // 34: agentcontainers.enforcer.v1.LoadComponentRequest
+	(*LoadComponentResponse)(nil),       // 35: agentcontainers.enforcer.v1.LoadComponentResponse
+	(*UnloadComponentRequest)(nil),      // 36: agentcontainers.enforcer.v1.UnloadComponentRequest
+	(*UnloadComponentResponse)(nil),     // 37: agentcontainers.enforcer.v1.UnloadComponentResponse
+	(*ListComponentsRequest)(nil),       // 38: agentcontainers.enforcer.v1.ListComponentsRequest
+	(*ComponentInfo)(nil),               // 39: agentcontainers.enforcer.v1.ComponentInfo
+	(*ListComponentsResponse)(nil),      // 40: agentcontainers.enforcer.v1.ListComponentsResponse
+	(*ListToolsRequest)(nil),            // 41: agentcontainers.enforcer.v1.ListToolsRequest
+	(*ListToolsResponse)(nil),           // 42: agentcontainers.enforcer.v1.ListToolsResponse
+	(*CallToolRequest)(nil),             // 43: agentcontainers.enforcer.v1.CallToolRequest
+	(*CallToolResponse)(nil),            // 44: agentcontainers.enforcer.v1.CallToolResponse
+	(*SetImmutableRequest)(nil),         // 45: agentcontainers.enforcer.v1.SetImmutableRequest
+	(*SetImmutableResponse)(nil),        // 46: agentcontainers.enforcer.v1.SetImmutableResponse
+	nil,                                 // 47: agentcontainers.enforcer.v1.EnforcementEvent.DetailsEntry
 }
 var file_enforcer_proto_depIdxs = []int32{
 	9,  // 0: agentcontainers.enforcer.v1.PrepareToolCallRequest.transient_egress:type_name -> agentcontainers.enforcer.v1.EgressRule
 	9,  // 1: agentcontainers.enforcer.v1.NetworkPolicyRequest.egress_rules:type_name -> agentcontainers.enforcer.v1.EgressRule
-	12, // 2: agentcontainers.enforcer.v1.InjectSecretsRequest.secrets:type_name -> agentcontainers.enforcer.v1.SecretEntry
-	16, // 3: agentcontainers.enforcer.v1.CredentialPolicyRequest.secret_acls:type_name -> agentcontainers.enforcer.v1.SecretAcl
-	40, // 4: agentcontainers.enforcer.v1.EnforcementEvent.details:type_name -> agentcontainers.enforcer.v1.EnforcementEvent.DetailsEntry
-	24, // 5: agentcontainers.enforcer.v1.LoadComponentRequest.policy:type_name -> agentcontainers.enforcer.v1.ComponentPolicy
-	25, // 6: agentcontainers.enforcer.v1.LoadComponentRequest.limits:type_name -> agentcontainers.enforcer.v1.ComponentLimits
-	26, // 7: agentcontainers.enforcer.v1.LoadComponentResponse.tools:type_name -> agentcontainers.enforcer.v1.ToolDefinition
-	26, // 8: agentcontainers.enforcer.v1.ComponentInfo.tools:type_name -> agentcontainers.enforcer.v1.ToolDefinition
-	32, // 9: agentcontainers.enforcer.v1.ListComponentsResponse.components:type_name -> agentcontainers.enforcer.v1.ComponentInfo
-	26, // 10: agentcontainers.enforcer.v1.ListToolsResponse.tools:type_name -> agentcontainers.enforcer.v1.ToolDefinition
-	0,  // 11: agentcontainers.enforcer.v1.Enforcer.RegisterContainer:input_type -> agentcontainers.enforcer.v1.RegisterContainerRequest
-	2,  // 12: agentcontainers.enforcer.v1.Enforcer.UnregisterContainer:input_type -> agentcontainers.enforcer.v1.UnregisterContainerRequest
-	4,  // 13: agentcontainers.enforcer.v1.Enforcer.PrepareToolCall:input_type -> agentcontainers.enforcer.v1.PrepareToolCallRequest
-	6,  // 14: agentcontainers.enforcer.v1.Enforcer.CompleteToolCall:input_type -> agentcontainers.enforcer.v1.CompleteToolCallRequest
-	8,  // 15: agentcontainers.enforcer.v1.Enforcer.ApplyNetworkPolicy:input_type -> agentcontainers.enforcer.v1.NetworkPolicyRequest
-	10, // 16: agentcontainers.enforcer.v1.Enforcer.ApplyFilesystemPolicy:input_type -> agentcontainers.enforcer.v1.FilesystemPolicyRequest
-	11, // 17: agentcontainers.enforcer.v1.Enforcer.ApplyProcessPolicy:input_type -> agentcontainers.enforcer.v1.ProcessPolicyRequest
-	15, // 18: agentcontainers.enforcer.v1.Enforcer.ApplyCredentialPolicy:input_type -> agentcontainers.enforcer.v1.CredentialPolicyRequest
-	13, // 19: agentcontainers.enforcer.v1.Enforcer.InjectSecrets:input_type -> agentcontainers.enforcer.v1.InjectSecretsRequest
-	17, // 20: agentcontainers.enforcer.v1.Enforcer.LoadPolicyBundle:input_type -> agentcontainers.enforcer.v1.LoadPolicyBundleRequest
-	20, // 21: agentcontainers.enforcer.v1.Enforcer.StreamEvents:input_type -> agentcontainers.enforcer.v1.StreamEventsRequest
-	22, // 22: agentcontainers.enforcer.v1.Enforcer.GetStats:input_type -> agentcontainers.enforcer.v1.GetStatsRequest
-	27, // 23: agentcontainers.enforcer.v1.Enforcer.LoadComponent:input_type -> agentcontainers.enforcer.v1.LoadComponentRequest
-	29, // 24: agentcontainers.enforcer.v1.Enforcer.UnloadComponent:input_type -> agentcontainers.enforcer.v1.UnloadComponentRequest
-	31, // 25: agentcontainers.enforcer.v1.Enforcer.ListComponents:input_type -> agentcontainers.enforcer.v1.ListComponentsRequest
-	34, // 26: agentcontainers.enforcer.v1.Enforcer.ListTools:input_type -> agentcontainers.enforcer.v1.ListToolsRequest
-	36, // 27: agentcontainers.enforcer.v1.Enforcer.CallTool:input_type -> agentcontainers.enforcer.v1.CallToolRequest
-	38, // 28: agentcontainers.enforcer.v1.Enforcer.SetImmutable:input_type -> agentcontainers.enforcer.v1.SetImmutableRequest
-	1,  // 29: agentcontainers.enforcer.v1.Enforcer.RegisterContainer:output_type -> agentcontainers.enforcer.v1.RegisterContainerResponse
-	3,  // 30: agentcontainers.enforcer.v1.Enforcer.UnregisterContainer:output_type -> agentcontainers.enforcer.v1.UnregisterContainerResponse
-	5,  // 31: agentcontainers.enforcer.v1.Enforcer.PrepareToolCall:output_type -> agentcontainers.enforcer.v1.PrepareToolCallResponse
-	7,  // 32: agentcontainers.enforcer.v1.Enforcer.CompleteToolCall:output_type -> agentcontainers.enforcer.v1.CompleteToolCallResponse
-	19, // 33: agentcontainers.enforcer.v1.Enforcer.ApplyNetworkPolicy:output_type -> agentcontainers.enforcer.v1.PolicyResponse
-	19, // 34: agentcontainers.enforcer.v1.Enforcer.ApplyFilesystemPolicy:output_type -> agentcontainers.enforcer.v1.PolicyResponse
-	19, // 35: agentcontainers.enforcer.v1.Enforcer.ApplyProcessPolicy:output_type -> agentcontainers.enforcer.v1.PolicyResponse
-	19, // 36: agentcontainers.enforcer.v1.Enforcer.ApplyCredentialPolicy:output_type -> agentcontainers.enforcer.v1.PolicyResponse
-	14, // 37: agentcontainers.enforcer.v1.Enforcer.InjectSecrets:output_type -> agentcontainers.enforcer.v1.InjectSecretsResponse
-	18, // 38: agentcontainers.enforcer.v1.Enforcer.LoadPolicyBundle:output_type -> agentcontainers.enforcer.v1.LoadPolicyBundleResponse
-	21, // 39: agentcontainers.enforcer.v1.Enforcer.StreamEvents:output_type -> agentcontainers.enforcer.v1.EnforcementEvent
-	23, // 40: agentcontainers.enforcer.v1.Enforcer.GetStats:output_type -> agentcontainers.enforcer.v1.StatsResponse
-	28, // 41: agentcontainers.enforcer.v1.Enforcer.LoadComponent:output_type -> agentcontainers.enforcer.v1.LoadComponentResponse
-	30, // 42: agentcontainers.enforcer.v1.Enforcer.UnloadComponent:output_type -> agentcontainers.enforcer.v1.UnloadComponentResponse
-	33, // 43: agentcontainers.enforcer.v1.Enforcer.ListComponents:output_type -> agentcontainers.enforcer.v1.ListComponentsResponse
-	35, // 44: agentcontainers.enforcer.v1.Enforcer.ListTools:output_type -> agentcontainers.enforcer.v1.ListToolsResponse
-	37, // 45: agentcontainers.enforcer.v1.Enforcer.CallTool:output_type -> agentcontainers.enforcer.v1.CallToolResponse
-	39, // 46: agentcontainers.enforcer.v1.Enforcer.SetImmutable:output_type -> agentcontainers.enforcer.v1.SetImmutableResponse
-	29, // [29:47] is the sub-list for method output_type
-	11, // [11:29] is the sub-list for method input_type
-	11, // [11:11] is the sub-list for extension type_name
-	11, // [11:11] is the sub-list for extension extendee
-	0,  // [0:11] is the sub-list for field type_name
+	12, // 2: agentcontainers.enforcer.v1.ApplyDenySetPolicyRequest.allowed_entries:type_name -> agentcontainers.enforcer.v1.DenySetEntry
+	13, // 3: agentcontainers.enforcer.v1.ApplyDenySetPolicyRequest.transitions:type_name -> agentcontainers.enforcer.v1.DenySetTransition
+	17, // 4: agentcontainers.enforcer.v1.BindPolicyRequest.allowed_binds:type_name -> agentcontainers.enforcer.v1.BindRule
+	19, // 5: agentcontainers.enforcer.v1.InjectSecretsRequest.secrets:type_name -> agentcontainers.enforcer.v1.SecretEntry
+	23, // 6: agentcontainers.enforcer.v1.CredentialPolicyRequest.secret_acls:type_name -> agentcontainers.enforcer.v1.SecretAcl
+	47, // 7: agentcontainers.enforcer.v1.EnforcementEvent.details:type_name -> agentcontainers.enforcer.v1.EnforcementEvent.DetailsEntry
+	31, // 8: agentcontainers.enforcer.v1.LoadComponentRequest.policy:type_name -> agentcontainers.enforcer.v1.ComponentPolicy
+	32, // 9: agentcontainers.enforcer.v1.LoadComponentRequest.limits:type_name -> agentcontainers.enforcer.v1.ComponentLimits
+	33, // 10: agentcontainers.enforcer.v1.LoadComponentResponse.tools:type_name -> agentcontainers.enforcer.v1.ToolDefinition
+	33, // 11: agentcontainers.enforcer.v1.ComponentInfo.tools:type_name -> agentcontainers.enforcer.v1.ToolDefinition
+	39, // 12: agentcontainers.enforcer.v1.ListComponentsResponse.components:type_name -> agentcontainers.enforcer.v1.ComponentInfo
+	33, // 13: agentcontainers.enforcer.v1.ListToolsResponse.tools:type_name -> agentcontainers.enforcer.v1.ToolDefinition
+	0,  // 14: agentcontainers.enforcer.v1.Enforcer.RegisterContainer:input_type -> agentcontainers.enforcer.v1.RegisterContainerRequest
+	2,  // 15: agentcontainers.enforcer.v1.Enforcer.UnregisterContainer:input_type -> agentcontainers.enforcer.v1.UnregisterContainerRequest
+	4,  // 16: agentcontainers.enforcer.v1.Enforcer.PrepareToolCall:input_type -> agentcontainers.enforcer.v1.PrepareToolCallRequest
+	6,  // 17: agentcontainers.enforcer.v1.Enforcer.CompleteToolCall:input_type -> agentcontainers.enforcer.v1.CompleteToolCallRequest
+	8,  // 18: agentcontainers.enforcer.v1.Enforcer.ApplyNetworkPolicy:input_type -> agentcontainers.enforcer.v1.NetworkPolicyRequest
+	10, // 19: agentcontainers.enforcer.v1.Enforcer.ApplyFilesystemPolicy:input_type -> agentcontainers.enforcer.v1.FilesystemPolicyRequest
+	11, // 20: agentcontainers.enforcer.v1.Enforcer.ApplyProcessPolicy:input_type -> agentcontainers.enforcer.v1.ProcessPolicyRequest
+	22, // 21: agentcontainers.enforcer.v1.Enforcer.ApplyCredentialPolicy:input_type -> agentcontainers.enforcer.v1.CredentialPolicyRequest
+	20, // 22: agentcontainers.enforcer.v1.Enforcer.InjectSecrets:input_type -> agentcontainers.enforcer.v1.InjectSecretsRequest
+	14, // 23: agentcontainers.enforcer.v1.Enforcer.ApplyDenySetPolicy:input_type -> agentcontainers.enforcer.v1.ApplyDenySetPolicyRequest
+	15, // 24: agentcontainers.enforcer.v1.Enforcer.UpdateDenySetPolicy:input_type -> agentcontainers.enforcer.v1.UpdateDenySetPolicyRequest
+	16, // 25: agentcontainers.enforcer.v1.Enforcer.ApplyBindPolicy:input_type -> agentcontainers.enforcer.v1.BindPolicyRequest
+	18, // 26: agentcontainers.enforcer.v1.Enforcer.ConfigureReverseShellDetection:input_type -> agentcontainers.enforcer.v1.ReverseShellConfigRequest
+	24, // 27: agentcontainers.enforcer.v1.Enforcer.LoadPolicyBundle:input_type -> agentcontainers.enforcer.v1.LoadPolicyBundleRequest
+	27, // 28: agentcontainers.enforcer.v1.Enforcer.StreamEvents:input_type -> agentcontainers.enforcer.v1.StreamEventsRequest
+	29, // 29: agentcontainers.enforcer.v1.Enforcer.GetStats:input_type -> agentcontainers.enforcer.v1.GetStatsRequest
+	34, // 30: agentcontainers.enforcer.v1.Enforcer.LoadComponent:input_type -> agentcontainers.enforcer.v1.LoadComponentRequest
+	36, // 31: agentcontainers.enforcer.v1.Enforcer.UnloadComponent:input_type -> agentcontainers.enforcer.v1.UnloadComponentRequest
+	38, // 32: agentcontainers.enforcer.v1.Enforcer.ListComponents:input_type -> agentcontainers.enforcer.v1.ListComponentsRequest
+	41, // 33: agentcontainers.enforcer.v1.Enforcer.ListTools:input_type -> agentcontainers.enforcer.v1.ListToolsRequest
+	43, // 34: agentcontainers.enforcer.v1.Enforcer.CallTool:input_type -> agentcontainers.enforcer.v1.CallToolRequest
+	45, // 35: agentcontainers.enforcer.v1.Enforcer.SetImmutable:input_type -> agentcontainers.enforcer.v1.SetImmutableRequest
+	1,  // 36: agentcontainers.enforcer.v1.Enforcer.RegisterContainer:output_type -> agentcontainers.enforcer.v1.RegisterContainerResponse
+	3,  // 37: agentcontainers.enforcer.v1.Enforcer.UnregisterContainer:output_type -> agentcontainers.enforcer.v1.UnregisterContainerResponse
+	5,  // 38: agentcontainers.enforcer.v1.Enforcer.PrepareToolCall:output_type -> agentcontainers.enforcer.v1.PrepareToolCallResponse
+	7,  // 39: agentcontainers.enforcer.v1.Enforcer.CompleteToolCall:output_type -> agentcontainers.enforcer.v1.CompleteToolCallResponse
+	26, // 40: agentcontainers.enforcer.v1.Enforcer.ApplyNetworkPolicy:output_type -> agentcontainers.enforcer.v1.PolicyResponse
+	26, // 41: agentcontainers.enforcer.v1.Enforcer.ApplyFilesystemPolicy:output_type -> agentcontainers.enforcer.v1.PolicyResponse
+	26, // 42: agentcontainers.enforcer.v1.Enforcer.ApplyProcessPolicy:output_type -> agentcontainers.enforcer.v1.PolicyResponse
+	26, // 43: agentcontainers.enforcer.v1.Enforcer.ApplyCredentialPolicy:output_type -> agentcontainers.enforcer.v1.PolicyResponse
+	21, // 44: agentcontainers.enforcer.v1.Enforcer.InjectSecrets:output_type -> agentcontainers.enforcer.v1.InjectSecretsResponse
+	26, // 45: agentcontainers.enforcer.v1.Enforcer.ApplyDenySetPolicy:output_type -> agentcontainers.enforcer.v1.PolicyResponse
+	26, // 46: agentcontainers.enforcer.v1.Enforcer.UpdateDenySetPolicy:output_type -> agentcontainers.enforcer.v1.PolicyResponse
+	26, // 47: agentcontainers.enforcer.v1.Enforcer.ApplyBindPolicy:output_type -> agentcontainers.enforcer.v1.PolicyResponse
+	26, // 48: agentcontainers.enforcer.v1.Enforcer.ConfigureReverseShellDetection:output_type -> agentcontainers.enforcer.v1.PolicyResponse
+	25, // 49: agentcontainers.enforcer.v1.Enforcer.LoadPolicyBundle:output_type -> agentcontainers.enforcer.v1.LoadPolicyBundleResponse
+	28, // 50: agentcontainers.enforcer.v1.Enforcer.StreamEvents:output_type -> agentcontainers.enforcer.v1.EnforcementEvent
+	30, // 51: agentcontainers.enforcer.v1.Enforcer.GetStats:output_type -> agentcontainers.enforcer.v1.StatsResponse
+	35, // 52: agentcontainers.enforcer.v1.Enforcer.LoadComponent:output_type -> agentcontainers.enforcer.v1.LoadComponentResponse
+	37, // 53: agentcontainers.enforcer.v1.Enforcer.UnloadComponent:output_type -> agentcontainers.enforcer.v1.UnloadComponentResponse
+	40, // 54: agentcontainers.enforcer.v1.Enforcer.ListComponents:output_type -> agentcontainers.enforcer.v1.ListComponentsResponse
+	42, // 55: agentcontainers.enforcer.v1.Enforcer.ListTools:output_type -> agentcontainers.enforcer.v1.ListToolsResponse
+	44, // 56: agentcontainers.enforcer.v1.Enforcer.CallTool:output_type -> agentcontainers.enforcer.v1.CallToolResponse
+	46, // 57: agentcontainers.enforcer.v1.Enforcer.SetImmutable:output_type -> agentcontainers.enforcer.v1.SetImmutableResponse
+	36, // [36:58] is the sub-list for method output_type
+	14, // [14:36] is the sub-list for method input_type
+	14, // [14:14] is the sub-list for extension type_name
+	14, // [14:14] is the sub-list for extension extendee
+	0,  // [0:14] is the sub-list for field type_name
 }
 
 func init() { file_enforcer_proto_init() }
@@ -2770,7 +3224,7 @@ func file_enforcer_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_enforcer_proto_rawDesc), len(file_enforcer_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   41,
+			NumMessages:   48,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

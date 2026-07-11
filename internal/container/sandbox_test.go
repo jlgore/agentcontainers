@@ -1199,17 +1199,6 @@ func (m *mockSandboxStrategy) Apply(ctx context.Context, containerID string, _ u
 	return nil
 }
 
-func (m *mockSandboxStrategy) ApplyBasePolicy(ctx context.Context, containerID string, _ uint32, p *policy.ContainerPolicy) error {
-	if m.applyFn != nil {
-		return m.applyFn(ctx, containerID, p)
-	}
-	return nil
-}
-
-func (m *mockSandboxStrategy) ApplyCredentialACLs(_ context.Context, _ string, _ *policy.ContainerPolicy) error {
-	return nil
-}
-
 func (m *mockSandboxStrategy) Update(ctx context.Context, containerID string, p *policy.ContainerPolicy) error {
 	if m.updateFn != nil {
 		return m.updateFn(ctx, containerID, p)
@@ -1225,10 +1214,6 @@ func (m *mockSandboxStrategy) Remove(ctx context.Context, containerID string) er
 }
 
 func (m *mockSandboxStrategy) InjectSecrets(_ context.Context, _ string, _ map[string]*secrets.Secret) error {
-	return nil
-}
-
-func (m *mockSandboxStrategy) SetImmutable(_ context.Context, _ string, _ []string, _ bool) error {
 	return nil
 }
 
@@ -1307,7 +1292,7 @@ func TestSandboxRuntime_Start_AppliesEnforcement(t *testing.T) {
 		WithDockerClientFactory(factory),
 		WithSandboxEnforcementLevel(enforcement.LevelGRPC),
 		WithSidecarStarter(mockStarter),
-		WithStrategyFactory(func(_ enforcement.ConnectionProfile) (enforcement.Strategy, error) {
+		WithStrategyFactory(func(_ string) (enforcement.Strategy, error) {
 			return strat, nil
 		}),
 	)
@@ -1369,7 +1354,7 @@ func TestSandboxRuntime_Start_StrategyFactoryError_NonFatal(t *testing.T) {
 		WithDockerClientFactory(factory),
 		WithSandboxEnforcementLevel(enforcement.LevelGRPC),
 		WithSidecarStarter(mockStarter),
-		WithStrategyFactory(func(_ enforcement.ConnectionProfile) (enforcement.Strategy, error) {
+		WithStrategyFactory(func(_ string) (enforcement.Strategy, error) {
 			return nil, fmt.Errorf("gRPC dial failed")
 		}),
 	)
@@ -1437,7 +1422,7 @@ func TestSandboxRuntime_Start_ApplyError_NonFatal(t *testing.T) {
 		WithDockerClientFactory(factory),
 		WithSandboxEnforcementLevel(enforcement.LevelGRPC),
 		WithSidecarStarter(mockStarter),
-		WithStrategyFactory(func(_ enforcement.ConnectionProfile) (enforcement.Strategy, error) {
+		WithStrategyFactory(func(_ string) (enforcement.Strategy, error) {
 			return strat, nil
 		}),
 	)

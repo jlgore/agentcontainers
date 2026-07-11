@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -101,36 +102,6 @@ func TestBuildContainerConfig_SecurityDefaults(t *testing.T) {
 
 	// Verify networking config is present (even if empty).
 	assert.NotNil(t, networkCfg)
-}
-
-// TestBuildContainerConfig_CgroupnsHost verifies that the host cgroup namespace
-// is set on the container only when the runtime is configured for the
-// kernel-primary posture (WithCgroupnsHost). Default keeps Docker's private
-// namespace so the Docker Desktop path is unchanged.
-func TestBuildContainerConfig_CgroupnsHost(t *testing.T) {
-	cfg := &config.AgentContainer{Name: "cgns-test", Image: "ubuntu:22.04"}
-	opts := StartOptions{}
-
-	// Default: cgroupns not set.
-	rtDefault := &DockerRuntime{logger: zap.NewNop()}
-	_, hostCfg, _ := rtDefault.buildContainerConfig(cfg, opts)
-	assert.Empty(t, string(hostCfg.CgroupnsMode),
-		"default runtime must not set cgroupns (preserves Docker Desktop path)")
-
-	// Kernel-primary: cgroupns=host.
-	rtHost := &DockerRuntime{logger: zap.NewNop(), cgroupnsHost: true}
-	_, hostCfgHost, _ := rtHost.buildContainerConfig(cfg, opts)
-	assert.Equal(t, "host", string(hostCfgHost.CgroupnsMode),
-		"kernel-primary runtime must set --cgroupns=host so the cgroup is visible to host BPF maps")
-}
-
-// TestWithCgroupnsHostOption verifies the option threads through to the runtime.
-func TestWithCgroupnsHostOption(t *testing.T) {
-	o := &dockerOptions{}
-	WithCgroupnsHost(true)(o)
-	assert.True(t, o.cgroupnsHost, "WithCgroupnsHost(true) must enable host cgroup namespace")
-	WithCgroupnsHost(false)(o)
-	assert.False(t, o.cgroupnsHost, "WithCgroupnsHost(false) must disable host cgroup namespace")
 }
 
 // TestBuildContainerConfig_PinnedImageRef verifies that when StartOptions
@@ -322,6 +293,16 @@ func TestParseMount_Tmpfs(t *testing.T) {
 
 	assert.Equal(t, mount.TypeTmpfs, m.Type)
 	assert.Equal(t, "/tmp", m.Target)
+}
+
+func TestParseMount_TmpfsOptions(t *testing.T) {
+	m := parseMount("type=tmpfs,target=/home/node,tmpfs-mode=0777")
+	require.NotNil(t, m)
+	require.NotNil(t, m.TmpfsOptions)
+
+	assert.Equal(t, mount.TypeTmpfs, m.Type)
+	assert.Equal(t, os.FileMode(0o777), m.TmpfsOptions.Mode)
+	assert.Empty(t, m.TmpfsOptions.Options)
 }
 
 func TestParseMount_AlternateKeys(t *testing.T) {
@@ -517,9 +498,6 @@ func TestBuildContainerConfig_PolicyNetworkMode(t *testing.T) {
 		name         string
 		networkMode  string
 		expectedMode container.NetworkMode
-		// expectUserNet is true when the container should attach to the per-agent
-		// user-defined bridge (for embedded DNS) instead of carrying a NetworkMode.
-		expectUserNet bool
 	}{
 		{
 			name:         "none mode for isolation",
@@ -527,13 +505,9 @@ func TestBuildContainerConfig_PolicyNetworkMode(t *testing.T) {
 			expectedMode: container.NetworkMode("none"),
 		},
 		{
-			// "bridge" must NOT pass through as NetworkMode: the container
-			// attaches to a user-defined bridge so embedded DNS works under
-			// default-deny egress.
-			name:          "bridge mode attaches user-defined network",
-			networkMode:   "bridge",
-			expectedMode:  container.NetworkMode(""),
-			expectUserNet: true,
+			name:         "bridge mode for network access",
+			networkMode:  "bridge",
+			expectedMode: container.NetworkMode("bridge"),
 		},
 		{
 			name:         "host mode",
@@ -553,14 +527,8 @@ func TestBuildContainerConfig_PolicyNetworkMode(t *testing.T) {
 				},
 			}
 
-			_, hostCfg, networkCfg := rt.buildContainerConfig(cfg, opts)
+			_, hostCfg, _ := rt.buildContainerConfig(cfg, opts)
 			assert.Equal(t, tt.expectedMode, hostCfg.NetworkMode, "should apply network mode from policy")
-			if tt.expectUserNet {
-				_, ok := networkCfg.EndpointsConfig[agentNetworkName(cfg.Name)]
-				assert.True(t, ok, "bridge mode should attach the per-agent user-defined network")
-			} else {
-				assert.Empty(t, networkCfg.EndpointsConfig, "non-bridge modes attach no user-defined network")
-			}
 		})
 	}
 }
@@ -764,38 +732,6 @@ func TestValidateMounts_EmptyList(t *testing.T) {
 	require.NoError(t, err, "empty mount list should be valid")
 }
 
-// A writable host cgroupfs or scheduler bind-mount re-opens a cgroup-escape /
-// out-of-cgroup-execution path; a read-only mount of the same is allowed.
-func TestValidateMounts_RejectsEscapeMounts(t *testing.T) {
-	tests := []struct {
-		name         string
-		mount        mount.Mount
-		expectReject bool
-	}{
-		{"writable cgroupfs", mount.Mount{Type: mount.TypeBind, Source: "/sys/fs/cgroup", Target: "/sys/fs/cgroup"}, true},
-		{"writable cgroupfs subpath", mount.Mount{Type: mount.TypeBind, Source: "/x", Target: "/sys/fs/cgroup/foo"}, true},
-		{"read-only cgroupfs", mount.Mount{Type: mount.TypeBind, Source: "/sys/fs/cgroup", Target: "/sys/fs/cgroup", ReadOnly: true}, false},
-		{"writable /etc/cron.d", mount.Mount{Type: mount.TypeBind, Source: "/etc/cron.d", Target: "/etc/cron.d"}, true},
-		{"writable cron.d subpath", mount.Mount{Type: mount.TypeBind, Source: "/etc/cron.d/mine", Target: "/etc/cron.d/mine"}, true},
-		{"read-only /etc/cron.d", mount.Mount{Type: mount.TypeBind, Source: "/etc/cron.d", Target: "/etc/cron.d", ReadOnly: true}, false},
-		{"writable /etc/systemd/system", mount.Mount{Type: mount.TypeBind, Source: "/etc/systemd/system", Target: "/etc/systemd/system"}, true},
-		{"writable /var/spool/cron", mount.Mount{Type: mount.TypeBind, Source: "/var/spool/cron", Target: "/spool"}, true},
-		{"benign writable mount", mount.Mount{Type: mount.TypeBind, Source: "/home/user/data", Target: "/data"}, false},
-		{"no false positive on cron-lookalike", mount.Mount{Type: mount.TypeBind, Source: "/etc/cronjobs-custom", Target: "/x"}, false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := validateMounts([]mount.Mount{tt.mount})
-			if tt.expectReject {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), "forbidden mount")
-			} else {
-				require.NoError(t, err)
-			}
-		})
-	}
-}
-
 func TestBuildContainerConfig_PanicsOnForbiddenMount(t *testing.T) {
 	// P0-4: buildContainerConfig should panic if it encounters a forbidden mount.
 	// This is a defense-in-depth measure: it should never happen in practice
@@ -870,20 +806,11 @@ var _ enforcement.Strategy = (*mockStrategy)(nil)
 func (m *mockStrategy) Apply(_ context.Context, _ string, _ uint32, _ *policy.ContainerPolicy) error {
 	return nil
 }
-func (m *mockStrategy) ApplyBasePolicy(_ context.Context, _ string, _ uint32, _ *policy.ContainerPolicy) error {
-	return nil
-}
-func (m *mockStrategy) ApplyCredentialACLs(_ context.Context, _ string, _ *policy.ContainerPolicy) error {
-	return nil
-}
 func (m *mockStrategy) Update(_ context.Context, _ string, _ *policy.ContainerPolicy) error {
 	return nil
 }
 func (m *mockStrategy) Remove(_ context.Context, _ string) error { return nil }
 func (m *mockStrategy) InjectSecrets(_ context.Context, _ string, _ map[string]*secrets.Secret) error {
-	return nil
-}
-func (m *mockStrategy) SetImmutable(_ context.Context, _ string, _ []string, _ bool) error {
 	return nil
 }
 func (m *mockStrategy) Events(_ string) <-chan enforcement.Event { return nil }

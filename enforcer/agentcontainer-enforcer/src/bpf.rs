@@ -18,208 +18,80 @@ use tracing::warn;
 
 use crate::events::{ContainerRegistry, EventBus};
 use crate::policy::{
-    ContainerHandle, CredentialPolicy, EgressRule, EnforcementEvent, EnforcementStats,
-    FilesystemPolicy, LsmStatus, NetworkPolicy, PolicyManager, ProcessPolicy,
+    BindPolicy, ContainerHandle, CredentialPolicy, DenySetPolicy, EnforcementEvent,
+    EnforcementStats, FilesystemPolicy, NetworkPolicy, PolicyManager, ProcessPolicy,
+    ResolvedDenySetEntry, ReverseShellConfig,
 };
 
-#[derive(Clone, Debug)]
-struct ToolWindow {
-    correlation_id: String,
-    start_ns: u64,
-    end_ns: Option<u64>,
+#[cfg(any(target_os = "linux", all(test, unix)))]
+use std::path::{Path, PathBuf};
+
+/// Minimal common prefix for all event records written to ring buffers.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct EventPidHeader {
+    timestamp_ns: u64,
+    pid: u32,
 }
 
-type CorrelationWindows = std::sync::Arc<RwLock<HashMap<u64, Vec<ToolWindow>>>>;
-
-#[cfg(target_os = "linux")]
-fn monotonic_ns() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    unsafe {
-        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
-    }
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
-}
-
-#[cfg(not(target_os = "linux"))]
-fn monotonic_ns() -> u64 {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START
-        .get_or_init(std::time::Instant::now)
-        .elapsed()
-        .as_nanos() as u64
-}
-
-/// Decode a userspace `stat.st_dev` into the true (major, minor) pair.
-///
-/// `st_dev` carries glibc's expanded dev_t encoding (major split across bits
-/// 8–19 and 32+, minor across bits 0–7 and 20–31) — NOT the kernel's internal
-/// `sb->s_dev` layout (`major << 20 | minor`) that the BPF LSM hooks decode.
-/// Both sides must reduce to the same true (major, minor) or every
-/// FsInodeKey/SecretAclKey lookup silently misses, leaving the inode
-/// deny-list and credential gating inert (fail-open).
-#[cfg(target_os = "linux")]
-fn decode_dev(st_dev: u64) -> (u32, u32) {
-    (libc::major(st_dev), libc::minor(st_dev))
-}
-
-/// How long a CLOSED window keeps matching after CompleteToolCall. Ring
-/// buffer events are drained asynchronously: an event generated during call
-/// N can be read after Complete(N), so closed windows must linger long
-/// enough to catch the drain lag — then they are pruned, or a long session
-/// accumulates one window per tool call forever.
-const CLOSED_WINDOW_RETENTION_NS: u64 = 30 * 1_000_000_000;
-
-/// How long an OPEN window (CompleteToolCall never arrived) keeps matching.
-/// This bounds the blast radius of a lost Complete: without a horizon, one
-/// failed RPC would attribute every subsequent kernel event for the cgroup
-/// to that correlation ID for the rest of the session — misattribution the
-/// spec calls worse than no attribution (§3.3). Generous enough for long
-/// forensic tool runs; events past the horizon carry no correlation ID.
-const OPEN_WINDOW_HORIZON_NS: u64 = 2 * 60 * 60 * 1_000_000_000;
-
-/// How long a drained event is parked before correlation assignment.
-///
-/// Prepare-side race: `PrepareToolCall` captures the window's start
-/// timestamp, then takes the write lock and inserts the window. An event
-/// generated inside the window can be drained from the ring buffer during
-/// that capture→insert gap — assigned immediately, it would find no window
-/// and stay uncorrelated even though its kernel timestamp matches one.
-/// Parking events for longer than any plausible lock-acquisition latency
-/// lets the in-flight Prepare land first. Late assignment is safe precisely
-/// because matching is by the event's kernel timestamp, not by when
-/// assignment runs (the same property §3.3 uses on the Complete side).
-const CORRELATION_ASSIGN_DELAY_NS: u64 = 100 * 1_000_000;
-
-/// FIFO park bench for drained events awaiting correlation assignment.
-/// Events become due `CORRELATION_ASSIGN_DELAY_NS` after their drain time;
-/// drain order is preserved.
-#[derive(Default)]
-struct PendingEvents {
-    queue: std::collections::VecDeque<(u64, EnforcementEvent)>,
-}
-
-impl PendingEvents {
-    /// Park an event drained at `now`.
-    fn park(&mut self, event: EnforcementEvent, now: u64) {
-        self.queue
-            .push_back((now.saturating_add(CORRELATION_ASSIGN_DELAY_NS), event));
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn read_event_pid(data: &[u8]) -> Option<u32> {
+    if data.len() < std::mem::size_of::<EventPidHeader>() {
+        return None;
     }
 
-    /// Monotonic instant the oldest parked event becomes due, if any.
-    fn next_due_ns(&self) -> Option<u64> {
-        self.queue.front().map(|(due, _)| *due)
-    }
+    let header: EventPidHeader = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const _) };
+    Some(header.pid)
+}
 
-    /// Remove and return every event due at `now` (drain order preserved).
-    fn take_due(&mut self, now: u64) -> Vec<EnforcementEvent> {
-        let mut due = Vec::new();
-        while matches!(self.queue.front(), Some((d, _)) if *d <= now) {
-            due.push(self.queue.pop_front().expect("front checked").1);
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn parse_proc_cgroup_relative_path(contents: &str) -> Option<&str> {
+    let mut fallback = None;
+
+    for line in contents.lines() {
+        let (hierarchy, rest) = line.split_once(':')?;
+        let (_, path) = rest.split_once(':')?;
+        if path.is_empty() {
+            continue;
         }
-        due
-    }
-
-    /// Remove and return everything regardless of due time (shutdown flush).
-    fn take_all(&mut self) -> Vec<EnforcementEvent> {
-        self.queue.drain(..).map(|(_, ev)| ev).collect()
-    }
-}
-
-fn assign_correlation(event: &mut EnforcementEvent, windows: &CorrelationWindows) {
-    let guard = windows.read().unwrap();
-    let Some(items) = guard.get(&event.cgroup_id) else {
-        return;
-    };
-    for w in items.iter().rev() {
-        // An open window matches only up to its horizon — never the rest
-        // of the session.
-        let end = w
-            .end_ns
-            .unwrap_or_else(|| w.start_ns.saturating_add(OPEN_WINDOW_HORIZON_NS));
-        if event.timestamp_ns >= w.start_ns && event.timestamp_ns <= end {
-            event.correlation_id = w.correlation_id.clone();
-            return;
+        if hierarchy == "0" {
+            return Some(path);
         }
+        fallback.get_or_insert(path);
     }
+
+    fallback
 }
 
-/// Record the start of a tool-call window, pruning dead windows first (the
-/// write lock is already held; prune amortizes to O(1) per call).
-fn open_tool_window(windows: &CorrelationWindows, cgroup_id: u64, correlation_id: &str, now: u64) {
-    let mut guard = windows.write().unwrap();
-    let items = guard.entry(cgroup_id).or_default();
-    prune_windows(items, now);
-    items.push(ToolWindow {
-        correlation_id: correlation_id.to_string(),
-        start_ns: now,
-        end_ns: None,
-    });
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn resolve_cgroup_path_for_pid_with_roots(
+    pid: u32,
+    proc_root: &Path,
+    cgroup_root: &Path,
+) -> anyhow::Result<PathBuf> {
+    let cgroup_file = proc_root.join(pid.to_string()).join("cgroup");
+    let contents = std::fs::read_to_string(&cgroup_file)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", cgroup_file.display()))?;
+    let relative = parse_proc_cgroup_relative_path(&contents)
+        .ok_or_else(|| anyhow::anyhow!("no cgroup path found in {}", cgroup_file.display()))?;
+    let relative = relative.strip_prefix('/').unwrap_or(relative);
+    Ok(cgroup_root.join(relative))
 }
 
-/// Close the open window with this correlation ID. Returns false when no
-/// such window exists (already completed, expired past the horizon, or
-/// never prepared) — callers surface that, since a mismatched Complete is
-/// an audit-relevant signal, not a no-op.
-fn close_tool_window(
-    windows: &CorrelationWindows,
-    cgroup_id: u64,
-    correlation_id: &str,
-    now: u64,
-) -> bool {
-    let mut guard = windows.write().unwrap();
-    let Some(items) = guard.get_mut(&cgroup_id) else {
-        return false;
-    };
-    let mut found = false;
-    for w in items.iter_mut().rev() {
-        if w.correlation_id == correlation_id && w.end_ns.is_none() {
-            w.end_ns = Some(now);
-            found = true;
-            break;
-        }
-    }
-    prune_windows(items, now);
-    found
-}
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn resolve_cgroup_id_for_pid_with_roots(
+    pid: u32,
+    proc_root: &Path,
+    cgroup_root: &Path,
+) -> anyhow::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
 
-/// Drop windows that can no longer match any event: closed ones past the
-/// retention horizon, and open ones past the open-window horizon (their
-/// CompleteToolCall is considered lost).
-fn prune_windows(items: &mut Vec<ToolWindow>, now: u64) {
-    items.retain(|w| match w.end_ns {
-        Some(end) => now.saturating_sub(end) < CLOSED_WINDOW_RETENTION_NS,
-        None => now.saturating_sub(w.start_ns) < OPEN_WINDOW_HORIZON_NS,
-    });
-}
-
-/// Container-namespace candidate paths for a bare command `name`, one per
-/// absolute PATH entry in search order (execvp semantics). Relative PATH
-/// entries are ignored — exec from a container must resolve to an absolute
-/// on-disk file.
-fn path_candidates(path_env: &str, name: &str) -> Vec<String> {
-    path_env
-        .split(':')
-        .filter(|d| d.starts_with('/'))
-        .map(|d| format!("{}/{}", d.trim_end_matches('/'), name))
-        .collect()
-}
-
-/// Parse a file's leading bytes; if it is a shebang script (`#!`), return the
-/// interpreter's absolute path (the first whitespace-delimited token after the
-/// `#!`, up to the first newline). None for a non-script or a relative
-/// interpreter (which the kernel rejects anyway).
-fn parse_shebang_interpreter(head: &[u8]) -> Option<String> {
-    let rest = head.strip_prefix(b"#!")?;
-    let line = rest.split(|&b| b == b'\n').next().unwrap_or(rest);
-    let interp = String::from_utf8_lossy(line)
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_string();
-    interp.starts_with('/').then_some(interp)
+    let cgroup_path = resolve_cgroup_path_for_pid_with_roots(pid, proc_root, cgroup_root)?;
+    let meta = std::fs::metadata(&cgroup_path).map_err(|e| {
+        anyhow::anyhow!("failed to stat cgroup path {}: {e}", cgroup_path.display())
+    })?;
+    Ok(meta.ino())
 }
 
 // ===========================================================================
@@ -230,40 +102,22 @@ fn parse_shebang_interpreter(head: &[u8]) -> Option<String> {
 mod linux {
     use super::*;
     use crate::events::{
-        parse_cred_event, parse_dns_event, parse_exec_event, parse_fs_event, parse_network_event,
+        parse_bind_event, parse_cred_event, parse_dns_event, parse_exec_event, parse_fs_event,
+        parse_memfd_event, parse_network_event, parse_reverse_shell_event, MemfdEvent,
     };
     use agentcontainer_common::events as bpf_events;
     use agentcontainer_common::maps::{
-        tool_identity, ActiveTool, CgroupStats, FsInodeKey, KernelOffsets, LpmDataV4, LpmDataV6,
-        PortKeyV4, PortKeyV6, SecretAclKey, SecretAclValue, SecretToolKey, CGROUP_FLAG_ENFORCED,
-        CGROUP_FLAG_EXEC_ENFORCED, FS_PERM_READ, FS_PERM_WRITE, LPM_CGROUP_PREFIX,
+        CgroupStats, DenySetKey, KernelOffsets, ScopedBindKey, ScopedFsInodeKey, ScopedLpmKeyV4,
+        ScopedPortKeyV4, SecretAclKey, SecretAclValue, CGROUP_FLAG_ENFORCED,
+        CGROUP_FLAG_EXEC_ENFORCED, FS_PERM_READ, FS_PERM_WRITE,
     };
-    use anyhow::Context as _;
-
-    /// TTL applied to an ACTIVE_TOOL entry so a lost CompleteToolCall cannot
-    /// leave a restricted secret readable indefinitely. Generous enough for long
-    /// forensic tool runs; matched against `bpf_ktime_get_ns` (CLOCK_MONOTONIC).
-    const ACTIVE_TOOL_TTL_NS: u64 = 60 * 60 * 1_000_000_000; // 1 hour
-    /// Default lifetime for a URI-scoped transient egress entry (G4) when the
-    /// caller passes window_timeout_ms == 0. Bounds a lost CompleteToolCall to
-    /// a short window — egress is meant to last a single tool call.
-    const TRANSIENT_EGRESS_DEFAULT_TTL_NS: u64 = 30 * 1_000_000_000; // 30 seconds
-    /// How often the background resolver re-resolves active transient-egress
-    /// windows' hosts and reconciles the BPF maps (DNS rotation / CDN churn
-    /// within a long window). The loop wakes every TRANSIENT_TICK to stay
-    /// responsive to shutdown; it re-resolves every TRANSIENT_RESOLVE_EVERY ticks.
-    const TRANSIENT_TICK: std::time::Duration = std::time::Duration::from_millis(500);
-    const TRANSIENT_RESOLVE_EVERY: u32 = 20; // 20 * 500ms = 10s
     use aya::maps::lpm_trie::Key as LpmKey;
-    use aya::maps::{HashMap as AyaHashMap, LpmTrie, MapData, PerCpuHashMap, RingBuf};
-    use aya::programs::{CgroupAttachMode, CgroupSkb, CgroupSkbAttachType, CgroupSockAddr, Lsm};
-    use aya::{Btf, Ebpf};
+    use aya::maps::{HashMap as AyaHashMap, LpmTrie, PerCpuHashMap, RingBuf};
+    use aya::Ebpf;
     use std::os::unix::fs::MetadataExt;
 
-    /// PATH used to resolve bare command names when the target container exposes
-    /// no PATH of its own. Mirrors the common Debian/Ubuntu default.
-    const DEFAULT_CONTAINER_PATH: &str =
-        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    const CGROUP_PREFIX_BITS: u32 = 64;
+    const IPV4_PREFIX_BITS: u32 = CGROUP_PREFIX_BITS + 32;
 
     /// Well-known paths where the BPF ELF may be found, in priority order.
     ///
@@ -289,171 +143,6 @@ mod linux {
     /// Environment variable to override the BPF ELF path.
     const BPF_ELF_ENV: &str = "AC_BPF_ELF_PATH";
 
-    /// Cloud metadata endpoints blocked for every enforced cgroup on each
-    /// `apply_network`, ahead of any allow entry (BLOCKED_CIDRS is checked
-    /// first in the connect/sendmsg hooks). Mirrors the sandbox L7 proxy's
-    /// default BlockCIDRs (internal/sandbox/policy.go).
-    const METADATA_ENDPOINTS: &[&str] = &[
-        "169.254.169.254/32", // AWS/GCP/Azure IMDS (v4)
-        "fd00:ec2::254/128",  // AWS IMDS (v6)
-    ];
-
-    /// Convert an IPv6 address to the `[u32; 4]` layout the BPF hooks read
-    /// from `user_ip6`: four words whose in-memory bytes are the address in
-    /// network order (the LPM trie matches on raw key bytes).
-    fn ipv6_words(ip: std::net::Ipv6Addr) -> [u32; 4] {
-        let o = ip.octets();
-        core::array::from_fn(|i| {
-            u32::from_ne_bytes([o[4 * i], o[4 * i + 1], o[4 * i + 2], o[4 * i + 3]])
-        })
-    }
-
-    /// Owned, shared handle to a transient-egress BPF hash map. Taken OUT of the
-    /// Ebpf at startup (like the ring buffers) so the background resolver thread
-    /// can mutate it without holding the programs lock — and so it does NOT keep
-    /// the BPF programs attached past manager drop. The kernel map persists (the
-    /// connect hooks hold their own reference); only the userspace handle moves.
-    type TransientMapV4 = std::sync::Arc<std::sync::Mutex<AyaHashMap<MapData, PortKeyV4, u64>>>;
-    type TransientMapV6 = std::sync::Arc<std::sync::Mutex<AyaHashMap<MapData, PortKeyV6, u64>>>;
-
-    /// One in-flight transient-egress (G4) window, keyed by correlation_id in
-    /// `TransientState::windows`. Retains the original rules + cgroup so the
-    /// background resolver can re-resolve the hosts and refresh the resolved keys
-    /// within the window. `expires_at_ns` is the fixed safety-net deadline.
-    struct TransientWindow {
-        rules: Vec<EgressRule>,
-        cgroup_id: u64,
-        expires_at_ns: u64,
-        keys_v4: Vec<PortKeyV4>,
-        keys_v6: Vec<PortKeyV6>,
-    }
-
-    /// All transient-egress book-keeping under one lock. The BPF maps are a
-    /// projection of `windows`: `reconcile` folds every window's keys into the
-    /// desired map state (union, max expiry across windows sharing a key) and
-    /// diffs it against `installed_*`. This makes overlap (two windows sharing a
-    /// key), re-resolution (a window's keys change), and completion (a window is
-    /// removed) all fall out of one declarative pass — no per-key refcounting.
-    #[derive(Default)]
-    struct TransientState {
-        windows: HashMap<String, TransientWindow>,
-        installed_v4: HashMap<PortKeyV4, u64>,
-        installed_v6: HashMap<PortKeyV6, u64>,
-    }
-
-    /// Resolve a set of egress rules to BPF map keys for a cgroup. Async DNS —
-    /// call this BEFORE taking the transient state / map locks. An IP literal
-    /// (including a bracket-free IPv6 host, which is what the proxy's URI parser
-    /// emits) is used directly; `lookup_host` would need it bracketed. A failed
-    /// resolution or unknown protocol skips that rule (fail-closed: no key, no
-    /// egress).
-    async fn resolve_transient_keys(
-        rules: &[EgressRule],
-        cgroup_id: u64,
-    ) -> (Vec<PortKeyV4>, Vec<PortKeyV6>) {
-        let mut v4 = Vec::new();
-        let mut v6 = Vec::new();
-        for rule in rules {
-            let proto: u8 = match rule.protocol.as_str() {
-                "tcp" | "" => 6u8,
-                "udp" => 17u8,
-                other => {
-                    warn!(protocol = %other, "unknown protocol in transient egress rule, skipping");
-                    continue;
-                }
-            };
-            let resolved: Vec<std::net::IpAddr> = match rule.host.parse::<std::net::IpAddr>() {
-                Ok(ip) => vec![ip],
-                Err(_) => match tokio::net::lookup_host(format!("{}:0", rule.host)).await {
-                    Ok(addrs) => addrs.map(|a| a.ip()).collect(),
-                    Err(e) => {
-                        warn!(
-                            host = %rule.host, error = %e,
-                            "DNS resolution failed for transient egress host, skipping"
-                        );
-                        continue;
-                    }
-                },
-            };
-            for ip in resolved {
-                match ip {
-                    std::net::IpAddr::V4(ip) => v4.push(PortKeyV4 {
-                        cgroup_id,
-                        ip: u32::from(ip).to_be(),
-                        port: rule.port,
-                        protocol: proto,
-                        _pad: 0,
-                    }),
-                    std::net::IpAddr::V6(ip) => v6.push(PortKeyV6 {
-                        cgroup_id,
-                        addr: ipv6_words(ip),
-                        port: rule.port,
-                        protocol: proto,
-                        _pad: 0,
-                        _pad2: 0,
-                    }),
-                }
-            }
-        }
-        (v4, v6)
-    }
-
-    /// Reconcile the transient-egress BPF maps to the desired state derived from
-    /// `state.windows`: the union of every window's keys, each valued at the max
-    /// expiry among windows that contributed it. Inserts/updates changed keys and
-    /// removes keys no longer desired, then updates the installed snapshot. The
-    /// caller must hold the `transient` write lock. Takes the map locks in a
-    /// fixed order (v4 then v6); does NOT await.
-    fn reconcile(
-        state: &mut TransientState,
-        map_v4: &TransientMapV4,
-        map_v6: &TransientMapV6,
-    ) -> anyhow::Result<()> {
-        let mut desired_v4: HashMap<PortKeyV4, u64> = HashMap::new();
-        let mut desired_v6: HashMap<PortKeyV6, u64> = HashMap::new();
-        for w in state.windows.values() {
-            for k in &w.keys_v4 {
-                let e = desired_v4.entry(*k).or_insert(0);
-                *e = (*e).max(w.expires_at_ns);
-            }
-            for k in &w.keys_v6 {
-                let e = desired_v6.entry(*k).or_insert(0);
-                *e = (*e).max(w.expires_at_ns);
-            }
-        }
-
-        {
-            let mut map = map_v4.lock().unwrap();
-            for (k, &exp) in &desired_v4 {
-                if state.installed_v4.get(k) != Some(&exp) {
-                    map.insert(k, exp, 0)?;
-                }
-            }
-            for k in state.installed_v4.keys() {
-                if !desired_v4.contains_key(k) {
-                    let _ = map.remove(k);
-                }
-            }
-        }
-        {
-            let mut map = map_v6.lock().unwrap();
-            for (k, &exp) in &desired_v6 {
-                if state.installed_v6.get(k) != Some(&exp) {
-                    map.insert(k, exp, 0)?;
-                }
-            }
-            for k in state.installed_v6.keys() {
-                if !desired_v6.contains_key(k) {
-                    let _ = map.remove(k);
-                }
-            }
-        }
-
-        state.installed_v4 = desired_v4;
-        state.installed_v6 = desired_v6;
-        Ok(())
-    }
-
     /// Real BPF-backed policy manager for Linux.
     ///
     /// Holds the loaded BPF programs and typed map handles. Methods translate
@@ -461,10 +150,6 @@ mod linux {
     /// insertions via aya.
     pub struct BpfPolicyManager {
         /// The loaded eBPF programs (network hooks, LSM hooks, DNS parser).
-        /// Holds the policy maps; the event-reader thread does NOT share this
-        /// Mutex — it takes the ring buffer maps out at startup and owns them
-        /// (see `spawn_event_readers`), so policy updates never contend with
-        /// the readers.
         programs: std::sync::Mutex<Ebpf>,
 
         /// Tracks cgroup_id -> container_id for ring buffer event correlation.
@@ -477,52 +162,7 @@ mod linux {
         /// In-memory tracking of which cgroup IDs have been registered,
         /// so we can clean up all related map entries on unregister.
         container_cgroups: RwLock<HashMap<String, u64>>,
-
-        /// Container init PIDs supplied at registration. Policy paths for a
-        /// container with a known PID resolve through `/proc/<pid>/root` —
-        /// its mount namespace — so pinned inodes match what the LSM hooks
-        /// observe (overlayfs files differ from same-named host paths).
-        container_pids: RwLock<HashMap<String, u32>>,
-
-        /// Per-cgroup tool-call windows used to attach MCP correlation IDs
-        /// to asynchronous kernel events by event timestamp.
-        correlations: CorrelationWindows,
-
-        /// Per-cgroup tracked policy domains for DNS observation: maps a
-        /// container's cgroup_id to the set of hostnames it declared,
-        /// keyed by their DNS wire-format bytes (lowercased,
-        /// length-prefixed, no terminator) → readable hostname. The DNS
-        /// event reader matches the kernel-emitted question name against
-        /// this set and drops everything else. Hashing moved out of the
-        /// kernel (verifier limits), so identification lives here.
-        tracked_domains: TrackedDomains,
-
-        /// cgroup IDs that have at least one restricted secret (a secret whose
-        /// allowed-tools list is non-empty). PrepareToolCall enforces
-        /// single-active-tool serialization and writes the ACTIVE_TOOL map only
-        /// for these cgroups; non-restricted cgroups keep container-wide access.
-        restricted_cgroups: RwLock<HashMap<u64, ()>>,
-
-        /// URI-scoped transient egress (G4) book-keeping: the in-flight windows
-        /// and the projected BPF map state. Shared (Arc) with the background
-        /// resolver thread. The kernel-side expiry is the safety net; this state
-        /// drives precise insert/refresh/remove via `reconcile`.
-        transient: std::sync::Arc<RwLock<TransientState>>,
-        /// Shared handles to the transient-egress BPF maps (taken out of the
-        /// Ebpf at startup), used by prepare/complete and the resolver thread.
-        transient_v4: TransientMapV4,
-        transient_v6: TransientMapV6,
-        /// Set on Drop to stop the background resolver thread.
-        transient_shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
-
-        /// Whether the BPF LSM hooks (file_open, bprm_check) actually attached.
-        /// Captured once at program-attach time and reported via lsm_status();
-        /// the proxy gates kernel-primary startup on it.
-        lsm_status: LsmStatus,
     }
-
-    /// cgroup_id → (wire-format question name → readable hostname).
-    type TrackedDomains = std::sync::Arc<RwLock<HashMap<u64, HashMap<Vec<u8>, String>>>>;
 
     impl BpfPolicyManager {
         /// Load BPF programs from the compiled ELF object.
@@ -543,204 +183,212 @@ mod linux {
             let mut bpf = Ebpf::load(&elf_bytes)
                 .map_err(|e| anyhow::anyhow!("failed to load BPF programs: {e}"))?;
 
-            // Resolve kernel struct field offsets from BTF and publish them into
-            // KERNEL_OFFSETS BEFORE attaching any program, so the LSM hooks read
-            // correct offsets from their first invocation. The Rust eBPF toolchain
-            // emits no CO-RE relocations, so hardcoded offsets break across kernel
-            // versions; this is the portable substitute. Fail closed at startup.
-            Self::populate_kernel_offsets(&mut bpf)?;
-
             // Initialize BPF logging (non-fatal — tracing may not be wired yet).
             if let Err(e) = aya_log::EbpfLogger::init(&mut bpf) {
                 warn!("BPF logger initialization failed (non-fatal): {e}");
             }
 
-            // Attach the programs — Ebpf::load only places them in the
-            // kernel; nothing enforces until each program is attached. The
-            // returned status records whether the LSM hooks attached (network
-            // hooks are fatal on failure; LSM is tolerated but reported).
-            let lsm_status = Self::attach_programs(&mut bpf)?;
+            info!("BPF programs loaded successfully");
 
-            info!("BPF programs loaded and attached successfully");
+            // Attach programs to their kernel hook points.
+            Self::populate_kernel_offsets(&mut bpf)?;
+            Self::attach_programs(&mut bpf)?;
 
             let registry = ContainerRegistry::new();
             let event_bus = EventBus::new();
-
-            // Take the transient-egress maps OUT of the Ebpf into shared handles
-            // (same rationale as the ring buffers): the resolver thread mutates
-            // them without the programs lock and without pinning the programs.
-            let take_transient = |bpf: &mut Ebpf, name: &str| -> anyhow::Result<aya::maps::Map> {
-                bpf.take_map(name)
-                    .ok_or_else(|| anyhow::anyhow!("BPF map {name} not found"))
-            };
-            let transient_v4: TransientMapV4 = std::sync::Arc::new(std::sync::Mutex::new(
-                AyaHashMap::try_from(take_transient(&mut bpf, "TRANSIENT_PORTS")?)?,
-            ));
-            let transient_v6: TransientMapV6 = std::sync::Arc::new(std::sync::Mutex::new(
-                AyaHashMap::try_from(take_transient(&mut bpf, "TRANSIENT_PORTS_V6")?)?,
-            ));
-            let transient = std::sync::Arc::new(RwLock::new(TransientState::default()));
-            let transient_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
             let mgr = Self {
                 programs: std::sync::Mutex::new(bpf),
                 registry,
                 event_bus,
                 container_cgroups: RwLock::new(HashMap::new()),
-                container_pids: RwLock::new(HashMap::new()),
-                correlations: std::sync::Arc::new(RwLock::new(HashMap::new())),
-                tracked_domains: std::sync::Arc::new(RwLock::new(HashMap::new())),
-                restricted_cgroups: RwLock::new(HashMap::new()),
-                transient,
-                transient_v4,
-                transient_v6,
-                transient_shutdown,
-                lsm_status,
             };
 
             // Spawn background ring buffer readers for all event sources.
             mgr.spawn_event_readers();
-            // Spawn the transient-egress re-resolution loop.
-            mgr.spawn_transient_resolver();
 
             Ok(mgr)
         }
 
-        /// Attach all BPF programs.
+        /// Attach all BPF programs to their kernel hook points.
         ///
-        /// Network hooks (connect4/6, sendmsg4/6) and the DNS parser attach
-        /// to the cgroup2 root — they self-filter via ENFORCED_CGROUPS, so
-        /// non-registered cgroups pay one map lookup and pass through.
-        /// `AllowMultiple` so we coexist with other cgroup BPF programs
-        /// (e.g. systemd socket filtering).
-        ///
-        /// LSM hooks (file_open, bprm_check) attach system-wide via BTF.
-        /// LSM attach failure is tolerated with a loud warning: kernels
-        /// without CONFIG_BPF_LSM (or "bpf" missing from the lsm= cmdline)
-        /// can still enforce the network boundary.
-        ///
-        /// Returns the LSM-attach status. `active` is true only when every LSM
-        /// hook attached; otherwise `detail` carries the reason so callers
-        /// running kernel-primary (Docker Engine) can fail loudly rather than
-        /// run containers with filesystem/exec enforcement silently inactive.
-        fn attach_programs(bpf: &mut Ebpf) -> anyhow::Result<LsmStatus> {
-            let cgroup = std::fs::File::open("/sys/fs/cgroup")
-                .map_err(|e| anyhow::anyhow!("opening cgroup2 root /sys/fs/cgroup: {e}"))?;
+        /// Programs are attached in a best-effort manner: if a specific hook is
+        /// unavailable on the running kernel (e.g., `sys_enter_memfd_create` on
+        /// older kernels), a warning is logged but startup continues. Only
+        /// critical failures (e.g., unable to open the root cgroup) are fatal.
+        fn attach_programs(bpf: &mut Ebpf) -> anyhow::Result<()> {
+            use aya::programs::{CgroupAttachMode, CgroupSockAddr, KProbe, Lsm, TracePoint};
+            use aya::Btf;
+            use std::os::fd::AsFd;
 
-            // CgroupAttachMode::Single, NOT AllowMultiple: on kernels >= 5.7
-            // aya attaches via bpf_link_create, and the kernel rejects any
-            // nonzero link_create flags for cgroup links with EINVAL —
-            // BPF_F_ALLOW_MULTI is a legacy BPF_PROG_ATTACH flag, while
-            // links are inherently multi-attach (Single maps to flags=0).
-            // AllowMultiple here made every attach fail on every modern
-            // kernel. The legacy (<5.7) fallback where Single would mean
-            // exclusive attach is unreachable: the enforcer requires 5.15+.
-            for name in ["ac_connect4", "ac_connect6", "ac_sendmsg4", "ac_sendmsg6"] {
-                let prog: &mut CgroupSockAddr = bpf
-                    .program_mut(name)
-                    .ok_or_else(|| anyhow::anyhow!("BPF program {name} not found"))?
-                    .try_into()
-                    .map_err(|e| anyhow::anyhow!("program {name} type mismatch: {e}"))?;
-                prog.load()
-                    .map_err(|e| anyhow::anyhow!("loading {name}: {e}"))?;
-                prog.attach(&cgroup, CgroupAttachMode::Single)
-                    .map_err(|e| anyhow::anyhow!("attaching {name} to cgroup root: {e}"))?;
-                info!(program = name, "attached network enforcement hook");
+            // Open the root cgroup v2 hierarchy for cgroup-attached programs.
+            let cgroup_file = std::fs::File::open("/sys/fs/cgroup/")
+                .map_err(|e| anyhow::anyhow!("failed to open cgroup v2 root: {e}"))?;
+            let cgroup_fd = cgroup_file.as_fd();
+
+            let btf = Btf::from_sys_fs()
+                .map_err(|e| anyhow::anyhow!("failed to load kernel BTF for LSM hooks: {e}"))?;
+
+            // ---------------------------------------------------------------
+            // LSM hooks (required for process enforcement)
+            // ---------------------------------------------------------------
+
+            match bpf.program_mut("ac_bprm_check") {
+                Some(prog) => {
+                    let lsm: &mut Lsm = prog.try_into()?;
+                    lsm.load("bprm_check_security", &btf)?;
+                    lsm.attach()
+                        .map_err(|e| anyhow::anyhow!("failed to attach ac_bprm_check: {e}"))?;
+                    info!("attached ac_bprm_check to LSM bprm_check_security");
+                }
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "BPF program ac_bprm_check not found in ELF"
+                    ));
+                }
             }
 
-            // DNS observation failing to load/attach must not take the
-            // enforcement hooks down with it — observation is additive,
-            // the connect/sendmsg deny boundary is the point. Mirror the
-            // LSM-hook tolerance below: warn loudly, continue.
-            let dns_attach = (|| -> anyhow::Result<()> {
-                let dns: &mut CgroupSkb = bpf
-                    .program_mut("ac_dns_ingress")
-                    .ok_or_else(|| anyhow::anyhow!("BPF program ac_dns_ingress not found"))?
-                    .try_into()
-                    .map_err(|e| anyhow::anyhow!("program ac_dns_ingress type mismatch: {e}"))?;
-                dns.load()
-                    .map_err(|e| anyhow::anyhow!("loading ac_dns_ingress: {e}"))?;
-                dns.attach(
-                    &cgroup,
-                    CgroupSkbAttachType::Ingress,
-                    CgroupAttachMode::Single,
-                )
-                .map_err(|e| anyhow::anyhow!("attaching ac_dns_ingress: {e}"))?;
-                Ok(())
-            })();
-            match dns_attach {
-                Ok(()) => info!("attached DNS observation hook"),
-                Err(e) => warn!(
-                    error = %e,
-                    "DNS observation hook NOT attached — tracked-domain DNS \
-                     observation disabled; network enforcement is unaffected"
-                ),
+            match bpf.program_mut("ac_file_open") {
+                Some(prog) => {
+                    let lsm: &mut Lsm = prog.try_into()?;
+                    lsm.load("file_open", &btf)?;
+                    lsm.attach()
+                        .map_err(|e| anyhow::anyhow!("failed to attach ac_file_open: {e}"))?;
+                    info!("attached ac_file_open to LSM file_open");
+                }
+                None => {
+                    return Err(anyhow::anyhow!("BPF program ac_file_open not found in ELF"));
+                }
             }
 
-            let lsm_status = match Btf::from_sys_fs() {
-                Ok(btf) => {
-                    let mut failures: Vec<String> = Vec::new();
-                    for (name, hook) in [
-                        ("ac_file_open", "file_open"),
-                        ("ac_bprm_check", "bprm_check_security"),
-                    ] {
-                        let attach = (|| -> anyhow::Result<()> {
-                            let prog: &mut Lsm = bpf
-                                .program_mut(name)
-                                .ok_or_else(|| anyhow::anyhow!("BPF program {name} not found"))?
-                                .try_into()
-                                .map_err(|e| anyhow::anyhow!("type mismatch: {e}"))?;
-                            prog.load(hook, &btf)
-                                .map_err(|e| anyhow::anyhow!("loading: {e}"))?;
-                            prog.attach()
-                                .map_err(|e| anyhow::anyhow!("attaching: {e}"))?;
-                            Ok(())
-                        })();
-                        match attach {
-                            Ok(()) => info!(program = name, hook, "attached LSM hook"),
-                            Err(e) => {
-                                warn!(
-                                    program = name,
-                                    hook,
-                                    error = %e,
-                                    "LSM hook NOT attached — kernel deny-list filesystem/exec \
-                                     enforcement and exec audit events are inactive (requires \
-                                     CONFIG_BPF_LSM and 'bpf' in the lsm= kernel cmdline)"
-                                );
-                                failures.push(format!("{hook}: {e}"));
-                            }
-                        }
-                    }
-                    if failures.is_empty() {
-                        LsmStatus {
-                            active: true,
-                            detail: "file_open, bprm_check attached".to_string(),
-                        }
-                    } else {
-                        LsmStatus {
-                            active: false,
-                            detail: format!(
-                                "LSM hooks not attached ({}); requires CONFIG_BPF_LSM and \
-                                 'bpf' in the lsm= kernel cmdline",
-                                failures.join("; ")
-                            ),
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        "BTF unavailable — LSM hooks not attached; kernel deny-list \
-                         filesystem/exec enforcement and exec audit events are inactive"
-                    );
-                    LsmStatus {
-                        active: false,
-                        detail: format!("BTF unavailable: {e}"),
-                    }
-                }
-            };
+            // ---------------------------------------------------------------
+            // Tracepoints
+            // ---------------------------------------------------------------
 
-            Ok(lsm_status)
+            // sched/sched_process_fork — deny-set inheritance tracking.
+            match bpf.program_mut("ac_sched_fork") {
+                Some(prog) => {
+                    let tp: &mut TracePoint = prog.try_into()?;
+                    tp.load()?;
+                    match tp.attach("sched", "sched_process_fork") {
+                        Ok(_link) => info!("attached ac_sched_fork to sched/sched_process_fork"),
+                        Err(e) => warn!(error = %e, "failed to attach ac_sched_fork (non-fatal)"),
+                    }
+                }
+                None => warn!("BPF program ac_sched_fork not found in ELF"),
+            }
+
+            // sched/sched_process_exit — deny-set cleanup on process exit.
+            match bpf.program_mut("ac_sched_exit") {
+                Some(prog) => {
+                    let tp: &mut TracePoint = prog.try_into()?;
+                    tp.load()?;
+                    match tp.attach("sched", "sched_process_exit") {
+                        Ok(_link) => info!("attached ac_sched_exit to sched/sched_process_exit"),
+                        Err(e) => warn!(error = %e, "failed to attach ac_sched_exit (non-fatal)"),
+                    }
+                }
+                None => warn!("BPF program ac_sched_exit not found in ELF"),
+            }
+
+            // syscalls/sys_enter_memfd_create — fileless execution detection.
+            match bpf.program_mut("ac_memfd_create") {
+                Some(prog) => {
+                    let tp: &mut TracePoint = prog.try_into()?;
+                    tp.load()?;
+                    match tp.attach("syscalls", "sys_enter_memfd_create") {
+                        Ok(_link) => {
+                            info!("attached ac_memfd_create to syscalls/sys_enter_memfd_create")
+                        }
+                        Err(e) => warn!(
+                            error = %e,
+                            "failed to attach ac_memfd_create — kernel may lack this tracepoint (non-fatal)"
+                        ),
+                    }
+                }
+                None => warn!("BPF program ac_memfd_create not found in ELF"),
+            }
+
+            // ---------------------------------------------------------------
+            // Cgroup socket address hooks (bind enforcement)
+            // ---------------------------------------------------------------
+
+            for program_name in ["ac_connect4", "ac_connect6", "ac_sendmsg4", "ac_sendmsg6"] {
+                match bpf.program_mut(program_name) {
+                    Some(prog) => {
+                        let cg: &mut CgroupSockAddr = prog.try_into()?;
+                        cg.load()?;
+                        cg.attach(cgroup_fd, CgroupAttachMode::Single)
+                            .map_err(|e| anyhow::anyhow!("failed to attach {program_name}: {e}"))?;
+                        info!(
+                            program = program_name,
+                            "attached cgroup socket address program"
+                        );
+                    }
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "BPF program {program_name} not found in ELF"
+                        ));
+                    }
+                }
+            }
+
+            // cgroup/bind4 — IPv4 bind enforcement.
+            match bpf.program_mut("ac_bind4") {
+                Some(prog) => {
+                    let cg: &mut CgroupSockAddr = prog.try_into()?;
+                    cg.load()?;
+                    cg.attach(cgroup_fd, CgroupAttachMode::Single)
+                        .map_err(|e| anyhow::anyhow!("failed to attach ac_bind4: {e}"))?;
+                    info!("attached ac_bind4 to cgroup bind4");
+                }
+                None => return Err(anyhow::anyhow!("BPF program ac_bind4 not found in ELF")),
+            }
+
+            // cgroup/bind6 — IPv6 bind enforcement.
+            match bpf.program_mut("ac_bind6") {
+                Some(prog) => {
+                    let cg: &mut CgroupSockAddr = prog.try_into()?;
+                    cg.load()?;
+                    cg.attach(cgroup_fd, CgroupAttachMode::Single)
+                        .map_err(|e| anyhow::anyhow!("failed to attach ac_bind6: {e}"))?;
+                    info!("attached ac_bind6 to cgroup bind6");
+                }
+                None => return Err(anyhow::anyhow!("BPF program ac_bind6 not found in ELF")),
+            }
+
+            // ---------------------------------------------------------------
+            // Kprobe — reverse shell dup2 detection
+            // ---------------------------------------------------------------
+
+            // kprobe/__x64_sys_dup2 — detects stdin/stdout redirection to sockets.
+            match bpf.program_mut("ac_dup2_check") {
+                Some(prog) => {
+                    let kp: &mut KProbe = prog.try_into()?;
+                    kp.load()?;
+                    match kp.attach("__x64_sys_dup2", 0) {
+                        Ok(_link) => info!("attached ac_dup2_check to kprobe __x64_sys_dup2"),
+                        Err(e) => warn!(
+                            error = %e,
+                            "failed to attach ac_dup2_check — __x64_sys_dup2 may not exist on this arch (non-fatal)"
+                        ),
+                    }
+                }
+                None => warn!("BPF program ac_dup2_check not found in ELF"),
+            }
+
+            // ---------------------------------------------------------------
+            // LSM hooks — loaded and attached by aya automatically when the
+            // ELF contains BTF-based LSM programs. We log their presence here
+            // for observability but no manual attachment is needed.
+            // ---------------------------------------------------------------
+
+            // Suppress unused variable warning for cgroup_fd — it's used above
+            // and kept alive until this function returns.
+            let _ = &cgroup_file;
+
+            info!("BPF program attachment complete");
+            Ok(())
         }
 
         /// Spawn background tasks that drain all BPF ring buffers and publish
@@ -751,44 +399,18 @@ mod linux {
         /// are parsed into [`EnforcementEvent`]s and fanned out via the
         /// [`EventBus`] to all gRPC stream subscribers.
         fn spawn_event_readers(&self) {
+            // Spawn a dedicated OS thread that holds the BPF programs lock and
+            // runs all ring buffer readers. We pass a raw pointer to self.programs
+            // because the Mutex<Ebpf> is not Arc-wrapped. This is safe because
+            // BpfPolicyManager lives for the process lifetime (created at startup,
+            // never dropped).
+            let programs_ptr = &self.programs as *const std::sync::Mutex<Ebpf>;
+            // SAFETY: BpfPolicyManager is created once at startup and lives until
+            // process exit. The thread we spawn accesses programs through this
+            // pointer for its entire lifetime.
+            let programs: &'static std::sync::Mutex<Ebpf> = unsafe { &*programs_ptr };
             let bus = self.event_bus.clone();
             let registry = self.registry.clone();
-            let correlations = self.correlations.clone();
-            let tracked = self.tracked_domains.clone();
-
-            // Take the ring buffer maps OUT of the Ebpf so the reader thread
-            // owns them outright and never touches the programs Mutex. A
-            // reader that locked the Mutex for its whole life (the old
-            // design leaked the guard) deadlocks every subsequent policy
-            // update — and a raw pointer into the Ebpf dangles once the
-            // manager is moved into its Arc. Owned RingBufs sidestep both:
-            // the kernel maps persist (the BPF programs hold their own
-            // references); only the userspace handles move here.
-            let (mut net, mut fs, mut proc_evs, mut cred, mut dns) = {
-                let mut bpf = self.programs.lock().unwrap();
-                let mut take = |name: &str| -> Option<RingBuf<aya::maps::MapData>> {
-                    match bpf.take_map(name) {
-                        Some(map) => match RingBuf::try_from(map) {
-                            Ok(rb) => Some(rb),
-                            Err(e) => {
-                                warn!(map = name, error = %e, "map is not a ring buffer");
-                                None
-                            }
-                        },
-                        None => {
-                            warn!(map = name, "ring buffer map not found");
-                            None
-                        }
-                    }
-                };
-                (
-                    take("NET_EVENTS"),
-                    take("FS_EVENTS"),
-                    take("PROC_EVENTS"),
-                    take("CRED_EVENTS"),
-                    take("DNS_EVENTS"),
-                )
-            };
 
             std::thread::Builder::new()
                 .name("event-readers".into())
@@ -799,74 +421,58 @@ mod linux {
                         .expect("event reader runtime");
 
                     let local = tokio::task::LocalSet::new();
-                    local.block_on(&rt, async move {
+                    local.block_on(&rt, async {
+                        // Leak the MutexGuard — held for the process lifetime.
+                        // Ring buffer readers need 'static refs to MapData inside.
+                        let bpf = Box::leak(Box::new(programs.lock().unwrap()));
                         let mut handles = Vec::new();
 
                         macro_rules! spawn_reader {
-                            ($name:expr, $ring:expr, $event_type:ty, $parse_fn:expr) => {
-                                if let Some(ring_buf) = $ring.take() {
-                                    let b = bus.clone();
-                                    let r = registry.clone();
-                                    let c = correlations.clone();
-                                    handles.push(tokio::task::spawn_local(async move {
-                                        Self::run_ring_buf_reader(
-                                            ring_buf,
-                                            b,
-                                            r,
-                                            c,
-                                            move |data, cid| {
-                                                if data.len() >= std::mem::size_of::<$event_type>()
-                                                {
-                                                    let raw: $event_type = unsafe {
-                                                        std::ptr::read_unaligned(
-                                                            data.as_ptr() as *const _
-                                                        )
-                                                    };
-                                                    $parse_fn(&raw, cid)
-                                                } else {
-                                                    None
-                                                }
-                                            },
-                                        )
-                                        .await;
-                                    }));
-                                    info!("{} ring buffer reader started", $name);
+                            ($map_name:expr, $event_type:ty, $parse_fn:expr) => {
+                                if let Some(map_data) = bpf.map($map_name) {
+                                    if let Ok(ring_buf) = RingBuf::try_from(map_data) {
+                                        let b = bus.clone();
+                                        let r = registry.clone();
+                                        handles.push(tokio::task::spawn_local(async move {
+                                            Self::run_ring_buf_reader(
+                                                ring_buf,
+                                                b,
+                                                r,
+                                                |data, cid| {
+                                                    if data.len()
+                                                        >= std::mem::size_of::<$event_type>()
+                                                    {
+                                                        let raw: $event_type = unsafe {
+                                                            std::ptr::read_unaligned(
+                                                                data.as_ptr() as *const _
+                                                            )
+                                                        };
+                                                        Some($parse_fn(&raw, cid))
+                                                    } else {
+                                                        None
+                                                    }
+                                                },
+                                            )
+                                            .await;
+                                        }));
+                                        info!("{} ring buffer reader started", $map_name);
+                                    }
                                 }
                             };
                         }
 
-                        spawn_reader!("NET_EVENTS", net, bpf_events::NetworkEvent, |r, c| Some(
-                            parse_network_event(r, c)
-                        ));
-                        spawn_reader!("FS_EVENTS", fs, bpf_events::FsEvent, |r, c| Some(
-                            parse_fs_event(r, c)
-                        ));
-                        spawn_reader!("PROC_EVENTS", proc_evs, bpf_events::ExecEvent, |r, c| Some(
-                            parse_exec_event(r, c)
-                        ));
-                        spawn_reader!("CRED_EVENTS", cred, bpf_events::CredEvent, |r, c| Some(
-                            parse_cred_event(r, c)
-                        ));
-                        // DNS observations: the kernel emits every response
-                        // for an enforced cgroup. Match the question name
-                        // against this cgroup's tracked-domain set; publish
-                        // tracked names with the readable hostname attached,
-                        // drop the rest.
-                        let parse_dns = move |raw: &bpf_events::DnsEvent, cid: &str| {
-                            let len = (raw.qname_len as usize).min(raw.qname.len());
-                            let qname = &raw.qname[..len];
-                            let host = {
-                                let guard = tracked.read().unwrap();
-                                guard
-                                    .get(&raw.cgroup_id)
-                                    .and_then(|m| m.get(qname))
-                                    .cloned()
-                            }?;
-                            let mut ev = parse_dns_event(raw, cid);
-                            ev.details.insert("domain".into(), host);
-                            Some(ev)
-                        };
-                        spawn_reader!("DNS_EVENTS", dns, bpf_events::DnsEvent, parse_dns);
+                        spawn_reader!("NET_EVENTS", bpf_events::NetworkEvent, parse_network_event);
+                        spawn_reader!("DNS_EVENTS", bpf_events::DnsEvent, parse_dns_event);
+                        spawn_reader!("FS_EVENTS", bpf_events::FsEvent, parse_fs_event);
+                        spawn_reader!("PROC_EVENTS", bpf_events::ExecEvent, parse_exec_event);
+                        spawn_reader!("CRED_EVENTS", bpf_events::CredEvent, parse_cred_event);
+                        spawn_reader!("BIND_EVENTS", bpf_events::BindEvent, parse_bind_event);
+                        spawn_reader!(
+                            "REVERSE_SHELL_EVENTS",
+                            bpf_events::ReverseShellEvent,
+                            parse_reverse_shell_event
+                        );
+                        spawn_reader!("MEMFD_EVENTS", MemfdEvent, parse_memfd_event);
 
                         for h in handles {
                             let _ = h.await;
@@ -888,10 +494,9 @@ mod linux {
         /// The loop terminates when the ring buffer returns no items (i.e. the BPF
         /// programs have been unloaded) — this is expected during normal shutdown.
         async fn run_ring_buf_reader<F>(
-            mut ring_buf: RingBuf<aya::maps::MapData>,
+            mut ring_buf: RingBuf<&aya::maps::MapData>,
             bus: EventBus,
             registry: ContainerRegistry,
-            correlations: CorrelationWindows,
             parse: F,
         ) where
             F: Fn(&[u8], &str) -> Option<crate::policy::EnforcementEvent> + Send + 'static,
@@ -914,72 +519,53 @@ mod linux {
                 }
             };
 
-            // Drained events are parked briefly before correlation
-            // assignment (see CORRELATION_ASSIGN_DELAY_NS): an event drained
-            // in the gap between PrepareToolCall capturing its window-start
-            // timestamp and inserting the window would otherwise be assigned
-            // against a window set that does not yet contain its window.
-            let mut pending = PendingEvents::default();
-
-            'reader: loop {
-                // Wait for ring buffer data — or for the oldest parked event
-                // to come due, whichever is first.
-                let readable = async_fd.readable();
-                tokio::pin!(readable);
-                let due_sleep = async {
-                    match pending.next_due_ns() {
-                        Some(due) => {
-                            let now = monotonic_ns();
-                            tokio::time::sleep(std::time::Duration::from_nanos(
-                                due.saturating_sub(now),
-                            ))
-                            .await
-                        }
-                        // Nothing parked — only readability can wake us.
-                        None => std::future::pending().await,
+            loop {
+                // Wait until the ring buffer has data.
+                let mut guard = match async_fd.readable().await {
+                    Ok(g) => g,
+                    Err(e) => {
+                        warn!(error = %e, "ring buffer readable() error, stopping reader");
+                        break;
                     }
                 };
 
-                tokio::select! {
-                    guard = &mut readable => {
-                        let mut guard = match guard {
-                            Ok(g) => g,
-                            Err(e) => {
-                                warn!(error = %e, "ring buffer readable() error, stopping reader");
-                                break 'reader;
-                            }
-                        };
+                // Drain all available records.
+                while let Some(item) = ring_buf.next() {
+                    let data: &[u8] = &item;
+                    let container_id = match read_event_pid(data) {
+                        Some(pid) => Self::resolve_container_id_for_pid(&registry, pid)
+                            .await
+                            .unwrap_or_default(),
+                        None => String::new(),
+                    };
 
-                        // Drain all available records into the park bench.
-                        let now = monotonic_ns();
-                        while let Some(item) = ring_buf.next() {
-                            let data: &[u8] = &item;
-                            if let Some(mut event) = parse(data, "") {
-                                if let Some(container_id) = registry.lookup(event.cgroup_id).await {
-                                    event.container_id = container_id;
-                                }
-                                pending.park(event, now);
-                            }
-                        }
-                        guard.clear_ready();
+                    if let Some(event) = parse(data, &container_id) {
+                        bus.publish(event);
                     }
-                    _ = due_sleep => {}
                 }
 
-                // Publish whatever has aged past the assignment delay.
-                for mut event in pending.take_due(monotonic_ns()) {
-                    assign_correlation(&mut event, &correlations);
-                    bus.publish(event);
-                }
+                guard.clear_ready();
                 let _ = online_cpus(); // suppress unused import warning
             }
+        }
 
-            // Shutdown: flush parked events rather than dropping them — a
-            // short assignment delay must never cost audit records.
-            for mut event in pending.take_all() {
-                assign_correlation(&mut event, &correlations);
-                bus.publish(event);
-            }
+        async fn resolve_container_id_for_pid(
+            registry: &ContainerRegistry,
+            pid: u32,
+        ) -> Option<String> {
+            let cgroup_id = match resolve_cgroup_id_for_pid_with_roots(
+                pid,
+                Path::new("/proc"),
+                Path::new("/sys/fs/cgroup"),
+            ) {
+                Ok(cgroup_id) => cgroup_id,
+                Err(e) => {
+                    warn!(pid, error = %e, "failed to resolve event pid to cgroup");
+                    return None;
+                }
+            };
+
+            registry.lookup(cgroup_id).await
         }
 
         /// Locate and read the BPF ELF binary.
@@ -1088,293 +674,14 @@ mod linux {
         }
 
         /// Resolve a filesystem path to an (inode, dev_major, dev_minor) triple.
-        /// Device numbers are decoded from the glibc st_dev encoding so they
-        /// match what the BPF hooks decode from the kernel's `sb->s_dev`.
         fn resolve_inode(path: &str) -> anyhow::Result<(u64, u32, u32)> {
             let meta = std::fs::metadata(path)
                 .map_err(|e| anyhow::anyhow!("failed to stat {path}: {e}"))?;
-            let (dev_major, dev_minor) = super::decode_dev(meta.dev());
+            let dev = meta.dev();
+            // Match Linux's userspace dev_t major/minor decoding.
+            let dev_major = (((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff)) as u32;
+            let dev_minor = ((dev & 0xff) | ((dev >> 12) & !0xff)) as u32;
             Ok((meta.ino(), dev_major, dev_minor))
-        }
-
-        /// Resolve a *container-namespace* policy path to the inode triple
-        /// the container's LSM hooks will observe.
-        ///
-        /// Policy paths (`policy.filesystem`, exec allowlists, secret ACLs)
-        /// are what the containerized tool sees, so they must be resolved
-        /// through `/proc/<init_pid>/root` — the container's mount
-        /// namespace. Stat'ing the same string in the enforcer's namespace
-        /// pins a *different* file for anything on the container's
-        /// overlayfs (only bind-mounted host paths coincide). Mirrors the
-        /// `/proc/<pid>/root` mechanism `inject_secrets` already uses.
-        ///
-        /// Falls back to the enforcer's own namespace when no init PID was
-        /// supplied at registration (host-side callers).
-        fn resolve_container_inode(
-            &self,
-            container_id: &str,
-            path: &str,
-        ) -> anyhow::Result<(u64, u32, u32)> {
-            match self.container_pids.read().unwrap().get(container_id) {
-                Some(&pid) => Self::resolve_inode(&format!("/proc/{pid}/root{path}")),
-                None => {
-                    warn!(
-                        container_id,
-                        path,
-                        "no init PID registered; resolving policy path in the \
-                         enforcer's own namespace (container-image paths will \
-                         not match)"
-                    );
-                    Self::resolve_inode(path)
-                }
-            }
-        }
-
-        /// Map a container-namespace path to the host-visible path the enforcer
-        /// reads through, via `/proc/<init_pid>/root` when a PID is registered.
-        fn host_path_for(&self, container_id: &str, container_path: &str) -> String {
-            match self.container_pids.read().unwrap().get(container_id) {
-                Some(&pid) => format!("/proc/{pid}/root{container_path}"),
-                None => container_path.to_string(),
-            }
-        }
-
-        /// Read the container's `PATH` from its init process environment. None
-        /// if no PID is registered or the variable is absent.
-        fn container_path_env(&self, container_id: &str) -> Option<String> {
-            let pid = *self.container_pids.read().unwrap().get(container_id)?;
-            let data = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
-            for kv in data.split(|&b| b == 0) {
-                if let Some(rest) = kv.strip_prefix(b"PATH=") {
-                    return Some(String::from_utf8_lossy(rest).into_owned());
-                }
-            }
-            None
-        }
-
-        /// Resolve a bare command name to its container-namespace path by
-        /// searching the container's `PATH` (falling back to a documented
-        /// default), returning the first directory that holds an executable
-        /// regular file — matching `execvp` semantics.
-        fn resolve_in_path(&self, container_id: &str, name: &str) -> anyhow::Result<String> {
-            let path_env = self
-                .container_path_env(container_id)
-                .unwrap_or_else(|| DEFAULT_CONTAINER_PATH.to_string());
-            for container_path in path_candidates(&path_env, name) {
-                let host = self.host_path_for(container_id, &container_path);
-                if let Ok(meta) = std::fs::metadata(&host) {
-                    if meta.is_file() && (meta.mode() & 0o111) != 0 {
-                        return Ok(container_path);
-                    }
-                }
-            }
-            Err(anyhow::anyhow!(
-                "command {name} not found as an executable in the container PATH ({path_env})"
-            ))
-        }
-
-        /// If `container_path` is a shebang script, return its interpreter's
-        /// absolute path so it too can be allowlisted (the kernel execs the
-        /// interpreter, not the script). Returns None for ELF/other binaries or
-        /// a relative interpreter (which the kernel rejects anyway).
-        fn read_shebang_interpreter(
-            &self,
-            container_id: &str,
-            container_path: &str,
-        ) -> Option<String> {
-            use std::io::Read;
-            let host = self.host_path_for(container_id, container_path);
-            let mut f = std::fs::File::open(&host).ok()?;
-            // "#!" + the first line, bounded.
-            let mut buf = [0u8; 258];
-            let n = f.read(&mut buf).ok()?;
-            parse_shebang_interpreter(&buf[..n])
-        }
-
-        /// Resolve one configured executable spec (absolute path or bare command
-        /// name) into the container-namespace inode triples to allowlist: the
-        /// executable itself plus, for a shebang script, its interpreter. Errors
-        /// if the spec resolves to no real regular file (caller aborts startup).
-        fn resolve_executables(
-            &self,
-            container_id: &str,
-            spec: &str,
-        ) -> anyhow::Result<Vec<(u64, u32, u32)>> {
-            let container_path = if spec.starts_with('/') {
-                spec.to_string()
-            } else if spec.contains('/') {
-                return Err(anyhow::anyhow!(
-                    "executable spec {spec:?} must be an absolute path or a bare command name, \
-                     not a relative path"
-                ));
-            } else {
-                self.resolve_in_path(container_id, spec)?
-            };
-
-            let mut out = Vec::new();
-            let primary = self
-                .resolve_container_inode(container_id, &container_path)
-                .with_context(|| format!("resolve executable {spec} ({container_path})"))?;
-            out.push(primary);
-
-            if let Some(interp) = self.read_shebang_interpreter(container_id, &container_path) {
-                let interp_inode = self
-                    .resolve_container_inode(container_id, &interp)
-                    .with_context(|| {
-                        format!("resolve shebang interpreter {interp} for script {spec}")
-                    })?;
-                out.push(interp_inode);
-            }
-            Ok(out)
-        }
-
-        /// Remove entries belonging to `cgroup_id` from a hash map whose key
-        /// struct embeds a cgroup_id (extracted via `key_cgroup`).
-        fn cleanup_hash_entries<K: aya::Pod, V: aya::Pod>(
-            bpf: &mut Ebpf,
-            name: &str,
-            cgroup_id: u64,
-            key_cgroup: impl Fn(&K) -> u64,
-        ) {
-            let Some(map_data) = bpf.map_mut(name) else {
-                return;
-            };
-            let Ok(mut map) = AyaHashMap::<_, K, V>::try_from(map_data) else {
-                warn!(map = name, "failed to open map for per-cgroup cleanup");
-                return;
-            };
-            let stale: Vec<K> = map
-                .keys()
-                .filter_map(|k| k.ok())
-                .filter(|k| key_cgroup(k) == cgroup_id)
-                .collect();
-            for key in &stale {
-                if let Err(e) = map.remove(key) {
-                    warn!(map = name, cgroup_id, error = %e, "failed to remove stale entry");
-                }
-            }
-            if !stale.is_empty() {
-                info!(
-                    map = name,
-                    cgroup_id,
-                    removed = stale.len(),
-                    "cleaned per-cgroup entries"
-                );
-            }
-        }
-
-        /// Remove entries belonging to `cgroup_id` from a per-cgroup LPM trie
-        /// (data payload begins with the 64-bit cgroup_id).
-        fn cleanup_lpm_entries<K: aya::Pod>(
-            bpf: &mut Ebpf,
-            name: &str,
-            cgroup_id: u64,
-            key_cgroup: impl Fn(&K) -> u64,
-        ) {
-            let Some(map_data) = bpf.map_mut(name) else {
-                return;
-            };
-            let Ok(mut map) = LpmTrie::<_, K, u8>::try_from(map_data) else {
-                warn!(map = name, "failed to open map for per-cgroup cleanup");
-                return;
-            };
-            let stale: Vec<LpmKey<K>> = map
-                .keys()
-                .filter_map(|k| k.ok())
-                .filter(|k| key_cgroup(&k.data()) == cgroup_id)
-                .collect();
-            let removed = stale.len();
-            for key in stale {
-                if let Err(e) = map.remove(&key) {
-                    warn!(map = name, cgroup_id, error = %e, "failed to remove stale entry");
-                }
-            }
-            if removed > 0 {
-                info!(map = name, cgroup_id, removed, "cleaned per-cgroup entries");
-            }
-        }
-
-        /// Encode a policy host as the DNS wire-format question name the
-        /// kernel emits: lowercased, length-prefixed labels, no terminating
-        /// zero. Returns None for IP literals (never appear in DNS
-        /// questions), malformed labels, or names whose wire form exceeds
-        /// what the kernel carries (DNS_QNAME_MAX) — such a name could never
-        /// match a kernel event, so tracking it would be dead weight.
-        fn domain_wire(host: &str) -> Option<Vec<u8>> {
-            if host.is_empty() || host.parse::<std::net::IpAddr>().is_ok() {
-                return None;
-            }
-            let canon = host.trim_end_matches('.').to_ascii_lowercase();
-            let mut wire = Vec::with_capacity(canon.len() + 1);
-            for label in canon.split('.') {
-                if label.is_empty() || label.len() > 63 {
-                    return None;
-                }
-                wire.push(label.len() as u8);
-                wire.extend_from_slice(label.as_bytes());
-            }
-            if wire.len() > agentcontainer_common::events::DNS_QNAME_MAX {
-                return None;
-            }
-            Some(wire)
-        }
-
-        /// Remove the per-cgroup *network* policy entries for `cgroup_id` —
-        /// the maps `apply_network` owns. Called both on unregister and at
-        /// the top of every `apply_network` so a re-apply REPLACES the
-        /// previous resolution instead of accumulating: without this, the
-        /// 5-minute hostname refresh only ever adds, and the egress
-        /// allowlist monotonically widens to every IP a CDN hostname ever
-        /// resolved to.
-        fn cleanup_network_entries(bpf: &mut Ebpf, cgroup_id: u64) {
-            Self::cleanup_lpm_entries::<LpmDataV4>(bpf, "ALLOWED_V4", cgroup_id, |k| k.cgroup_id);
-            Self::cleanup_lpm_entries::<LpmDataV6>(bpf, "ALLOWED_V6", cgroup_id, |k| k.cgroup_id);
-            Self::cleanup_hash_entries::<PortKeyV4, u8>(bpf, "ALLOWED_PORTS", cgroup_id, |k| {
-                k.cgroup_id
-            });
-        }
-
-        /// Remove all per-cgroup policy entries for `cgroup_id`.
-        ///
-        /// cgroup IDs are kernfs inode numbers and can be recycled after a
-        /// container exits; a stale entry would hand the prior container's
-        /// policy to whichever cgroup reuses the ID. With per-cgroup map
-        /// keys this cleanup is mandatory, not best-effort.
-        fn cleanup_cgroup_entries(bpf: &mut Ebpf, cgroup_id: u64) {
-            Self::cleanup_network_entries(bpf, cgroup_id);
-            Self::cleanup_lpm_entries::<LpmDataV4>(bpf, "BLOCKED_CIDRS_V4", cgroup_id, |k| {
-                k.cgroup_id
-            });
-            Self::cleanup_lpm_entries::<LpmDataV6>(bpf, "BLOCKED_CIDRS_V6", cgroup_id, |k| {
-                k.cgroup_id
-            });
-            Self::cleanup_hash_entries::<FsInodeKey, u8>(bpf, "ALLOWED_INODES", cgroup_id, |k| {
-                k.cgroup_id
-            });
-            Self::cleanup_hash_entries::<FsInodeKey, u8>(bpf, "DENIED_INODES", cgroup_id, |k| {
-                k.cgroup_id
-            });
-            Self::cleanup_hash_entries::<FsInodeKey, u8>(bpf, "ALLOWED_EXECS", cgroup_id, |k| {
-                k.cgroup_id
-            });
-            Self::cleanup_hash_entries::<SecretAclKey, SecretAclValue>(
-                bpf,
-                "SECRET_ACLS",
-                cgroup_id,
-                |k| k.cgroup_id,
-            );
-            Self::cleanup_hash_entries::<SecretToolKey, u8>(
-                bpf,
-                "SECRET_TOOL_ACLS",
-                cgroup_id,
-                |k| k.cgroup_id,
-            );
-            // ACTIVE_TOOL is keyed by cgroup_id directly.
-            if let Some(map_data) = bpf.map_mut("ACTIVE_TOOL") {
-                if let Ok(mut map) = AyaHashMap::<_, u64, ActiveTool>::try_from(map_data) {
-                    let _ = map.remove(&cgroup_id);
-                }
-            }
         }
     }
 
@@ -1399,10 +706,21 @@ mod linux {
                     bpf.map_mut("ENFORCED_CGROUPS")
                         .ok_or_else(|| anyhow::anyhow!("BPF map ENFORCED_CGROUPS not found"))?,
                 )?;
-                // Network + filesystem enforcement only at registration. Exec
-                // (bprm_check) is opt-in and gets its flag bit later, in
-                // apply_process, and only for a non-empty allowlist.
                 map.insert(cgroup_id, CGROUP_FLAG_ENFORCED, 0)?;
+
+                // Seed process-tree sticky map so forks inherit the subject even
+                // when they land in sibling/non-ancestor cgroups (cron, systemd).
+                if init_pid != 0 {
+                    let mut sticky: AyaHashMap<_, u32, u64> = AyaHashMap::try_from(
+                        bpf.map_mut("PROC_ENFORCED")
+                            .ok_or_else(|| anyhow::anyhow!("BPF map PROC_ENFORCED not found"))?,
+                    )?;
+                    sticky.insert(init_pid, cgroup_id, 0)?;
+                    info!(
+                        init_pid,
+                        cgroup_id, "seeded PROC_ENFORCED for container init"
+                    );
+                }
             }
 
             // Track in registry for event correlation.
@@ -1414,12 +732,6 @@ mod linux {
                 .write()
                 .unwrap()
                 .insert(container_id.to_string(), cgroup_id);
-            if init_pid != 0 {
-                self.container_pids
-                    .write()
-                    .unwrap()
-                    .insert(container_id.to_string(), init_pid);
-            }
 
             Ok(ContainerHandle {
                 container_id: container_id.to_string(),
@@ -1428,11 +740,9 @@ mod linux {
         }
 
         async fn unregister(&self, container_id: &str) -> anyhow::Result<()> {
-            self.container_pids.write().unwrap().remove(container_id);
             let cgroup_id = self.container_cgroups.write().unwrap().remove(container_id);
 
             if let Some(cgroup_id) = cgroup_id {
-                self.restricted_cgroups.write().unwrap().remove(&cgroup_id);
                 info!(
                     container_id,
                     cgroup_id, "unregistering cgroup from BPF enforcement"
@@ -1459,13 +769,17 @@ mod linux {
                         }
                     }
 
-                    self.correlations.write().unwrap().remove(&cgroup_id);
-                    self.tracked_domains.write().unwrap().remove(&cgroup_id);
+                    // Policy maps are scoped by cgroup where possible; exact
+                    // key cleanup is handled by the follow-up policy index.
 
-                    // Remove this cgroup's entries from every per-cgroup policy
-                    // map (network LPM tries, ports, inodes, execs, secret ACLs)
-                    // so a recycled cgroup ID cannot inherit stale policy.
-                    Self::cleanup_cgroup_entries(&mut bpf, cgroup_id);
+                    // Clean up SECRET_ACLS entries for this cgroup.
+                    // SecretAclKey includes cgroup_id, but we'd need to iterate all keys.
+                    // For now, log that cleanup is best-effort.
+                    warn!(
+                        cgroup_id,
+                        "per-cgroup cleanup for scoped policy maps/SECRET_ACLS is best-effort; \
+                         stale entries expire naturally or on next policy apply"
+                    );
                 } // MutexGuard dropped before await
 
                 self.registry.unregister_container(cgroup_id).await;
@@ -1480,84 +794,76 @@ mod linux {
             &self,
             container_id: &str,
             policy: &NetworkPolicy,
-        ) -> anyhow::Result<crate::policy::NetworkApplyReport> {
+        ) -> anyhow::Result<()> {
             let cgroup_id = self.lookup_cgroup(container_id)?;
             info!(container_id, cgroup_id, hosts = ?policy.allowed_hosts, "applying network policy to BPF maps");
 
-            // Hosts skipped because DNS failed — reported to the caller so a
-            // partial application is distinguishable from a full one.
-            let mut unresolved_hosts: Vec<String> = Vec::new();
-
-            // Phase 1 — resolve every hostname BEFORE touching any map. DNS
-            // can take seconds; the swap below must not leave the cgroup
-            // swept (default-deny on previously-allowed destinations) while
-            // lookups are in flight.
-            let mut host_addrs: Vec<(&str, std::net::Ipv4Addr)> = Vec::new();
-            let mut host_addrs_v6: Vec<(&str, std::net::Ipv6Addr)> = Vec::new();
+            // Resolve allowed_hosts to IPs and insert into ALLOWED_V4 LPM trie.
             for host in &policy.allowed_hosts {
                 match tokio::net::lookup_host(format!("{host}:0")).await {
                     Ok(addrs) => {
+                        let mut bpf = self.programs.lock().unwrap();
                         for addr in addrs {
-                            match addr.ip() {
-                                std::net::IpAddr::V4(ip) => host_addrs.push((host, ip)),
-                                std::net::IpAddr::V6(ip) => host_addrs_v6.push((host, ip)),
+                            if let std::net::IpAddr::V4(ip) = addr.ip() {
+                                let key = LpmKey::new(
+                                    IPV4_PREFIX_BITS,
+                                    ScopedLpmKeyV4 {
+                                        cgroup_id,
+                                        addr: u32::from(ip).to_be(),
+                                        _pad: 0,
+                                    },
+                                );
+                                let map_data = bpf.map_mut("ALLOWED_V4").ok_or_else(|| {
+                                    anyhow::anyhow!("BPF map ALLOWED_V4 not found")
+                                })?;
+                                let mut map: LpmTrie<_, ScopedLpmKeyV4, u8> =
+                                    LpmTrie::try_from(map_data)?;
+                                map.insert(&key, 1, 0)?;
+                                info!(host, ip = %ip, "added IP to ALLOWED_V4");
                             }
                         }
                     }
                     Err(e) => {
                         warn!(host, error = %e, "DNS resolution failed for allowed host, skipping");
-                        unresolved_hosts.push(host.clone());
                     }
                 }
             }
 
-            // Blocked CIDRs: policy entries plus the cloud metadata
-            // endpoints, which are always denied for every enforced cgroup —
-            // an allowed hostname under attacker-influenced DNS must not be
-            // able to resolve its way to the instance credentials endpoint.
-            let mut blocked_v4: Vec<(std::net::Ipv4Addr, u8)> = Vec::new();
-            let mut blocked_v6: Vec<(std::net::Ipv6Addr, u8)> = Vec::new();
-            let builtin = METADATA_ENDPOINTS.iter().map(|s| (*s, true));
-            let declared = policy.blocked_cidrs.iter().map(|s| (s.as_str(), false));
-            for (cidr, is_builtin) in builtin.chain(declared) {
-                match crate::policy::parse_cidr(cidr) {
-                    Some((std::net::IpAddr::V4(ip), prefix)) => blocked_v4.push((ip, prefix)),
-                    Some((std::net::IpAddr::V6(ip), prefix)) => blocked_v6.push((ip, prefix)),
-                    None => {
-                        debug_assert!(!is_builtin, "builtin metadata CIDR must parse");
-                        warn!(cidr, "malformed blocked CIDR in network policy, skipping");
-                    }
-                }
-            }
-            let mut rule_addrs: Vec<(&crate::policy::EgressRule, std::net::Ipv4Addr, u8)> =
-                Vec::new();
+            // Insert egress rules into ALLOWED_PORTS map.
             for rule in &policy.egress_rules {
-                let proto = match rule.protocol.to_lowercase().as_str() {
-                    // An omitted protocol defaults to tcp rather than being
-                    // dropped — a silently skipped allow rule is worse than a
-                    // sensible default for the common HTTP/S egress case.
-                    "tcp" | "" => 6u8,
-                    "udp" => 17u8,
-                    other => {
-                        warn!(protocol = %other, "unknown protocol in egress rule, skipping");
-                        continue;
-                    }
-                };
                 match tokio::net::lookup_host(format!("{}:0", rule.host)).await {
                     Ok(addrs) => {
+                        let proto = match rule.protocol.to_lowercase().as_str() {
+                            "tcp" => 6u8,
+                            "udp" => 17u8,
+                            _ => {
+                                warn!(protocol = %rule.protocol, "unknown protocol in egress rule, skipping");
+                                continue;
+                            }
+                        };
+                        let mut bpf = self.programs.lock().unwrap();
                         for addr in addrs {
-                            match addr.ip() {
-                                std::net::IpAddr::V4(ip) => rule_addrs.push((rule, ip, proto)),
-                                std::net::IpAddr::V6(ip) => {
-                                    // No per-port IPv6 map exists (ALLOWED_PORTS
-                                    // is v4-keyed); widening the rule to a
-                                    // host-wide v6 allow would exceed declared
-                                    // policy, so the v6 address stays denied.
-                                    warn!(
-                                        host = %rule.host, ip = %ip,
-                                        "egress rule resolved to IPv6 — port-scoped v6 enforcement unsupported, address remains denied"
-                                    );
-                                }
+                            if let std::net::IpAddr::V4(ip) = addr.ip() {
+                                let key = ScopedPortKeyV4 {
+                                    cgroup_id,
+                                    ip: u32::from(ip).to_be(),
+                                    port: rule.port,
+                                    protocol: proto,
+                                    _pad: 0,
+                                };
+                                let map_data = bpf.map_mut("ALLOWED_PORTS").ok_or_else(|| {
+                                    anyhow::anyhow!("BPF map ALLOWED_PORTS not found")
+                                })?;
+                                let mut map: AyaHashMap<_, ScopedPortKeyV4, u8> =
+                                    AyaHashMap::try_from(map_data)?;
+                                map.insert(key, 1, 0)?;
+                                info!(
+                                    host = %rule.host,
+                                    ip = %ip,
+                                    port = rule.port,
+                                    protocol = %rule.protocol,
+                                    "added port rule to ALLOWED_PORTS"
+                                );
                             }
                         }
                     }
@@ -1567,135 +873,11 @@ mod linux {
                             error = %e,
                             "DNS resolution failed for egress rule host, skipping"
                         );
-                        unresolved_hosts.push(rule.host.clone());
                     }
                 }
             }
 
-            // Phase 2 — swap under one lock: sweep this cgroup's previous
-            // network entries, then insert the fresh resolution. A re-apply
-            // (the 5-minute hostname refresh) thereby REPLACES the prior IP
-            // set; insert-only semantics would accumulate every IP a CDN
-            // hostname ever resolved to, monotonically widening egress for
-            // the whole session. The deny window is map-operation-sized.
-            let mut bpf = self.programs.lock().unwrap();
-            Self::cleanup_network_entries(&mut bpf, cgroup_id);
-
-            // Rebuild this cgroup's tracked-domain set for DNS observation
-            // (the userspace match table the event reader consults). Rebuilt
-            // each apply_network so the 5-minute refresh REPLACES rather
-            // than accumulates, mirroring the IP-set swap above.
-            {
-                let hosts = policy
-                    .allowed_hosts
-                    .iter()
-                    .chain(policy.egress_rules.iter().map(|r| &r.host));
-                let mut set = HashMap::new();
-                for host in hosts {
-                    if let Some(wire) = Self::domain_wire(host) {
-                        set.insert(wire, host.trim_end_matches('.').to_ascii_lowercase());
-                    }
-                }
-                if set.is_empty() {
-                    self.tracked_domains.write().unwrap().remove(&cgroup_id);
-                } else {
-                    self.tracked_domains.write().unwrap().insert(cgroup_id, set);
-                }
-            }
-
-            // Always-deny overrides go in first: BLOCKED_CIDRS_* is checked
-            // before the allow maps in the hooks, so an IP covered here is
-            // unreachable no matter what the allow inserts below contain.
-            for (ip, prefix) in blocked_v4 {
-                let key = LpmKey::new(
-                    LPM_CGROUP_PREFIX + prefix as u32,
-                    LpmDataV4 {
-                        cgroup_id,
-                        addr: u32::from(ip).to_be(),
-                        _pad: 0,
-                    },
-                );
-                let map_data = bpf
-                    .map_mut("BLOCKED_CIDRS_V4")
-                    .ok_or_else(|| anyhow::anyhow!("BPF map BLOCKED_CIDRS_V4 not found"))?;
-                let mut map: LpmTrie<_, LpmDataV4, u8> = LpmTrie::try_from(map_data)?;
-                map.insert(&key, 1, 0)?;
-                info!(cidr = %format!("{ip}/{prefix}"), cgroup_id, "added CIDR to BLOCKED_CIDRS_V4");
-            }
-            for (ip, prefix) in blocked_v6 {
-                let key = LpmKey::new(
-                    LPM_CGROUP_PREFIX + prefix as u32,
-                    LpmDataV6 {
-                        cgroup_id,
-                        addr: ipv6_words(ip),
-                    },
-                );
-                let map_data = bpf
-                    .map_mut("BLOCKED_CIDRS_V6")
-                    .ok_or_else(|| anyhow::anyhow!("BPF map BLOCKED_CIDRS_V6 not found"))?;
-                let mut map: LpmTrie<_, LpmDataV6, u8> = LpmTrie::try_from(map_data)?;
-                map.insert(&key, 1, 0)?;
-                info!(cidr = %format!("{ip}/{prefix}"), cgroup_id, "added CIDR to BLOCKED_CIDRS_V6");
-            }
-
-            for (host, ip) in host_addrs {
-                // Per-cgroup LPM key: prefix covers all 64 cgroup bits plus
-                // the full /32 host address.
-                let key = LpmKey::new(
-                    LPM_CGROUP_PREFIX + 32,
-                    LpmDataV4 {
-                        cgroup_id,
-                        addr: u32::from(ip).to_be(),
-                        _pad: 0,
-                    },
-                );
-                let map_data = bpf
-                    .map_mut("ALLOWED_V4")
-                    .ok_or_else(|| anyhow::anyhow!("BPF map ALLOWED_V4 not found"))?;
-                let mut map: LpmTrie<_, LpmDataV4, u8> = LpmTrie::try_from(map_data)?;
-                map.insert(&key, 1, 0)?;
-                info!(host, ip = %ip, cgroup_id, "added IP to ALLOWED_V4");
-            }
-
-            for (host, ip) in host_addrs_v6 {
-                let key = LpmKey::new(
-                    LPM_CGROUP_PREFIX + 128,
-                    LpmDataV6 {
-                        cgroup_id,
-                        addr: ipv6_words(ip),
-                    },
-                );
-                let map_data = bpf
-                    .map_mut("ALLOWED_V6")
-                    .ok_or_else(|| anyhow::anyhow!("BPF map ALLOWED_V6 not found"))?;
-                let mut map: LpmTrie<_, LpmDataV6, u8> = LpmTrie::try_from(map_data)?;
-                map.insert(&key, 1, 0)?;
-                info!(host, ip = %ip, cgroup_id, "added IP to ALLOWED_V6");
-            }
-
-            for (rule, ip, proto) in rule_addrs {
-                let key = PortKeyV4 {
-                    cgroup_id,
-                    ip: u32::from(ip).to_be(),
-                    port: rule.port,
-                    protocol: proto,
-                    _pad: 0,
-                };
-                let map_data = bpf
-                    .map_mut("ALLOWED_PORTS")
-                    .ok_or_else(|| anyhow::anyhow!("BPF map ALLOWED_PORTS not found"))?;
-                let mut map: AyaHashMap<_, PortKeyV4, u8> = AyaHashMap::try_from(map_data)?;
-                map.insert(key, 1, 0)?;
-                info!(
-                    host = %rule.host,
-                    ip = %ip,
-                    port = rule.port,
-                    protocol = %rule.protocol,
-                    "added port rule to ALLOWED_PORTS"
-                );
-            }
-
-            Ok(crate::policy::NetworkApplyReport { unresolved_hosts })
+            Ok(())
         }
 
         async fn apply_filesystem(
@@ -1713,18 +895,18 @@ mod linux {
 
             // Insert read-only paths.
             for path in &policy.read_paths {
-                match self.resolve_container_inode(container_id, path) {
+                match Self::resolve_inode(path) {
                     Ok((inode, dev_major, dev_minor)) => {
-                        let key = FsInodeKey {
+                        let key = ScopedFsInodeKey {
                             inode,
+                            cgroup_id,
                             dev_major,
                             dev_minor,
-                            cgroup_id,
                         };
                         let map_data = bpf
                             .map_mut("ALLOWED_INODES")
                             .ok_or_else(|| anyhow::anyhow!("BPF map ALLOWED_INODES not found"))?;
-                        let mut map: AyaHashMap<_, FsInodeKey, u8> =
+                        let mut map: AyaHashMap<_, ScopedFsInodeKey, u8> =
                             AyaHashMap::try_from(map_data)?;
                         map.insert(key, FS_PERM_READ, 0)?;
                         info!(path, inode, "added read-only inode to ALLOWED_INODES");
@@ -1737,18 +919,18 @@ mod linux {
 
             // Insert read+write paths.
             for path in &policy.write_paths {
-                match self.resolve_container_inode(container_id, path) {
+                match Self::resolve_inode(path) {
                     Ok((inode, dev_major, dev_minor)) => {
-                        let key = FsInodeKey {
+                        let key = ScopedFsInodeKey {
                             inode,
+                            cgroup_id,
                             dev_major,
                             dev_minor,
-                            cgroup_id,
                         };
                         let map_data = bpf
                             .map_mut("ALLOWED_INODES")
                             .ok_or_else(|| anyhow::anyhow!("BPF map ALLOWED_INODES not found"))?;
-                        let mut map: AyaHashMap<_, FsInodeKey, u8> =
+                        let mut map: AyaHashMap<_, ScopedFsInodeKey, u8> =
                             AyaHashMap::try_from(map_data)?;
                         map.insert(key, FS_PERM_READ | FS_PERM_WRITE, 0)?;
                         info!(path, inode, "added read-write inode to ALLOWED_INODES");
@@ -1759,21 +941,20 @@ mod linux {
                 }
             }
 
-            // Insert denied paths (checked by the LSM hook BEFORE the allow
-            // list, so a deny entry overrides any allow for the same inode).
+            // Insert denied paths. Deny entries take priority in the BPF hook.
             for path in &policy.deny_paths {
-                match self.resolve_container_inode(container_id, path) {
+                match Self::resolve_inode(path) {
                     Ok((inode, dev_major, dev_minor)) => {
-                        let key = FsInodeKey {
+                        let key = ScopedFsInodeKey {
                             inode,
+                            cgroup_id,
                             dev_major,
                             dev_minor,
-                            cgroup_id,
                         };
                         let map_data = bpf
                             .map_mut("DENIED_INODES")
                             .ok_or_else(|| anyhow::anyhow!("BPF map DENIED_INODES not found"))?;
-                        let mut map: AyaHashMap<_, FsInodeKey, u8> =
+                        let mut map: AyaHashMap<_, ScopedFsInodeKey, u8> =
                             AyaHashMap::try_from(map_data)?;
                         map.insert(key, 1, 0)?;
                         info!(path, inode, "added denied inode to DENIED_INODES");
@@ -1795,69 +976,42 @@ mod linux {
             let cgroup_id = self.lookup_cgroup(container_id)?;
             info!(container_id, cgroup_id, binaries = ?policy.allowed_binaries, "applying process policy to BPF maps");
 
-            // Resolve every configured executable first. bprm_check is
-            // default-deny, so an executable that cannot be resolved uniquely
-            // and safely must abort startup rather than be silently skipped
-            // (which would leave it un-runnable with no signal). Resolving
-            // before any map mutation also avoids a partial allowlist.
-            let mut keys: Vec<(FsInodeKey, String)> = Vec::new();
+            let mut bpf = self.programs.lock().unwrap();
+
             for binary in &policy.allowed_binaries {
-                let inodes = self.resolve_executables(container_id, binary)?;
-                for (inode, dev_major, dev_minor) in inodes {
-                    keys.push((
-                        FsInodeKey {
+                match Self::resolve_inode(binary) {
+                    Ok((inode, dev_major, dev_minor)) => {
+                        let key = ScopedFsInodeKey {
                             inode,
+                            cgroup_id,
                             dev_major,
                             dev_minor,
-                            cgroup_id,
-                        },
-                        binary.clone(),
-                    ));
+                        };
+                        let map_data = bpf
+                            .map_mut("ALLOWED_EXECS")
+                            .ok_or_else(|| anyhow::anyhow!("BPF map ALLOWED_EXECS not found"))?;
+                        let mut map: AyaHashMap<_, ScopedFsInodeKey, u8> =
+                            AyaHashMap::try_from(map_data)?;
+                        map.insert(key, 1, 0)?;
+                        info!(binary, inode, "added binary inode to ALLOWED_EXECS");
+                    }
+                    Err(e) => {
+                        warn!(binary, error = %e, "failed to resolve binary inode, skipping");
+                    }
                 }
             }
 
-            let mut bpf = self.programs.lock().unwrap();
-            // Clear this cgroup's existing entries first, so a tightened
-            // allowlist (Update with fewer binaries) actually revokes the
-            // removed executables rather than leaving them authorized.
-            Self::cleanup_hash_entries::<FsInodeKey, u8>(
-                &mut bpf,
-                "ALLOWED_EXECS",
-                cgroup_id,
-                |k| k.cgroup_id,
-            );
-            {
-                let map_data = bpf
-                    .map_mut("ALLOWED_EXECS")
-                    .ok_or_else(|| anyhow::anyhow!("BPF map ALLOWED_EXECS not found"))?;
-                let mut map: AyaHashMap<_, FsInodeKey, u8> = AyaHashMap::try_from(map_data)?;
-                for (key, binary) in &keys {
-                    map.insert(key, 1, 0)?;
-                    info!(
-                        binary,
-                        inode = key.inode,
-                        "added binary inode to ALLOWED_EXECS"
-                    );
-                }
-            }
-
-            // Toggle the exec-enforcement flag on this cgroup. bprm_check is an
-            // allowlist: gating a cgroup with an EMPTY allowlist would deny ALL
-            // execs. So exec enforcement is opt-in — set the EXEC flag only when
-            // the allowlist is non-empty; clear it otherwise so a cgroup with no
-            // declared binaries (e.g. a proxy-launched tool-runner backend that
-            // must spawn its own processes) is not exec-gated. Network/filesystem
-            // enforcement is unaffected (the ENFORCED bit stays set).
+            // Opt-in exec enforcement: set EXEC_ENFORCED only when allowlist non-empty.
             {
                 let map_data = bpf
                     .map_mut("ENFORCED_CGROUPS")
                     .ok_or_else(|| anyhow::anyhow!("BPF map ENFORCED_CGROUPS not found"))?;
                 let mut emap: AyaHashMap<_, u64, u8> = AyaHashMap::try_from(map_data)?;
                 let cur = emap.get(&cgroup_id, 0).unwrap_or(CGROUP_FLAG_ENFORCED);
-                let new = if keys.is_empty() {
-                    cur & !CGROUP_FLAG_EXEC_ENFORCED
-                } else {
+                let new = if !policy.allowed_binaries.is_empty() {
                     cur | CGROUP_FLAG_EXEC_ENFORCED
+                } else {
+                    cur & !CGROUP_FLAG_EXEC_ENFORCED
                 };
                 emap.insert(cgroup_id, new, 0)?;
             }
@@ -1881,7 +1035,7 @@ mod linux {
             let mut bpf = self.programs.lock().unwrap();
 
             for acl in &policy.secret_acls {
-                match self.resolve_container_inode(container_id, &acl.path) {
+                match Self::resolve_inode(&acl.path) {
                     Ok((inode, dev_major, dev_minor)) => {
                         let key = SecretAclKey {
                             inode,
@@ -1905,18 +1059,10 @@ mod linux {
                             0 // No expiry.
                         };
 
-                        // A non-empty allowed-tools list makes the secret
-                        // restricted: readable only during an allowed tool's
-                        // active call window (enforced in file_open via
-                        // ACTIVE_TOOL + SECRET_TOOL_ACLS). An empty list keeps
-                        // container-wide access.
-                        let restricted = !acl.allowed_tools.is_empty();
-
                         let value = SecretAclValue {
                             expires_at_ns,
                             allowed_ops: FS_PERM_READ,
-                            restricted: u8::from(restricted),
-                            _pad: [0; 6],
+                            _pad: [0; 7],
                         };
 
                         let map_data = bpf
@@ -1925,50 +1071,19 @@ mod linux {
                         let mut map: AyaHashMap<_, SecretAclKey, SecretAclValue> =
                             AyaHashMap::try_from(map_data)?;
                         map.insert(key, value, 0)?;
-
-                        // Populate the per-tool allow-set for restricted secrets.
-                        if restricted {
-                            let tool_map_data =
-                                bpf.map_mut("SECRET_TOOL_ACLS").ok_or_else(|| {
-                                    anyhow::anyhow!("BPF map SECRET_TOOL_ACLS not found")
-                                })?;
-                            let mut tool_map: AyaHashMap<_, SecretToolKey, u8> =
-                                AyaHashMap::try_from(tool_map_data)?;
-                            for tool in &acl.allowed_tools {
-                                let tool_key = SecretToolKey {
-                                    inode,
-                                    dev_major,
-                                    dev_minor,
-                                    cgroup_id,
-                                    tool_id: tool_identity(tool),
-                                };
-                                tool_map.insert(tool_key, 1u8, 0)?;
-                            }
-                            self.restricted_cgroups
-                                .write()
-                                .unwrap()
-                                .insert(cgroup_id, ());
-                        }
-
                         info!(
                             path = %acl.path,
                             inode,
                             ttl = acl.ttl_seconds,
-                            restricted,
-                            allowed_tools = acl.allowed_tools.len(),
                             "added secret ACL to SECRET_ACLS"
                         );
                     }
                     Err(e) => {
-                        // Fail closed: a secret whose inode cannot be resolved
-                        // would be left ungated (file_open default-allow). The
-                        // caller injects secrets before installing ACLs, so the
-                        // file must exist by now; an unresolvable path is a real
-                        // error and must abort the bootstrap, never be skipped.
-                        return Err(e.context(format!(
-                            "resolve secret path inode for ACL {} (container {})",
-                            acl.path, container_id
-                        )));
+                        warn!(
+                            path = %acl.path,
+                            error = %e,
+                            "failed to resolve secret path inode, skipping"
+                        );
                     }
                 }
             }
@@ -1976,23 +1091,173 @@ mod linux {
             Ok(())
         }
 
-        async fn get_stats(&self, container_id: &str) -> anyhow::Result<EnforcementStats> {
-            // Resolve the target cgroups before locking the BPF programs (keeps
-            // the container_cgroups -> programs lock ordering). Per the
-            // PolicyManager::get_stats contract, an empty container_id means
-            // "aggregate across all registered containers" — this is the path
-            // the kernel-primary gate uses to read global LSM status before any
-            // container is registered, so it must NOT error like a lookup miss.
-            let cgroup_ids: Vec<u64> = if container_id.is_empty() {
-                self.container_cgroups
-                    .read()
-                    .unwrap()
-                    .values()
-                    .copied()
-                    .collect()
-            } else {
-                vec![self.lookup_cgroup(container_id)?]
+        async fn apply_deny_set(
+            &self,
+            container_id: &str,
+            policy: &DenySetPolicy,
+        ) -> anyhow::Result<()> {
+            let _cgroup_id = self.lookup_cgroup(container_id)?;
+            info!(
+                container_id,
+                entries = policy.entries.len(),
+                transitions = policy.transitions.len(),
+                init_pid = policy.init_pid,
+                init_deny_set_id = policy.init_deny_set_id,
+                "applying deny-set policy to BPF maps"
+            );
+
+            let mut bpf = self.programs.lock().unwrap();
+
+            // Insert allowed entries into DENY_SET_POLICY map.
+            {
+                let map_data = bpf
+                    .map_mut("DENY_SET_POLICY")
+                    .ok_or_else(|| anyhow::anyhow!("BPF map DENY_SET_POLICY not found"))?;
+                let mut map: AyaHashMap<_, DenySetKey, u8> = AyaHashMap::try_from(map_data)?;
+                for entry in &policy.entries {
+                    let key = DenySetKey {
+                        deny_set_id: entry.deny_set_id,
+                        _pad: 0,
+                        inode: entry.inode,
+                        dev_major: entry.dev_major,
+                        dev_minor: entry.dev_minor,
+                    };
+                    map.insert(key, 1u8, 0)?;
+                    info!(
+                        deny_set_id = entry.deny_set_id,
+                        inode = entry.inode,
+                        "added entry to DENY_SET_POLICY"
+                    );
+                }
+            }
+
+            // Insert transitions into DENY_SET_TRANSITIONS map.
+            {
+                let map_data = bpf
+                    .map_mut("DENY_SET_TRANSITIONS")
+                    .ok_or_else(|| anyhow::anyhow!("BPF map DENY_SET_TRANSITIONS not found"))?;
+                let mut map: AyaHashMap<_, DenySetKey, u32> = AyaHashMap::try_from(map_data)?;
+                for t in &policy.transitions {
+                    let key = DenySetKey {
+                        deny_set_id: t.parent_deny_set_id,
+                        _pad: 0,
+                        inode: t.child_inode,
+                        dev_major: t.child_dev_major,
+                        dev_minor: t.child_dev_minor,
+                    };
+                    map.insert(key, t.child_deny_set_id, 0)?;
+                    info!(
+                        parent_deny_set_id = t.parent_deny_set_id,
+                        child_deny_set_id = t.child_deny_set_id,
+                        "added transition to DENY_SET_TRANSITIONS"
+                    );
+                }
+            }
+
+            // Insert init PID -> deny_set_id into PROC_DENY_SETS map.
+            {
+                let map_data = bpf
+                    .map_mut("PROC_DENY_SETS")
+                    .ok_or_else(|| anyhow::anyhow!("BPF map PROC_DENY_SETS not found"))?;
+                let mut map: AyaHashMap<_, u32, u32> = AyaHashMap::try_from(map_data)?;
+                map.insert(policy.init_pid, policy.init_deny_set_id, 0)?;
+                info!(
+                    init_pid = policy.init_pid,
+                    init_deny_set_id = policy.init_deny_set_id,
+                    "added init PID to PROC_DENY_SETS"
+                );
+            }
+
+            Ok(())
+        }
+
+        async fn update_deny_set(
+            &self,
+            container_id: &str,
+            entry: &ResolvedDenySetEntry,
+        ) -> anyhow::Result<()> {
+            let _cgroup_id = self.lookup_cgroup(container_id)?;
+            info!(
+                container_id,
+                deny_set_id = entry.deny_set_id,
+                inode = entry.inode,
+                "updating single deny-set entry in BPF map"
+            );
+
+            let mut bpf = self.programs.lock().unwrap();
+            let map_data = bpf
+                .map_mut("DENY_SET_POLICY")
+                .ok_or_else(|| anyhow::anyhow!("BPF map DENY_SET_POLICY not found"))?;
+            let mut map: AyaHashMap<_, DenySetKey, u8> = AyaHashMap::try_from(map_data)?;
+            let key = DenySetKey {
+                deny_set_id: entry.deny_set_id,
+                _pad: 0,
+                inode: entry.inode,
+                dev_major: entry.dev_major,
+                dev_minor: entry.dev_minor,
             };
+            map.insert(key, 1u8, 0)?;
+
+            Ok(())
+        }
+
+        async fn apply_bind(&self, container_id: &str, policy: &BindPolicy) -> anyhow::Result<()> {
+            let cgroup_id = self.lookup_cgroup(container_id)?;
+            info!(
+                container_id,
+                cgroup_id,
+                rules = policy.rules.len(),
+                "applying bind policy to BPF maps"
+            );
+
+            let mut bpf = self.programs.lock().unwrap();
+            let map_data = bpf
+                .map_mut("ALLOWED_BINDS")
+                .ok_or_else(|| anyhow::anyhow!("BPF map ALLOWED_BINDS not found"))?;
+            let mut map: AyaHashMap<_, ScopedBindKey, u8> = AyaHashMap::try_from(map_data)?;
+
+            for rule in &policy.rules {
+                let key = ScopedBindKey {
+                    cgroup_id,
+                    port: rule.port,
+                    protocol: rule.protocol,
+                    _pad: 0,
+                };
+                map.insert(key, 1u8, 0)?;
+                info!(
+                    port = rule.port,
+                    protocol = rule.protocol,
+                    "added bind rule to ALLOWED_BINDS"
+                );
+            }
+
+            Ok(())
+        }
+
+        async fn configure_reverse_shell(
+            &self,
+            container_id: &str,
+            config: &ReverseShellConfig,
+        ) -> anyhow::Result<()> {
+            let _cgroup_id = self.lookup_cgroup(container_id)?;
+            info!(
+                container_id,
+                mode = config.mode,
+                "configuring reverse shell detection in BPF"
+            );
+
+            let mut bpf = self.programs.lock().unwrap();
+            let map_data = bpf
+                .map_mut("REVERSE_SHELL_MODE")
+                .ok_or_else(|| anyhow::anyhow!("BPF map REVERSE_SHELL_MODE not found"))?;
+            let mut map: aya::maps::Array<_, u8> = aya::maps::Array::try_from(map_data)?;
+            map.set(0, config.mode, 0)?;
+
+            Ok(())
+        }
+
+        async fn get_stats(&self, container_id: &str) -> anyhow::Result<EnforcementStats> {
+            let cgroup_id = self.lookup_cgroup(container_id)?;
 
             let bpf = self.programs.lock().unwrap();
             let map_data = bpf
@@ -2000,36 +1265,30 @@ mod linux {
                 .ok_or_else(|| anyhow::anyhow!("BPF map CGROUP_STATS not found"))?;
             let map: PerCpuHashMap<_, u64, CgroupStats> = PerCpuHashMap::try_from(map_data)?;
 
-            // Sum counters across the target cgroups and all CPUs.
-            let mut totals = EnforcementStats::default();
-            for cgroup_id in cgroup_ids {
-                match map.get(&cgroup_id, 0) {
-                    Ok(per_cpu_values) => {
-                        for cpu_stats in per_cpu_values.iter() {
-                            totals.network_allowed += cpu_stats.network_allowed;
-                            totals.network_blocked += cpu_stats.network_blocked;
-                            totals.filesystem_allowed += cpu_stats.filesystem_allowed;
-                            totals.filesystem_blocked += cpu_stats.filesystem_blocked;
-                            totals.process_allowed += cpu_stats.process_allowed;
-                            totals.process_blocked += cpu_stats.process_blocked;
-                            totals.credential_allowed += cpu_stats.credential_allowed;
-                            totals.credential_blocked += cpu_stats.credential_blocked;
-                        }
+            match map.get(&cgroup_id, 0) {
+                Ok(per_cpu_values) => {
+                    // Sum counters across all CPUs.
+                    let mut totals = EnforcementStats::default();
+                    for cpu_stats in per_cpu_values.iter() {
+                        totals.network_allowed += cpu_stats.network_allowed;
+                        totals.network_blocked += cpu_stats.network_blocked;
+                        totals.filesystem_allowed += cpu_stats.filesystem_allowed;
+                        totals.filesystem_blocked += cpu_stats.filesystem_blocked;
+                        totals.process_allowed += cpu_stats.process_allowed;
+                        totals.process_blocked += cpu_stats.process_blocked;
+                        totals.credential_allowed += cpu_stats.credential_allowed;
+                        totals.credential_blocked += cpu_stats.credential_blocked;
                     }
-                    // No stats yet for this cgroup (no enforcement decisions made).
-                    Err(aya::maps::MapError::KeyNotFound) => {}
-                    Err(e) => {
-                        return Err(anyhow::anyhow!(
-                            "failed to read CGROUP_STATS for cgroup {cgroup_id}: {e}"
-                        ))
-                    }
+                    Ok(totals)
                 }
+                Err(aya::maps::MapError::KeyNotFound) => {
+                    // No stats yet for this cgroup (no enforcement decisions made).
+                    Ok(EnforcementStats::default())
+                }
+                Err(e) => Err(anyhow::anyhow!(
+                    "failed to read CGROUP_STATS for cgroup {cgroup_id}: {e}"
+                )),
             }
-            Ok(totals)
-        }
-
-        fn lsm_status(&self) -> LsmStatus {
-            self.lsm_status.clone()
         }
 
         async fn subscribe_events(
@@ -2037,137 +1296,6 @@ mod linux {
             container_id: &str,
         ) -> anyhow::Result<tokio::sync::mpsc::Receiver<EnforcementEvent>> {
             Ok(self.event_bus.subscribe(container_id))
-        }
-
-        async fn prepare_tool_call(
-            &self,
-            container_id: &str,
-            correlation_id: &str,
-            tool_name: &str,
-            transient_egress: &[EgressRule],
-            window_timeout_ms: u64,
-        ) -> anyhow::Result<()> {
-            let cgroup_id = self.lookup_cgroup(container_id)?;
-
-            // Correlation window (event attribution) — applies to every call.
-            open_tool_window(
-                &self.correlations,
-                cgroup_id,
-                correlation_id,
-                monotonic_ns(),
-            );
-
-            // G4: URI-scoped transient egress. Resolve target hosts up front
-            // (async DNS — must not be held across the state/map locks), record
-            // the window, then reconcile the BPF maps to the windows' union. The
-            // connect hooks allow these targets only while unexpired; the expiry
-            // bounds a lost CompleteToolCall (parity with ACTIVE_TOOL), and the
-            // background resolver re-resolves the hosts within the window.
-            if !transient_egress.is_empty() {
-                let ttl_ns = if window_timeout_ms > 0 {
-                    window_timeout_ms.saturating_mul(1_000_000)
-                } else {
-                    TRANSIENT_EGRESS_DEFAULT_TTL_NS
-                };
-                let expires_at_ns = monotonic_ns().saturating_add(ttl_ns);
-                let (keys_v4, keys_v6) = resolve_transient_keys(transient_egress, cgroup_id).await;
-
-                let mut state = self.transient.write().unwrap();
-                state.windows.insert(
-                    correlation_id.to_string(),
-                    TransientWindow {
-                        rules: transient_egress.to_vec(),
-                        cgroup_id,
-                        expires_at_ns,
-                        keys_v4,
-                        keys_v6,
-                    },
-                );
-                reconcile(&mut state, &self.transient_v4, &self.transient_v6)?;
-            }
-
-            // Per-tool secret enforcement only applies to cgroups that hold a
-            // restricted secret. For those, serialize tool calls (one active
-            // tool at a time) and publish the active tool identity for file_open.
-            if self
-                .restricted_cgroups
-                .read()
-                .unwrap()
-                .contains_key(&cgroup_id)
-            {
-                let mut bpf = self.programs.lock().unwrap();
-                let map_data = bpf
-                    .map_mut("ACTIVE_TOOL")
-                    .ok_or_else(|| anyhow::anyhow!("BPF map ACTIVE_TOOL not found"))?;
-                let mut map: AyaHashMap<_, u64, ActiveTool> = AyaHashMap::try_from(map_data)?;
-                // Reject overlapping calls on a restricted container: an active
-                // tool window must close before the next opens. Holding the
-                // programs lock makes this check-and-set atomic against a
-                // concurrent prepare/complete. An expired entry (a lost
-                // CompleteToolCall) is treated as closed and may be replaced.
-                if let Ok(existing) = map.get(&cgroup_id, 0) {
-                    if existing.expires_at_ns == 0 || monotonic_ns() <= existing.expires_at_ns {
-                        return Err(anyhow::anyhow!(
-                            "overlapping tool call on restricted container {container_id}: a tool call is already active"
-                        ));
-                    }
-                }
-                let active = ActiveTool {
-                    tool_id: tool_identity(tool_name),
-                    expires_at_ns: monotonic_ns() + ACTIVE_TOOL_TTL_NS,
-                };
-                map.insert(cgroup_id, active, 0)?;
-            }
-            Ok(())
-        }
-
-        async fn complete_tool_call(
-            &self,
-            container_id: &str,
-            correlation_id: &str,
-        ) -> anyhow::Result<()> {
-            let cgroup_id = self.lookup_cgroup(container_id)?;
-
-            // Clear the active tool window first, so the secret becomes
-            // inaccessible again even if the correlation bookkeeping below logs
-            // a miss. Removing an absent key is not an error.
-            if self
-                .restricted_cgroups
-                .read()
-                .unwrap()
-                .contains_key(&cgroup_id)
-            {
-                let mut bpf = self.programs.lock().unwrap();
-                if let Some(map_data) = bpf.map_mut("ACTIVE_TOOL") {
-                    let mut map: AyaHashMap<_, u64, ActiveTool> = AyaHashMap::try_from(map_data)?;
-                    let _ = map.remove(&cgroup_id);
-                }
-            }
-
-            // G4: drop this correlation's window and reconcile — the keys it
-            // contributed are removed from the BPF maps unless another in-flight
-            // window still references them (overlap-safe). The kernel-side expiry
-            // already bounds a missed Complete; this makes the clean path precise.
-            {
-                let mut state = self.transient.write().unwrap();
-                if state.windows.remove(correlation_id).is_some() {
-                    reconcile(&mut state, &self.transient_v4, &self.transient_v6)?;
-                }
-            }
-
-            if !close_tool_window(
-                &self.correlations,
-                cgroup_id,
-                correlation_id,
-                monotonic_ns(),
-            ) {
-                warn!(
-                    container_id,
-                    correlation_id,
-                    "CompleteToolCall matched no open window (already completed, expired past the horizon, or never prepared)"
-                );
-            }
-            Ok(())
         }
     }
 
@@ -2182,146 +1310,6 @@ mod linux {
                 .ok_or_else(|| {
                     anyhow::anyhow!("container {container_id} not registered — call register first")
                 })
-        }
-
-        /// Test/diagnostic helper: report whether a cgroup has exec-allowlist
-        /// (bprm_check) enforcement active — the EXEC flag bit in
-        /// ENFORCED_CGROUPS. Set only after a non-empty exec allowlist is
-        /// applied; false for a registered cgroup with no/empty allowlist.
-        pub fn exec_enforced(&self, cgroup_id: u64) -> bool {
-            let bpf = self.programs.lock().unwrap();
-            if let Some(map) = bpf.map("ENFORCED_CGROUPS") {
-                if let Ok(map) = AyaHashMap::<_, u64, u8>::try_from(map) {
-                    if let Ok(flags) = map.get(&cgroup_id, 0) {
-                        return flags & CGROUP_FLAG_EXEC_ENFORCED != 0;
-                    }
-                }
-            }
-            false
-        }
-
-        /// Test/diagnostic helper: count the URI-scoped transient egress
-        /// entries (G4) currently installed for a cgroup in TRANSIENT_PORTS.
-        /// Used to assert the prepare/complete window lifecycle.
-        pub fn transient_egress_count(&self, cgroup_id: u64) -> usize {
-            self.transient_v4
-                .lock()
-                .unwrap()
-                .keys()
-                .filter_map(|k| k.ok())
-                .filter(|k| k.cgroup_id == cgroup_id)
-                .count()
-        }
-
-        /// Test/diagnostic helper: count the IPv6 transient egress entries (G4)
-        /// installed for a cgroup in TRANSIENT_PORTS_V6.
-        pub fn transient_egress_v6_count(&self, cgroup_id: u64) -> usize {
-            self.transient_v6
-                .lock()
-                .unwrap()
-                .keys()
-                .filter_map(|k| k.ok())
-                .filter(|k| k.cgroup_id == cgroup_id)
-                .count()
-        }
-
-        /// Background loop: periodically re-resolve the hosts of every in-flight
-        /// transient-egress window and reconcile the BPF maps, so DNS rotation /
-        /// CDN churn within a window keeps the allowed IPs current. Also GCs
-        /// windows past their expiry (a lost CompleteToolCall), bounding the
-        /// userspace book-keeping. Runs on its own thread + runtime (mirrors
-        /// spawn_event_readers) and holds only the transient state + map handles,
-        /// so it never pins the BPF programs; it exits when `transient_shutdown`
-        /// is set (on Drop).
-        fn spawn_transient_resolver(&self) {
-            let transient = self.transient.clone();
-            let map_v4 = self.transient_v4.clone();
-            let map_v6 = self.transient_v6.clone();
-            let shutdown = self.transient_shutdown.clone();
-
-            let _ = std::thread::Builder::new()
-                .name("transient-resolver".into())
-                .spawn(move || {
-                    let rt = match tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                    {
-                        Ok(rt) => rt,
-                        Err(e) => {
-                            warn!(error = %e, "transient resolver runtime failed to start");
-                            return;
-                        }
-                    };
-                    rt.block_on(async move {
-                        let mut ticks: u32 = 0;
-                        loop {
-                            tokio::time::sleep(TRANSIENT_TICK).await;
-                            if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-                                return;
-                            }
-                            ticks = ticks.wrapping_add(1);
-                            if !ticks.is_multiple_of(TRANSIENT_RESOLVE_EVERY) {
-                                continue;
-                            }
-
-                            // Snapshot active windows (and find expired ones) under a
-                            // read lock, then resolve OUTSIDE any lock.
-                            let now = monotonic_ns();
-                            let (active, expired) = {
-                                let st = transient.read().unwrap();
-                                // (correlation_id, cgroup_id, rules) per active window.
-                                let mut active: Vec<(String, u64, Vec<EgressRule>)> = Vec::new();
-                                let mut expired: Vec<String> = Vec::new();
-                                for (cid, w) in st.windows.iter() {
-                                    if w.expires_at_ns != 0 && now > w.expires_at_ns {
-                                        expired.push(cid.clone());
-                                    } else {
-                                        active.push((cid.clone(), w.cgroup_id, w.rules.clone()));
-                                    }
-                                }
-                                (active, expired)
-                            };
-                            if active.is_empty() && expired.is_empty() {
-                                continue;
-                            }
-
-                            let mut refreshed: HashMap<String, (Vec<PortKeyV4>, Vec<PortKeyV6>)> =
-                                HashMap::new();
-                            for (cid, cgid, rules) in &active {
-                                refreshed.insert(
-                                    cid.clone(),
-                                    resolve_transient_keys(rules, *cgid).await,
-                                );
-                            }
-
-                            // Apply: drop expired windows, refresh still-present
-                            // windows' keys, reconcile. A window completed between
-                            // snapshot and now is simply absent — skip it.
-                            let mut st = transient.write().unwrap();
-                            for cid in &expired {
-                                st.windows.remove(cid);
-                            }
-                            for (cid, keys) in refreshed {
-                                if let Some(w) = st.windows.get_mut(&cid) {
-                                    w.keys_v4 = keys.0;
-                                    w.keys_v6 = keys.1;
-                                }
-                            }
-                            if let Err(e) = reconcile(&mut st, &map_v4, &map_v6) {
-                                warn!(error = %e, "transient resolver reconcile failed");
-                            }
-                        }
-                    });
-                });
-        }
-    }
-
-    impl Drop for BpfPolicyManager {
-        fn drop(&mut self) {
-            // Signal the background resolver to stop; it checks each tick and
-            // exits within TRANSIENT_TICK, releasing its map-handle clones.
-            self.transient_shutdown
-                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -2345,7 +1333,6 @@ mod stub {
         event_bus: EventBus,
         container_cgroups: RwLock<HashMap<String, u64>>,
         next_fake_id: RwLock<u64>,
-        correlations: CorrelationWindows,
     }
 
     impl BpfPolicyManager {
@@ -2359,7 +1346,6 @@ mod stub {
                 event_bus: EventBus::new(),
                 container_cgroups: RwLock::new(HashMap::new()),
                 next_fake_id: RwLock::new(1),
-                correlations: std::sync::Arc::new(RwLock::new(HashMap::new())),
             })
         }
     }
@@ -2370,7 +1356,7 @@ mod stub {
             &self,
             container_id: &str,
             cgroup_path: &str,
-            _init_pid: u32,
+            init_pid: u32,
         ) -> anyhow::Result<ContainerHandle> {
             let cgroup_id = {
                 let mut id = self.next_fake_id.write().unwrap();
@@ -2380,7 +1366,10 @@ mod stub {
             };
             warn!(
                 container_id,
-                cgroup_path, cgroup_id, "stub: register is a no-op (no BPF on this platform)"
+                cgroup_path,
+                cgroup_id,
+                init_pid,
+                "stub: register is a no-op (no BPF on this platform)"
             );
 
             self.registry
@@ -2402,7 +1391,6 @@ mod stub {
             let cgroup_id = self.container_cgroups.write().unwrap().remove(container_id);
             if let Some(cgroup_id) = cgroup_id {
                 self.registry.unregister_container(cgroup_id).await;
-                self.correlations.write().unwrap().remove(&cgroup_id);
             }
             Ok(())
         }
@@ -2411,14 +1399,14 @@ mod stub {
             &self,
             container_id: &str,
             policy: &NetworkPolicy,
-        ) -> anyhow::Result<crate::policy::NetworkApplyReport> {
+        ) -> anyhow::Result<()> {
             warn!(
                 container_id,
                 hosts = ?policy.allowed_hosts,
                 rules = policy.egress_rules.len(),
                 "stub: apply_network is a no-op"
             );
-            Ok(crate::policy::NetworkApplyReport::default())
+            Ok(())
         }
 
         async fn apply_filesystem(
@@ -2462,6 +1450,55 @@ mod stub {
             Ok(())
         }
 
+        async fn apply_deny_set(
+            &self,
+            container_id: &str,
+            policy: &DenySetPolicy,
+        ) -> anyhow::Result<()> {
+            warn!(
+                container_id,
+                entries = policy.entries.len(),
+                transitions = policy.transitions.len(),
+                "stub: apply_deny_set is a no-op"
+            );
+            Ok(())
+        }
+
+        async fn update_deny_set(
+            &self,
+            container_id: &str,
+            entry: &ResolvedDenySetEntry,
+        ) -> anyhow::Result<()> {
+            warn!(
+                container_id,
+                deny_set_id = entry.deny_set_id,
+                "stub: update_deny_set is a no-op"
+            );
+            Ok(())
+        }
+
+        async fn apply_bind(&self, container_id: &str, policy: &BindPolicy) -> anyhow::Result<()> {
+            warn!(
+                container_id,
+                rules = policy.rules.len(),
+                "stub: apply_bind is a no-op"
+            );
+            Ok(())
+        }
+
+        async fn configure_reverse_shell(
+            &self,
+            container_id: &str,
+            config: &ReverseShellConfig,
+        ) -> anyhow::Result<()> {
+            warn!(
+                container_id,
+                mode = config.mode,
+                "stub: configure_reverse_shell is a no-op"
+            );
+            Ok(())
+        }
+
         async fn get_stats(&self, _container_id: &str) -> anyhow::Result<EnforcementStats> {
             Ok(EnforcementStats::default())
         }
@@ -2471,45 +1508,6 @@ mod stub {
             container_id: &str,
         ) -> anyhow::Result<tokio::sync::mpsc::Receiver<EnforcementEvent>> {
             Ok(self.event_bus.subscribe(container_id))
-        }
-
-        async fn prepare_tool_call(
-            &self,
-            container_id: &str,
-            correlation_id: &str,
-            _tool_name: &str,
-            _transient_egress: &[EgressRule],
-            _window_timeout_ms: u64,
-        ) -> anyhow::Result<()> {
-            let cgroup_id = self.lookup_cgroup(container_id)?;
-            open_tool_window(
-                &self.correlations,
-                cgroup_id,
-                correlation_id,
-                monotonic_ns(),
-            );
-            Ok(())
-        }
-
-        async fn complete_tool_call(
-            &self,
-            container_id: &str,
-            correlation_id: &str,
-        ) -> anyhow::Result<()> {
-            let cgroup_id = self.lookup_cgroup(container_id)?;
-            if !close_tool_window(
-                &self.correlations,
-                cgroup_id,
-                correlation_id,
-                monotonic_ns(),
-            ) {
-                warn!(
-                    container_id,
-                    correlation_id,
-                    "CompleteToolCall matched no open window (already completed, expired past the horizon, or never prepared)"
-                );
-            }
-            Ok(())
         }
     }
 }
@@ -2527,156 +1525,17 @@ pub use stub::BpfPolicyManager;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::events::parse_network_event;
     use crate::policy::PolicyManager;
-
-    fn test_event(cgroup_id: u64, timestamp_ns: u64) -> EnforcementEvent {
-        EnforcementEvent {
-            timestamp_ns,
-            cgroup_id,
-            correlation_id: String::new(),
-            container_id: "ctr-1".into(),
-            domain: crate::policy::EventDomain::Process,
-            verdict: crate::policy::EventVerdict::Allow,
-            pid: 1,
-            comm: "find".into(),
-            details: HashMap::new(),
-        }
-    }
-
-    fn new_windows() -> CorrelationWindows {
-        std::sync::Arc::new(RwLock::new(HashMap::new()))
-    }
-
-    fn correlate(windows: &CorrelationWindows, cgroup_id: u64, ts: u64) -> String {
-        let mut ev = test_event(cgroup_id, ts);
-        assign_correlation(&mut ev, windows);
-        ev.correlation_id
-    }
-
-    #[test]
-    fn test_window_open_matches_during_call() {
-        let w = new_windows();
-        open_tool_window(&w, 7, "call-1", 1_000);
-        assert_eq!(correlate(&w, 7, 1_500), "call-1");
-        // Different cgroup never matches.
-        assert_eq!(correlate(&w, 8, 1_500), "");
-        // Before the window opened: no match.
-        assert_eq!(correlate(&w, 7, 500), "");
-    }
-
-    #[test]
-    fn test_window_closed_matches_late_drain_within_retention() {
-        let w = new_windows();
-        open_tool_window(&w, 7, "call-1", 1_000);
-        assert!(close_tool_window(&w, 7, "call-1", 2_000));
-        // Event generated during the call but drained after Complete still
-        // correlates by kernel timestamp (SPEC §3.3).
-        assert_eq!(correlate(&w, 7, 1_500), "call-1");
-        // Event after Complete: outside the window, no correlation.
-        assert_eq!(correlate(&w, 7, 2_500), "");
-    }
-
-    #[test]
-    fn test_window_gap_between_calls_is_uncorrelated() {
-        let w = new_windows();
-        open_tool_window(&w, 7, "call-1", 1_000);
-        assert!(close_tool_window(&w, 7, "call-1", 2_000));
-        open_tool_window(&w, 7, "call-2", 5_000);
-        // Background activity between Complete(1) and Prepare(2) belongs to
-        // neither call.
-        assert_eq!(correlate(&w, 7, 3_000), "");
-        assert_eq!(correlate(&w, 7, 5_500), "call-2");
-        assert_eq!(correlate(&w, 7, 1_500), "call-1");
-    }
-
-    #[test]
-    fn test_window_lost_complete_bounded_by_horizon() {
-        let w = new_windows();
-        open_tool_window(&w, 7, "call-1", 1_000);
-        // CompleteToolCall never arrives. Events within the horizon still
-        // correlate...
-        assert_eq!(correlate(&w, 7, 1_000 + OPEN_WINDOW_HORIZON_NS), "call-1");
-        // ...but the window must not claim the rest of the session.
-        assert_eq!(correlate(&w, 7, 1_001 + OPEN_WINDOW_HORIZON_NS), "");
-    }
-
-    #[test]
-    fn test_window_prune_drops_dead_windows() {
-        let w = new_windows();
-        for i in 0..100u64 {
-            open_tool_window(&w, 7, &format!("call-{i}"), 1_000 + i);
-            assert!(close_tool_window(&w, 7, &format!("call-{i}"), 2_000 + i));
-        }
-        // A prepare long after retention prunes all the closed windows.
-        let later = 2_099 + CLOSED_WINDOW_RETENTION_NS;
-        open_tool_window(&w, 7, "fresh", later);
-        assert_eq!(w.read().unwrap().get(&7).unwrap().len(), 1);
-
-        // An abandoned open window is pruned once past the horizon.
-        let much_later = later + OPEN_WINDOW_HORIZON_NS;
-        open_tool_window(&w, 7, "fresher", much_later);
-        let items: Vec<String> = w
-            .read()
-            .unwrap()
-            .get(&7)
-            .unwrap()
-            .iter()
-            .map(|x| x.correlation_id.clone())
-            .collect();
-        assert_eq!(items, vec!["fresher".to_string()]);
-    }
-
-    #[test]
-    fn test_window_close_unknown_correlation_reports_mismatch() {
-        let w = new_windows();
-        open_tool_window(&w, 7, "call-1", 1_000);
-        assert!(!close_tool_window(&w, 7, "ghost", 2_000));
-        assert!(!close_tool_window(&w, 99, "call-1", 2_000));
-        // Double-complete is a mismatch too.
-        assert!(close_tool_window(&w, 7, "call-1", 2_000));
-        assert!(!close_tool_window(&w, 7, "call-1", 2_100));
-    }
-
-    #[test]
-    fn test_window_overlapping_calls_newest_first() {
-        let w = new_windows();
-        open_tool_window(&w, 7, "call-1", 1_000);
-        open_tool_window(&w, 7, "call-2", 2_000);
-        // In the overlap, the most recent window wins (maxConcurrentTools>1
-        // ambiguity is resolved deterministically).
-        assert_eq!(correlate(&w, 7, 2_500), "call-2");
-        // Before call-2 opened, only call-1 can match.
-        assert_eq!(correlate(&w, 7, 1_500), "call-1");
-    }
-
-    /// The userspace st_dev decode and the BPF-side s_dev decode
-    /// (lsm/file_open.rs, lsm/bprm_check.rs: `(s_dev >> 20) & 0xfff`,
-    /// `s_dev & 0xfffff`) must reduce to the same (major, minor) for the
-    /// same device, or FsInodeKey/SecretAclKey lookups never match.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn test_decode_dev_matches_kernel_side() {
-        // Includes minors > 0xff and majors > 0xff to exercise glibc's
-        // split encoding — exactly where the old legacy decode broke.
-        for &(major, minor) in &[
-            (8u32, 1u32),
-            (253, 3),
-            (259, 0x1234),
-            (0, 38),
-            (4095, 0xfffff),
-        ] {
-            // Userspace view: glibc-encoded stat.st_dev.
-            let st_dev = libc::makedev(major, minor);
-            let user = decode_dev(st_dev);
-
-            // Kernel view: sb->s_dev (MKDEV layout), decoded as the BPF
-            // hooks do.
-            let s_dev: u32 = (major << 20) | minor;
-            let kernel = ((s_dev >> 20) & 0xfff, s_dev & 0xfffff);
-
-            assert_eq!(user, kernel, "major={major} minor={minor}");
-        }
-    }
+    #[cfg(unix)]
+    use crate::policy::{EventDomain, EventVerdict};
+    #[cfg(unix)]
+    use agentcontainer_common::events::{EventType, NetworkEvent, Verdict, COMM_MAX};
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    #[cfg(unix)]
+    use tempfile::tempdir;
 
     #[cfg(not(target_os = "linux"))]
     #[tokio::test]
@@ -2771,92 +1630,86 @@ mod tests {
         // Receiver is valid; no events will come from stub.
     }
 
-    // --- PendingEvents: deferred correlation assignment (#prepare-race) ---
+    #[cfg(unix)]
+    fn sample_network_event(pid: u32) -> NetworkEvent {
+        let mut comm = [0u8; COMM_MAX];
+        comm[..4].copy_from_slice(b"curl");
 
-    #[test]
-    fn test_pending_events_due_only_after_delay() {
-        let mut p = PendingEvents::default();
-        p.park(test_event(7, 1_000), 1_000);
-        // Not due before the delay elapses.
-        assert!(p
-            .take_due(1_000 + CORRELATION_ASSIGN_DELAY_NS - 1)
-            .is_empty());
-        // Due exactly at the boundary; drain order preserved.
-        p.park(test_event(7, 2_000), 2_000);
-        let due = p.take_due(1_000 + CORRELATION_ASSIGN_DELAY_NS);
-        assert_eq!(due.len(), 1);
-        assert_eq!(due[0].timestamp_ns, 1_000);
-        assert_eq!(p.next_due_ns(), Some(2_000 + CORRELATION_ASSIGN_DELAY_NS));
+        NetworkEvent {
+            timestamp_ns: 1_000,
+            pid,
+            uid: 1000,
+            event_type: EventType::NetworkConnect as u32,
+            verdict: Verdict::Block as u32,
+            dst_ip4: 0x0a000001,
+            dst_ip6: [0; 4],
+            dst_port: 443,
+            protocol: 6,
+            ip_version: 4,
+            comm,
+        }
     }
 
-    #[test]
-    fn test_pending_events_take_all_flushes_regardless_of_due() {
-        let mut p = PendingEvents::default();
-        p.park(test_event(7, 1_000), 1_000);
-        p.park(test_event(7, 2_000), 2_000);
-        let all = p.take_all();
-        assert_eq!(all.len(), 2, "shutdown flush must not drop parked events");
-        assert!(p.next_due_ns().is_none());
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_pid_resolved_event_reaches_filtered_subscriber() {
+        let tmp = tempdir().unwrap();
+        let proc_root = tmp.path().join("proc");
+        let cgroup_root = tmp.path().join("sys/fs/cgroup");
+        let pid = 4242u32;
+
+        let proc_pid_dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(&proc_pid_dir).unwrap();
+
+        let cgroup_dir = cgroup_root.join("agentcontainer/test.scope");
+        std::fs::create_dir_all(&cgroup_dir).unwrap();
+        std::fs::write(
+            proc_pid_dir.join("cgroup"),
+            "0::/agentcontainer/test.scope\n",
+        )
+        .unwrap();
+
+        let registry = ContainerRegistry::new();
+        let cgroup_id = std::fs::metadata(&cgroup_dir).unwrap().ino();
+        registry.register_container(cgroup_id, "ctr-a".into()).await;
+
+        let raw = sample_network_event(pid);
+        let data = unsafe {
+            std::slice::from_raw_parts(
+                (&raw as *const NetworkEvent).cast::<u8>(),
+                std::mem::size_of::<NetworkEvent>(),
+            )
+        };
+        let resolved_pid = read_event_pid(data).unwrap();
+        let container_id = registry
+            .lookup(
+                resolve_cgroup_id_for_pid_with_roots(resolved_pid, &proc_root, &cgroup_root)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe("ctr-a");
+        bus.publish(parse_network_event(&raw, &container_id));
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(event.container_id, "ctr-a");
+        assert_eq!(event.domain, EventDomain::Network);
+        assert_eq!(event.verdict, EventVerdict::Block);
     }
 
-    /// The prepare-side race end-to-end at the logic level: an event drained
-    /// BEFORE its PrepareToolCall window is recorded must still correlate,
-    /// because assignment happens only after the park delay — by which time
-    /// the window exists and the kernel timestamp matches it.
+    #[cfg(unix)]
     #[test]
-    fn test_parked_event_correlates_with_window_recorded_after_drain() {
-        let w = new_windows();
-        let mut p = PendingEvents::default();
-
-        // t=1_000: kernel event generated and immediately drained — its
-        // window is not recorded yet (Prepare is mid-flight).
-        p.park(test_event(7, 1_000), 1_000);
-
-        // t=1_050: PrepareToolCall lands, window start backdates to 990
-        // (its timestamp was captured before the insert).
-        open_tool_window(&w, 7, "call-1", 990);
-
-        // Assignment at due time finds the window.
-        let mut due = p.take_due(1_000 + CORRELATION_ASSIGN_DELAY_NS);
-        assert_eq!(due.len(), 1);
-        assign_correlation(&mut due[0], &w);
-        assert_eq!(due[0].correlation_id, "call-1");
-    }
-
-    #[test]
-    fn path_candidates_preserves_order_and_skips_relative() {
-        let got = path_candidates("/usr/bin:rel:/bin:", "ls");
-        assert_eq!(got, vec!["/usr/bin/ls".to_string(), "/bin/ls".to_string()]);
-    }
-
-    #[test]
-    fn path_candidates_trims_trailing_slash() {
-        assert_eq!(path_candidates("/bin/", "sh"), vec!["/bin/sh".to_string()]);
-    }
-
-    #[test]
-    fn parse_shebang_extracts_absolute_interpreter() {
+    fn test_parse_proc_cgroup_relative_path_prefers_unified_hierarchy() {
+        let contents = "12:cpuset:/ignored\n0::/agentcontainer/test.scope\n";
         assert_eq!(
-            parse_shebang_interpreter(b"#!/bin/sh\necho hi\n"),
-            Some("/bin/sh".to_string())
+            parse_proc_cgroup_relative_path(contents),
+            Some("/agentcontainer/test.scope")
         );
-        // Interpreter with an argument: only the interpreter path is taken.
-        assert_eq!(
-            parse_shebang_interpreter(b"#!/usr/bin/env python3\n"),
-            Some("/usr/bin/env".to_string())
-        );
-        // Leading spaces after #! are tolerated.
-        assert_eq!(
-            parse_shebang_interpreter(b"#!  /bin/bash\n"),
-            Some("/bin/bash".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_shebang_rejects_non_scripts_and_relative() {
-        assert_eq!(parse_shebang_interpreter(b"\x7fELF......"), None);
-        assert_eq!(parse_shebang_interpreter(b"#!sh\n"), None); // relative
-        assert_eq!(parse_shebang_interpreter(b"#!\n"), None); // empty
-        assert_eq!(parse_shebang_interpreter(b""), None);
     }
 }

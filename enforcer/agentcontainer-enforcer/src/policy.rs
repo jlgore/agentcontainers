@@ -13,7 +13,9 @@ use tonic::async_trait;
 
 // Re-export policy data types from agentcontainer-common (the single source of truth).
 pub use agentcontainer_common::policy::{
-    CredentialPolicy, EgressRule, FilesystemPolicy, NetworkPolicy, ProcessPolicy, SecretAcl,
+    BindPolicy, BindRule, CredentialPolicy, DenySetPolicy, EgressRule, FilesystemPolicy,
+    NetworkPolicy, ProcessPolicy, ResolvedDenySetEntry, ResolvedDenySetTransition,
+    ReverseShellConfig, SecretAcl,
 };
 
 /// Per-container enforcement context returned by [`PolicyManager::register`].
@@ -21,37 +23,6 @@ pub use agentcontainer_common::policy::{
 pub struct ContainerHandle {
     pub container_id: String,
     pub cgroup_id: u64,
-}
-
-/// Parse a CIDR string (`"10.0.0.0/8"`, `"fd00:ec2::254/128"`) or a bare IP
-/// (treated as a host route: /32 or /128) into address + prefix length.
-/// Returns `None` for anything malformed — callers warn-and-skip so one bad
-/// entry cannot abort policy application.
-pub fn parse_cidr(s: &str) -> Option<(std::net::IpAddr, u8)> {
-    let (addr_str, prefix_str) = match s.split_once('/') {
-        Some((a, p)) => (a, Some(p)),
-        None => (s, None),
-    };
-    let addr: std::net::IpAddr = addr_str.trim().parse().ok()?;
-    let max = if addr.is_ipv4() { 32 } else { 128 };
-    let prefix = match prefix_str {
-        Some(p) => p.trim().parse::<u8>().ok()?,
-        None => max,
-    };
-    if prefix > max {
-        return None;
-    }
-    Some((addr, prefix))
-}
-
-/// Outcome of a network policy application. `unresolved_hosts` lists policy
-/// hosts whose DNS resolution failed: no allow entries were installed for
-/// them, so the policy applied PARTIALLY — narrower than declared, never
-/// wider. Callers (the proxy) decide whether to warn, retry, or abort;
-/// swallowing the partiality here left them unable to tell.
-#[derive(Debug, Clone, Default)]
-pub struct NetworkApplyReport {
-    pub unresolved_hosts: Vec<String>,
 }
 
 /// Enforcement statistics for a container.
@@ -67,26 +38,10 @@ pub struct EnforcementStats {
     pub credential_blocked: u64,
 }
 
-/// Whether the kernel BPF LSM hooks (file_open, bprm_check) are actually
-/// attached. Network/cgroup hooks can attach on kernels that lack BPF LSM, so
-/// the enforcer can look healthy while filesystem deny-list and exec
-/// enforcement are silently inactive. On Docker Engine — where the eBPF LSM is
-/// the primary containment boundary — callers refuse to run unenforced
-/// containers when `active` is false. `detail` carries the reason for the
-/// negative case (e.g. CONFIG_BPF_LSM missing, or "bpf" absent from the kernel
-/// lsm= ordering).
-#[derive(Debug, Clone)]
-pub struct LsmStatus {
-    pub active: bool,
-    pub detail: String,
-}
-
 /// Enforcement event emitted from BPF ring buffers.
 #[derive(Debug, Clone)]
 pub struct EnforcementEvent {
     pub timestamp_ns: u64,
-    pub cgroup_id: u64,
-    pub correlation_id: String,
     pub container_id: String,
     pub domain: EventDomain,
     pub verdict: EventVerdict,
@@ -101,9 +56,9 @@ pub enum EventDomain {
     Filesystem,
     Process,
     Credential,
-    /// Synthetic marker about the event stream itself (e.g. a backpressure
-    /// gap on the event bus) — not a kernel enforcement event.
-    Stream,
+    Bind,
+    ReverseShell,
+    Memfd,
 }
 
 impl EventDomain {
@@ -113,7 +68,9 @@ impl EventDomain {
             Self::Filesystem => "filesystem",
             Self::Process => "process",
             Self::Credential => "credential",
-            Self::Stream => "stream",
+            Self::Bind => "bind",
+            Self::ReverseShell => "reverse_shell",
+            Self::Memfd => "memfd",
         }
     }
 }
@@ -143,12 +100,9 @@ pub trait PolicyManager: Send + Sync + 'static {
     /// Register a container for enforcement. Resolves the cgroup path to an ID
     /// and inserts it into the ENFORCED_CGROUPS map.
     ///
-    /// `init_pid` is the container's init process PID; when non-zero,
-    /// filesystem/process/credential policy paths are resolved through
-    /// `/proc/<init_pid>/root` (the container's mount namespace) so the
-    /// pinned inodes are the ones its LSM hooks actually observe. Zero
-    /// falls back to resolving in the enforcer's own namespace (host-side
-    /// callers).
+    /// `init_pid`, when non-zero, seeds the process-tree sticky map
+    /// (`PROC_ENFORCED`) so descendants stay governed even if they migrate to
+    /// sibling/non-ancestor cgroups (cron, systemd scopes, etc.).
     async fn register(
         &self,
         container_id: &str,
@@ -159,13 +113,9 @@ pub trait PolicyManager: Send + Sync + 'static {
     /// Unregister a container. Removes all map entries for this cgroup.
     async fn unregister(&self, container_id: &str) -> anyhow::Result<()>;
 
-    /// Apply network enforcement policy for a container. The report carries
-    /// hosts that failed DNS resolution (partial application).
-    async fn apply_network(
-        &self,
-        container_id: &str,
-        policy: &NetworkPolicy,
-    ) -> anyhow::Result<NetworkApplyReport>;
+    /// Apply network enforcement policy for a container.
+    async fn apply_network(&self, container_id: &str, policy: &NetworkPolicy)
+        -> anyhow::Result<()>;
 
     /// Apply filesystem enforcement policy for a container.
     async fn apply_filesystem(
@@ -185,20 +135,32 @@ pub trait PolicyManager: Send + Sync + 'static {
         policy: &CredentialPolicy,
     ) -> anyhow::Result<()>;
 
+    /// Apply deny-set process-tree policy for a container.
+    async fn apply_deny_set(
+        &self,
+        container_id: &str,
+        policy: &DenySetPolicy,
+    ) -> anyhow::Result<()>;
+
+    /// Update a single deny-set entry (add one binary to an existing set).
+    async fn update_deny_set(
+        &self,
+        container_id: &str,
+        entry: &ResolvedDenySetEntry,
+    ) -> anyhow::Result<()>;
+
+    /// Apply bind (listen) policy for a container.
+    async fn apply_bind(&self, container_id: &str, policy: &BindPolicy) -> anyhow::Result<()>;
+
+    /// Configure reverse shell detection mode for a container.
+    async fn configure_reverse_shell(
+        &self,
+        container_id: &str,
+        config: &ReverseShellConfig,
+    ) -> anyhow::Result<()>;
+
     /// Get enforcement stats for a container (empty string = aggregate).
     async fn get_stats(&self, container_id: &str) -> anyhow::Result<EnforcementStats>;
-
-    /// Report whether the kernel BPF LSM hooks are attached. Manager-global, not
-    /// per-container. The default is inactive — stub/non-Linux managers have no
-    /// kernel LSM enforcement; the real Linux manager overrides this with the
-    /// result captured at program-attach time.
-    fn lsm_status(&self) -> LsmStatus {
-        LsmStatus {
-            active: false,
-            detail: "kernel BPF LSM enforcement unavailable (no Linux BPF policy manager)"
-                .to_string(),
-        }
-    }
 
     /// Subscribe to enforcement events. Returns a receiver that yields events
     /// for the given container (empty string = all containers).
@@ -206,27 +168,6 @@ pub trait PolicyManager: Send + Sync + 'static {
         &self,
         container_id: &str,
     ) -> anyhow::Result<tokio::sync::mpsc::Receiver<EnforcementEvent>>;
-
-    /// Mark the start of a proxied MCP tool call for event correlation, and
-    /// optionally open URI-scoped transient egress (G4): the `transient_egress`
-    /// host:port targets are allowed at the kernel for the duration of this
-    /// tool-call window, removed on `complete_tool_call` or after
-    /// `window_timeout_ms` (0 = enforcer default horizon).
-    async fn prepare_tool_call(
-        &self,
-        container_id: &str,
-        correlation_id: &str,
-        tool_name: &str,
-        transient_egress: &[EgressRule],
-        window_timeout_ms: u64,
-    ) -> anyhow::Result<()>;
-
-    /// Mark the end of a proxied MCP tool call for event correlation.
-    async fn complete_tool_call(
-        &self,
-        container_id: &str,
-        correlation_id: &str,
-    ) -> anyhow::Result<()>;
 }
 
 /// Stub policy manager for macOS and tests. All operations succeed as no-ops.
@@ -238,9 +179,9 @@ impl PolicyManager for StubPolicyManager {
         &self,
         container_id: &str,
         _cgroup_path: &str,
-        _init_pid: u32,
+        init_pid: u32,
     ) -> anyhow::Result<ContainerHandle> {
-        tracing::warn!("stub policy manager: register is a no-op");
+        tracing::warn!(init_pid, "stub policy manager: register is a no-op");
         Ok(ContainerHandle {
             container_id: container_id.to_string(),
             cgroup_id: 0,
@@ -255,8 +196,8 @@ impl PolicyManager for StubPolicyManager {
         &self,
         _container_id: &str,
         _policy: &NetworkPolicy,
-    ) -> anyhow::Result<NetworkApplyReport> {
-        Ok(NetworkApplyReport::default())
+    ) -> anyhow::Result<()> {
+        Ok(())
     }
 
     async fn apply_filesystem(
@@ -283,6 +224,34 @@ impl PolicyManager for StubPolicyManager {
         Ok(())
     }
 
+    async fn apply_deny_set(
+        &self,
+        _container_id: &str,
+        _policy: &DenySetPolicy,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn update_deny_set(
+        &self,
+        _container_id: &str,
+        _entry: &ResolvedDenySetEntry,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn apply_bind(&self, _container_id: &str, _policy: &BindPolicy) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn configure_reverse_shell(
+        &self,
+        _container_id: &str,
+        _config: &ReverseShellConfig,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn get_stats(&self, _container_id: &str) -> anyhow::Result<EnforcementStats> {
         Ok(EnforcementStats::default())
     }
@@ -296,68 +265,5 @@ impl PolicyManager for StubPolicyManager {
     ) -> anyhow::Result<tokio::sync::mpsc::Receiver<EnforcementEvent>> {
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         Ok(rx)
-    }
-
-    async fn prepare_tool_call(
-        &self,
-        _container_id: &str,
-        _correlation_id: &str,
-        _tool_name: &str,
-        _transient_egress: &[EgressRule],
-        _window_timeout_ms: u64,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    async fn complete_tool_call(
-        &self,
-        _container_id: &str,
-        _correlation_id: &str,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_cidr;
-    use std::net::IpAddr;
-
-    #[test]
-    fn parse_cidr_v4_with_prefix() {
-        let (addr, prefix) = parse_cidr("10.0.0.0/8").unwrap();
-        assert_eq!(addr, "10.0.0.0".parse::<IpAddr>().unwrap());
-        assert_eq!(prefix, 8);
-    }
-
-    #[test]
-    fn parse_cidr_bare_v4_is_host_route() {
-        let (addr, prefix) = parse_cidr("169.254.169.254").unwrap();
-        assert_eq!(addr, "169.254.169.254".parse::<IpAddr>().unwrap());
-        assert_eq!(prefix, 32);
-    }
-
-    #[test]
-    fn parse_cidr_v6_with_prefix() {
-        let (addr, prefix) = parse_cidr("fd00:ec2::254/128").unwrap();
-        assert_eq!(addr, "fd00:ec2::254".parse::<IpAddr>().unwrap());
-        assert_eq!(prefix, 128);
-    }
-
-    #[test]
-    fn parse_cidr_bare_v6_is_host_route() {
-        let (_, prefix) = parse_cidr("2001:db8::1").unwrap();
-        assert_eq!(prefix, 128);
-    }
-
-    #[test]
-    fn parse_cidr_rejects_malformed() {
-        // Prefix beyond the family maximum, garbage, empty, hostname.
-        assert!(parse_cidr("10.0.0.0/33").is_none());
-        assert!(parse_cidr("2001:db8::/129").is_none());
-        assert!(parse_cidr("not-an-ip/8").is_none());
-        assert!(parse_cidr("").is_none());
-        assert!(parse_cidr("example.com").is_none());
-        assert!(parse_cidr("10.0.0.0/abc").is_none());
     }
 }

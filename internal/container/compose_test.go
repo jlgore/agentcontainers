@@ -415,15 +415,6 @@ func (s *composeTestStrategy) Apply(_ context.Context, containerID string, _ uin
 	s.applied = append(s.applied, containerID)
 	return s.applyErr
 }
-func (s *composeTestStrategy) ApplyBasePolicy(_ context.Context, containerID string, _ uint32, _ *policy.ContainerPolicy) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.applied = append(s.applied, containerID)
-	return s.applyErr
-}
-func (s *composeTestStrategy) ApplyCredentialACLs(_ context.Context, _ string, _ *policy.ContainerPolicy) error {
-	return nil
-}
 func (s *composeTestStrategy) Update(_ context.Context, _ string, _ *policy.ContainerPolicy) error {
 	return nil
 }
@@ -434,9 +425,6 @@ func (s *composeTestStrategy) Remove(_ context.Context, containerID string) erro
 	return s.removeErr
 }
 func (s *composeTestStrategy) InjectSecrets(_ context.Context, _ string, _ map[string]*secrets.Secret) error {
-	return nil
-}
-func (s *composeTestStrategy) SetImmutable(_ context.Context, _ string, _ []string, _ bool) error {
 	return nil
 }
 func (s *composeTestStrategy) Events(_ string) <-chan enforcement.Event { return nil }

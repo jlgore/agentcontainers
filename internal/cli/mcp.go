@@ -24,10 +24,8 @@ import (
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/approval"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/config"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/enforcement"
-	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/enforcerapi"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/identity"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/mcpproxy"
-	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/sidecar"
 )
 
 const defaultMCPPort = 4508
@@ -263,31 +261,28 @@ func buildMCPDeps(cfg *config.AgentContainer, log *zap.Logger) (mcpproxy.Deps, f
 		if addr == "" {
 			addr = "127.0.0.1:50051"
 		}
-		insecureDev := mcpEnforcerInsecureDev(cfg)
-		ca, cert, key := resolveEnforcerClientCreds(insecureDev)
-		profile := enforcement.ConnectionProfile{
-			Addr:           addr,
-			CACertPath:     ca,
-			ClientCertPath: cert,
-			ClientKeyPath:  key,
-			InsecureDev:    insecureDev,
-		}
 		// grpc.NewClient is lazy — it never dials. Without an eager probe,
 		// an unreachable enforcer surfaces only at the first backend
 		// launch, after audit sinks and approval channels are already up.
 		// Reaching this branch means enforcement is required (component
 		// servers need the enforcer runtime; container servers only skip
-		// it via enforcer.required: false), so fail `mcp start` here. The probe
-		// uses the same TLS credentials a real client presents.
-		if !enforcerProfileProbe(profile) {
+		// it via enforcer.required: false), so fail `mcp start` here.
+		if !enforcerHealthProbe(addr) {
 			return deps, cleanup, fmt.Errorf("enforcer at %s failed its gRPC health check; the configured MCP servers require it (kernel enforcement, or the component runtime) — start the enforcer sidecar, point AC_ENFORCER_ADDR at it (with AC_ENFORCER_TLS_* for mTLS), or set agent.enforcer.required: false to run container servers without kernel enforcement", addr)
 		}
-		conn, err := enforcement.DialEnforcer(profile, func(msg string) { log.Warn(msg) })
+		// Reuse the enforcement package's env-driven connection (AC_ENFORCER_TLS_*
+		// selects mTLS / server-TLS / insecure, and a unix:// target dials the UDS),
+		// so the proxy connects exactly as the runtime's own strategy does.
+		enfOpts, err := enforcement.GRPCOptsFromEnv()
+		if err != nil {
+			return deps, cleanup, fmt.Errorf("enforcer at %s: TLS config from AC_ENFORCER_TLS_*: %w", addr, err)
+		}
+		strat, err := enforcement.NewGRPCStrategy(addr, enfOpts...)
 		if err != nil {
 			return deps, cleanup, fmt.Errorf("connecting to enforcer at %s: %w", addr, err)
 		}
-		deps.Enforcer = enforcerapi.NewEnforcerClient(conn)
-		cleanups = append(cleanups, func() { _ = conn.Close() })
+		deps.Enforcer = strat.Client()
+		cleanups = append(cleanups, func() { _ = strat.Close() })
 	}
 
 	return deps, cleanup, nil
@@ -297,49 +292,6 @@ func buildMCPDeps(cfg *config.AgentContainer, log *zap.Logger) (mcpproxy.Deps, f
 // gRPC health service (grpc.health.v1, served by the enforcer sidecar) with
 // a 2-second timeout over plaintext.
 var enforcerHealthProbe = enforcement.ProbeEnforcerHealth
-
-// enforcerProfileProbe is swappable for tests; the default probes the enforcer
-// health service using the connection profile's TLS credentials, so an
-// mTLS-only enforcer is checked exactly as a real client connects. For a
-// plaintext (no-mTLS) profile it delegates to enforcerHealthProbe so both share
-// one probe seam.
-var enforcerProfileProbe = func(p enforcement.ConnectionProfile) bool {
-	if p.HasMTLS() {
-		return enforcement.ProbeEnforcerHealthProfile(p)
-	}
-	return enforcerHealthProbe(p.Addr)
-}
-
-// resolveEnforcerClientCreds returns the mTLS client material for talking to a
-// managed enforcer. It prefers explicit external configuration via
-// AC_ENFORCER_TLS_*, and otherwise falls back to the stable host creds
-// directory a managed enforcer writes (~/.ac/enforcer-creds), so a separate
-// process — `mcp start`, `enforcer status` — discovers the current enforcer's
-// credentials without manual exports. The fallback is skipped under insecureDev
-// (a plaintext enforcer wants no client cert) and when any env var is set (the
-// operator is configuring it explicitly). Returns empty strings when neither
-// source has credentials.
-func resolveEnforcerClientCreds(insecureDev bool) (ca, cert, key string) {
-	ca = os.Getenv("AC_ENFORCER_TLS_CA")
-	cert = os.Getenv("AC_ENFORCER_TLS_CERT")
-	key = os.Getenv("AC_ENFORCER_TLS_KEY")
-	if insecureDev || ca != "" || cert != "" || key != "" {
-		return ca, cert, key
-	}
-	if dca, dcert, dkey, ok := sidecar.DefaultClientCredsPaths(); ok {
-		return dca, dcert, dkey
-	}
-	return ca, cert, key
-}
-
-// mcpEnforcerInsecureDev reports whether the agent config opted into a plaintext
-// (no-mTLS) enforcer control plane.
-func mcpEnforcerInsecureDev(cfg *config.AgentContainer) bool {
-	if cfg == nil || cfg.Agent == nil || cfg.Agent.Enforcer == nil {
-		return false
-	}
-	return cfg.Agent.Enforcer.InsecureDev
-}
 
 // buildApprovalChannels stands up the HITL broker and its channels when any
 // configured server declares requireApproval tools. Returns a nil broker

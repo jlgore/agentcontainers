@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/moby/moby/api/pkg/stdcopy"
@@ -17,10 +19,10 @@ import (
 	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
 	"go.uber.org/zap"
+	"golang.org/x/sys/unix"
 
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/config"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/enforcement"
-	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/harness"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/policy"
 )
 
@@ -38,20 +40,12 @@ const (
 // Compile-time check that DockerRuntime satisfies the Runtime interface.
 var _ Runtime = (*DockerRuntime)(nil)
 
-// Compile-time check that DockerRuntime supports interactive (TTY) exec.
-var _ InteractiveExecer = (*DockerRuntime)(nil)
-
 // DockerRuntime implements the Runtime interface using the Docker Engine API.
 type DockerRuntime struct {
-	client       client.APIClient
-	logger       *zap.Logger
-	stopTimeout  time.Duration
-	strategy     enforcement.Strategy
-	cgroupnsHost bool
-	// scanExecConfig discovers the agent's execution-config surfaces for the
-	// freeze step; nil means the default harness.Scan. A seam so bootstrap tests
-	// can inject findings without a real container filesystem.
-	scanExecConfig func(harness.Options) ([]harness.Finding, error)
+	client      client.APIClient
+	logger      *zap.Logger
+	stopTimeout time.Duration
+	strategy    enforcement.Strategy
 }
 
 // DockerOption configures a DockerRuntime.
@@ -63,8 +57,6 @@ type dockerOptions struct {
 	logger           *zap.Logger
 	stopTimeout      time.Duration
 	enforcementLevel *enforcement.Level
-	strategy         enforcement.Strategy
-	cgroupnsHost     bool
 }
 
 // defaultDockerOptions returns sensible defaults for the Docker runtime.
@@ -106,37 +98,10 @@ func WithStopTimeout(d time.Duration) DockerOption {
 
 // WithEnforcementLevel sets the enforcement level for the Docker runtime.
 // When set to a level other than LevelNone, a Strategy is created during
-// NewDockerRuntime from process environment (AC_ENFORCER_*). Prefer
-// WithEnforcementStrategy, which threads an explicit connection profile and
-// does not depend on process-global environment variables.
+// NewDockerRuntime and used for container security enforcement.
 func WithEnforcementLevel(level enforcement.Level) DockerOption {
 	return func(o *dockerOptions) {
 		o.enforcementLevel = &level
-	}
-}
-
-// WithEnforcementStrategy injects a pre-built enforcement strategy (e.g. one
-// constructed from a sidecar's connection profile via
-// enforcement.NewStrategyFromProfile). When set it takes precedence over
-// WithEnforcementLevel, so the runtime never has to read AC_ENFORCER_* itself.
-func WithEnforcementStrategy(s enforcement.Strategy) DockerOption {
-	return func(o *dockerOptions) {
-		if s != nil {
-			o.strategy = s
-		}
-	}
-}
-
-// WithCgroupnsHost runs containers in the host cgroup namespace
-// (docker create --cgroupns=host) so the container's cgroup hierarchy is
-// visible to the host kernel's BPF maps, letting the eBPF enforcer's per-cgroup
-// hooks see the container's processes. It is the kernel-primary posture used on
-// Docker Engine (no sandboxd VM); see config.EnforcerConfig.KernelPrimary.
-// Default (false) leaves Docker's default cgroup namespace (private) in place,
-// preserving the Docker Desktop path unchanged.
-func WithCgroupnsHost(enabled bool) DockerOption {
-	return func(o *dockerOptions) {
-		o.cgroupnsHost = enabled
 	}
 }
 
@@ -158,27 +123,17 @@ func NewDockerRuntime(opts ...DockerOption) (*DockerRuntime, error) {
 	}
 
 	d := &DockerRuntime{
-		client:       o.client,
-		logger:       o.logger,
-		stopTimeout:  o.stopTimeout,
-		cgroupnsHost: o.cgroupnsHost,
+		client:      o.client,
+		logger:      o.logger,
+		stopTimeout: o.stopTimeout,
 	}
 
-	// Prefer an explicitly injected strategy (built from a connection profile).
-	// Fall back to deriving one from the enforcement level via the environment.
-	switch {
-	case o.strategy != nil:
-		d.strategy = o.strategy
-		d.logger.Info("enforcement strategy configured",
-			zap.String("level", d.strategy.Level().String()),
-			zap.String("source", "profile"),
-		)
-	case o.enforcementLevel != nil && *o.enforcementLevel != enforcement.LevelNone:
+	// Create enforcement strategy if a level was requested.
+	if o.enforcementLevel != nil && *o.enforcementLevel != enforcement.LevelNone {
 		level := *o.enforcementLevel
 		d.strategy = enforcement.NewStrategy(level)
 		d.logger.Info("enforcement strategy configured",
 			zap.String("level", level.String()),
-			zap.String("source", "env"),
 		)
 	}
 
@@ -209,19 +164,6 @@ func (d *DockerRuntime) Start(ctx context.Context, cfg *config.AgentContainer, o
 
 	containerCfg, hostCfg, networkCfg := d.buildContainerConfig(cfg, opts)
 
-	// When the policy enables egress ("bridge"), the container attaches to a
-	// per-agent user-defined bridge for embedded DNS (see buildContainerConfig).
-	// Create it before ContainerCreate so the attachment resolves.
-	netPolicy := opts.Policy
-	if netPolicy == nil {
-		netPolicy = defaultContainerPolicy()
-	}
-	if netPolicy.NetworkMode == "bridge" {
-		if err := d.ensureAgentNetwork(ctx, agentNetworkName(cfg.Name)); err != nil {
-			return nil, fmt.Errorf("docker runtime: ensuring agent network: %w", err)
-		}
-	}
-
 	d.logger.Info("creating container",
 		zap.String("image", imageRef),
 		zap.String("name", cfg.Name),
@@ -250,88 +192,52 @@ func (d *DockerRuntime) Start(ctx context.Context, cfg *config.AgentContainer, o
 
 	d.logger.Info("container started", zap.String("id", resp.ID))
 
-	// teardownUnenforced force-removes the container without unpausing it, so a
-	// container can never be left running with incomplete enforcement. Best-effort
-	// enforcement removal first cleans up any partially-installed BPF state.
-	teardownUnenforced := func() {
-		if d.strategy != nil {
-			_ = d.strategy.Remove(ctx, resp.ID)
-		}
+	// Inspect the container to get the init PID for enforcer access to
+	// /proc/<pid>/root/ (used by InjectSecrets). Treat inspect failure as
+	// fatal: without the PID the enforcer cannot inject secrets, and silently
+	// proceeding with initPID=0 would cause injection to target /proc/0/root
+	// which is either wrong or a security issue.
+	inspectResult, err := d.client.ContainerInspect(ctx, resp.ID, client.ContainerInspectOptions{})
+	if err != nil {
+		_, _ = d.client.ContainerStop(ctx, resp.ID, client.ContainerStopOptions{})
 		_, _ = d.client.ContainerRemove(ctx, resp.ID, client.ContainerRemoveOptions{Force: true})
+		return nil, fmt.Errorf("docker runtime: inspecting container for init PID: %w", err)
+	}
+	initPID := uint32(inspectResult.Container.State.Pid)
+	if initPID == 0 {
+		_, _ = d.client.ContainerStop(ctx, resp.ID, client.ContainerStopOptions{})
+		_, _ = d.client.ContainerRemove(ctx, resp.ID, client.ContainerRemoveOptions{Force: true})
+		return nil, fmt.Errorf("docker runtime: inspecting container for init PID: container has no running init process")
 	}
 
-	// When enforcement is active, bootstrap atomically: pause the container
-	// immediately so it cannot execute a single instruction before policy and
-	// secrets are fully installed, then apply enforcement in a strict order:
-	//
-	//   pause → base policy → inject secrets → credential ACLs → unpause
-	//
-	// Credential ACLs are installed only after the secret files exist, so the
-	// enforcer can resolve each secret's inode. Any failure tears the container
-	// down without ever unpausing it.
+	// Post-start enforcement: register the container and apply policy via the
+	// enforcer sidecar. Must happen after ContainerStart because the cgroup is
+	// created by the container runtime when the process starts.
 	if d.strategy != nil {
-		if _, err := d.client.ContainerPause(ctx, resp.ID, client.ContainerPauseOptions{}); err != nil {
-			teardownUnenforced()
-			return nil, fmt.Errorf("docker runtime: pausing container for enforcement bootstrap: %w", err)
+		if err := d.strategy.Apply(ctx, resp.ID, initPID, p); err != nil {
+			// Enforcement failed — stop and remove the container (fail-closed).
+			_, _ = d.client.ContainerStop(ctx, resp.ID, client.ContainerStopOptions{})
+			_, _ = d.client.ContainerRemove(ctx, resp.ID, client.ContainerRemoveOptions{Force: true})
+			return nil, fmt.Errorf("docker runtime: post-start enforcement: %w", err)
 		}
-
-		// Inspect (while paused) to get the init PID for enforcer access to
-		// /proc/<pid>/root/. Fatal on failure: without the PID the enforcer
-		// cannot inject secrets, and initPID=0 would target /proc/0/root.
-		inspectResult, err := d.client.ContainerInspect(ctx, resp.ID, client.ContainerInspectOptions{})
-		if err != nil {
-			teardownUnenforced()
-			return nil, fmt.Errorf("docker runtime: inspecting container for init PID: %w", err)
-		}
-		initPID := uint32(inspectResult.Container.State.Pid)
-
-		// 1. Base policy: register + network/filesystem/process (no ACLs yet).
-		if err := d.strategy.ApplyBasePolicy(ctx, resp.ID, initPID, p); err != nil {
-			teardownUnenforced()
-			return nil, fmt.Errorf("docker runtime: applying base policy: %w", err)
-		}
-
-		// 2. Inject secrets while paused, so the files exist before their ACLs.
-		if len(opts.ResolvedSecrets) > 0 {
-			if err := d.strategy.InjectSecrets(ctx, resp.ID, opts.ResolvedSecrets); err != nil {
-				teardownUnenforced()
-				return nil, fmt.Errorf("docker runtime: injecting secrets: %w", err)
-			}
-			d.logger.Info("secrets injected via enforcer",
-				zap.String("id", resp.ID),
-				zap.Int("count", len(opts.ResolvedSecrets)),
-			)
-		}
-
-		// 3. Credential ACLs, now that the secret files exist. A path that
-		// cannot be resolved is fatal in the enforcer (no silent skip).
-		if err := d.strategy.ApplyCredentialACLs(ctx, resp.ID, p); err != nil {
-			teardownUnenforced()
-			return nil, fmt.Errorf("docker runtime: installing credential ACLs: %w", err)
-		}
-
-		// 3b. Freeze the agent's writable execution-config immutable, while still
-		// paused, so it is locked before the agent runs a single instruction. This
-		// closes the self-rewrite escape (the agent disabling its own guard hook or
-		// planting a cron/systemd job that runs in an unenforced cgroup) without a
-		// manual `harness protect`. Docker/kernel-primary runtime only; the sandbox
-		// (VM) and compose runtimes do not wire this yet.
-		if opts.FreezeConfig {
-			if err := d.freezeExecConfig(ctx, resp.ID, initPID); err != nil {
-				teardownUnenforced()
-				return nil, fmt.Errorf("docker runtime: freezing execution-config: %w", err)
-			}
-		}
-
-		// 4. Resume only after every step succeeded.
-		if _, err := d.client.ContainerUnpause(ctx, resp.ID, client.ContainerUnpauseOptions{}); err != nil {
-			teardownUnenforced()
-			return nil, fmt.Errorf("docker runtime: unpausing container after enforcement bootstrap: %w", err)
-		}
-
 		d.logger.Info("enforcement applied",
 			zap.String("id", resp.ID),
 			zap.String("level", d.strategy.Level().String()),
+		)
+	}
+
+	// Inject secrets via the enforcer sidecar (post-enforcement).
+	// Credential ACLs are active before secrets are written, so the enforcer
+	// can gate access correctly from the first instruction onward.
+	if d.strategy != nil && len(opts.ResolvedSecrets) > 0 {
+		if err := d.strategy.InjectSecrets(ctx, resp.ID, opts.ResolvedSecrets); err != nil {
+			_, _ = d.client.ContainerStop(ctx, resp.ID, client.ContainerStopOptions{})
+			_, _ = d.client.ContainerRemove(ctx, resp.ID, client.ContainerRemoveOptions{Force: true})
+			return nil, fmt.Errorf("docker runtime: injecting secrets: %w", err)
+		}
+		d.logger.Info("secrets injected via enforcer",
+			zap.String("id", resp.ID),
+			zap.Int("count", len(opts.ResolvedSecrets)),
 		)
 	}
 
@@ -341,101 +247,6 @@ func (d *DockerRuntime) Start(ctx context.Context, cfg *config.AgentContainer, o
 		Status:      "running",
 		CreatedAt:   time.Now(),
 	}, nil
-}
-
-// freezeExecConfig scans the paused agent's mount namespace for writable
-// execution-config surfaces (harness guard hook, cron/systemd, shell rc) and
-// freezes them immutable via the enforcer. The agent's uid/gid/HOME — needed for
-// the writability verdict and "~" expansion — are read from the init process's
-// /proc/<initPID>/{status,environ}. A scan error is fatal (the caller tears the
-// container down); an individual non-existent surface is skipped inside Scan.
-func (d *DockerRuntime) freezeExecConfig(ctx context.Context, containerID string, initPID uint32) error {
-	root := fmt.Sprintf("/proc/%d/root", initPID)
-	uid, gid := procUIDGID(initPID)
-	home := procHome(initPID)
-
-	scan := d.scanExecConfig
-	if scan == nil {
-		scan = harness.Scan
-	}
-	findings, err := scan(harness.Options{
-		Root:     root,
-		Home:     home,
-		AgentUID: uid,
-		AgentGID: gid,
-	})
-	if err != nil {
-		return fmt.Errorf("scan %s: %w", root, err)
-	}
-
-	var paths []string
-	for _, f := range findings {
-		if !f.Writable {
-			continue // freeze only the agent-writable surfaces (the actual risks)
-		}
-		// Strip the /proc/<pid>/root prefix so the enforcer re-resolves the path
-		// in its own view of the same mount namespace.
-		paths = append(paths, strings.TrimPrefix(f.Path, root))
-	}
-	if len(paths) == 0 {
-		d.logger.Info("no writable execution-config to freeze", zap.String("id", containerID))
-		return nil
-	}
-
-	if err := d.strategy.SetImmutable(ctx, containerID, paths, true); err != nil {
-		return err
-	}
-	d.logger.Info("execution-config frozen immutable",
-		zap.String("id", containerID),
-		zap.Int("count", len(paths)),
-	)
-	return nil
-}
-
-// procUIDGID reads the real uid/gid of a process from /proc/<pid>/status.
-// Returns (0,0) when unreadable; harness.writableBy then treats owner-writable
-// surfaces conservatively.
-func procUIDGID(pid uint32) (int, int) {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
-	if err != nil {
-		return 0, 0
-	}
-	uid, gid := 0, 0
-	for _, line := range strings.Split(string(data), "\n") {
-		if rest, ok := strings.CutPrefix(line, "Uid:"); ok {
-			uid = firstIntField(rest)
-		} else if rest, ok := strings.CutPrefix(line, "Gid:"); ok {
-			gid = firstIntField(rest)
-		}
-	}
-	return uid, gid
-}
-
-// procHome reads HOME from a process's environment (/proc/<pid>/environ, a
-// NUL-delimited list). Returns "" if unset, in which case harness.Scan skips
-// user-scoped ("~/") entries. The value is namespace-relative (e.g. "/home/node"),
-// exactly what harness.Options.Home expects.
-func procHome(pid uint32) string {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
-	if err != nil {
-		return ""
-	}
-	for _, kv := range strings.Split(string(data), "\x00") {
-		if v, ok := strings.CutPrefix(kv, "HOME="); ok {
-			return v
-		}
-	}
-	return ""
-}
-
-// firstIntField parses the first whitespace-separated field of s as an int.
-func firstIntField(s string) int {
-	fields := strings.Fields(s)
-	if len(fields) == 0 {
-		return 0
-	}
-	n, _ := strconv.Atoi(fields[0])
-	return n
 }
 
 // Stop gracefully stops the container, waits for the stop timeout, then removes it.
@@ -520,98 +331,144 @@ func (d *DockerRuntime) Exec(ctx context.Context, session *Session, cmd []string
 	}, nil
 }
 
-// ExecInteractive runs cmd inside the session container with streamed stdio and
-// an optional TTY, for human-driven sessions. It returns the command's exit
-// code. The caller owns the terminal; this method owns the docker exec and
-// applies resize events delivered on opts.Resize.
-//
-// Enforcement is unaffected: the exec process is created in the container's
-// cgroup, so the eBPF egress hooks apply, and an interactive `claude` reads the
-// same managed-settings PreToolUse hook as the main process.
-func (d *DockerRuntime) ExecInteractive(ctx context.Context, session *Session, cmd []string, opts InteractiveExecOptions) (int, error) {
+// ExecInteractive executes a command inside the running container while
+// attaching local stdio. It is intended for shells and other interactive tools.
+func (d *DockerRuntime) ExecInteractive(ctx context.Context, session *Session, cmd []string, execIO ExecIO) (int, error) {
 	if session == nil {
 		return 0, fmt.Errorf("docker runtime: nil session")
 	}
 	if len(cmd) == 0 {
 		return 0, fmt.Errorf("docker runtime: empty command")
 	}
+	stdout := execIO.Stdout
+	if stdout == nil {
+		stdout = io.Discard
+	}
+	stderr := execIO.Stderr
+	if stderr == nil {
+		stderr = io.Discard
+	}
 
 	execResp, err := d.client.ExecCreate(ctx, session.ContainerID, client.ExecCreateOptions{
 		Cmd:          cmd,
-		User:         opts.User,
-		WorkingDir:   opts.WorkingDir,
-		Env:          opts.Env,
-		TTY:          opts.TTY,
-		AttachStdin:  opts.Stdin != nil,
-		AttachStdout: opts.Stdout != nil,
-		AttachStderr: opts.Stderr != nil,
-		ConsoleSize:  client.ConsoleSize{Height: opts.InitialSize.Rows, Width: opts.InitialSize.Cols},
+		AttachStdin:  execIO.Stdin != nil,
+		AttachStdout: true,
+		AttachStderr: true,
+		TTY:          execIO.TTY,
 	})
 	if err != nil {
 		return 0, fmt.Errorf("docker runtime: creating exec: %w", err)
 	}
 
-	attach, err := d.client.ExecAttach(ctx, execResp.ID, client.ExecAttachOptions{TTY: opts.TTY})
+	attach, err := d.client.ExecAttach(ctx, execResp.ID, client.ExecAttachOptions{
+		TTY: execIO.TTY,
+	})
 	if err != nil {
 		return 0, fmt.Errorf("docker runtime: attaching exec: %w", err)
 	}
 	defer attach.Close()
 
-	// Pump TTY resize events to the exec for the lifetime of this call.
-	if opts.Resize != nil {
-		resizeCtx, cancelResize := context.WithCancel(ctx)
-		defer cancelResize()
-		go func() {
-			for {
-				select {
-				case <-resizeCtx.Done():
-					return
-				case sz, ok := <-opts.Resize:
-					if !ok {
-						return
-					}
-					_, _ = d.client.ExecResize(resizeCtx, execResp.ID, client.ExecResizeOptions{
-						Height: sz.Rows,
-						Width:  sz.Cols,
-					})
-				}
-			}
-		}()
+	cleanupTTY, err := configureLocalTTY(ctx, d.client, execResp.ID, execIO)
+	if err != nil {
+		return 0, err
 	}
+	defer cleanupTTY()
 
-	// Stream stdin to the exec, then half-close so the process sees EOF.
-	if opts.Stdin != nil {
+	if execIO.Stdin != nil {
 		go func() {
-			_, _ = io.Copy(attach.Conn, opts.Stdin)
+			_, _ = io.Copy(attach.Conn, execIO.Stdin)
 			_ = attach.CloseWrite()
 		}()
 	}
 
-	// Stream output back. A TTY merges stdout and stderr onto one stream, so
-	// copy it directly; otherwise demux the multiplexed frames.
-	if opts.TTY {
-		if opts.Stdout != nil {
-			_, _ = io.Copy(opts.Stdout, attach.Reader)
+	if execIO.TTY {
+		if _, err := io.Copy(stdout, attach.Reader); err != nil {
+			return 0, fmt.Errorf("docker runtime: reading exec output: %w", err)
 		}
-	} else {
-		out := opts.Stdout
-		errOut := opts.Stderr
-		if out == nil {
-			out = io.Discard
-		}
-		if errOut == nil {
-			errOut = io.Discard
-		}
-		if _, err := stdcopy.StdCopy(out, errOut, attach.Reader); err != nil {
-			return 0, fmt.Errorf("docker runtime: streaming exec output: %w", err)
-		}
+	} else if _, err := stdcopy.StdCopy(stdout, stderr, attach.Reader); err != nil {
+		return 0, fmt.Errorf("docker runtime: reading exec output: %w", err)
 	}
 
 	inspect, err := d.client.ExecInspect(ctx, execResp.ID, client.ExecInspectOptions{})
 	if err != nil {
 		return 0, fmt.Errorf("docker runtime: inspecting exec: %w", err)
 	}
+
 	return inspect.ExitCode, nil
+}
+
+func configureLocalTTY(ctx context.Context, cli client.APIClient, execID string, execIO ExecIO) (func(), error) {
+	if !execIO.TTY {
+		return func() {}, nil
+	}
+
+	var cleanupFuncs []func()
+
+	if stdin, ok := execIO.Stdin.(*os.File); ok && isTerminal(stdin) {
+		fd := int(stdin.Fd())
+		state, err := unix.IoctlGetTermios(fd, ioctlGetTermios)
+		if err != nil {
+			return nil, fmt.Errorf("docker runtime: reading local terminal state: %w", err)
+		}
+
+		raw := *state
+		raw.Iflag &^= unix.IGNBRK | unix.BRKINT | unix.PARMRK | unix.ISTRIP | unix.INLCR | unix.IGNCR | unix.ICRNL | unix.IXON
+		raw.Oflag &^= unix.OPOST
+		raw.Lflag &^= unix.ECHO | unix.ECHONL | unix.ICANON | unix.ISIG | unix.IEXTEN
+		raw.Cflag &^= unix.CSIZE | unix.PARENB
+		raw.Cflag |= unix.CS8
+		raw.Cc[unix.VMIN] = 1
+		raw.Cc[unix.VTIME] = 0
+
+		if err := unix.IoctlSetTermios(fd, ioctlSetTermios, &raw); err != nil {
+			return nil, fmt.Errorf("docker runtime: enabling local terminal raw mode: %w", err)
+		}
+		cleanupFuncs = append(cleanupFuncs, func() {
+			_ = unix.IoctlSetTermios(fd, ioctlSetTermios, state)
+		})
+	}
+
+	if stdout, ok := execIO.Stdout.(*os.File); ok && isTerminal(stdout) {
+		resize := func() {
+			if size, err := unix.IoctlGetWinsize(int(stdout.Fd()), unix.TIOCGWINSZ); err == nil && size.Col > 0 && size.Row > 0 {
+				_, _ = cli.ExecResize(ctx, execID, client.ExecResizeOptions{
+					Height: uint(size.Row),
+					Width:  uint(size.Col),
+				})
+			}
+		}
+		resize()
+
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGWINCH)
+		done := make(chan struct{})
+		go func() {
+			for {
+				select {
+				case <-sigCh:
+					resize()
+				case <-done:
+					return
+				}
+			}
+		}()
+
+		cleanupFuncs = append(cleanupFuncs, func() {
+			signal.Stop(sigCh)
+			close(done)
+		})
+	}
+
+	return func() {
+		for i := len(cleanupFuncs) - 1; i >= 0; i-- {
+			cleanupFuncs[i]()
+		}
+	}, nil
+}
+
+func isTerminal(file *os.File) bool {
+	_, err := unix.IoctlGetTermios(int(file.Fd()), ioctlGetTermios)
+	return err == nil
 }
 
 // Logs returns a ReadCloser that streams the container's combined stdout/stderr.
@@ -740,32 +597,12 @@ func (d *DockerRuntime) buildContainerConfig(
 		ReadonlyRootfs: p.ReadonlyRootfs,
 	}
 
-	// Kernel-primary posture (Docker Engine, no sandboxd VM): run in the host
-	// cgroup namespace so the container's cgroup is visible to the host kernel's
-	// BPF maps and the enforcer's per-cgroup LSM/network hooks can scope to it.
-	// Left unset, Docker's default (private) namespace applies — the Docker
-	// Desktop path is unchanged.
-	if d.cgroupnsHost {
-		hostCfg.CgroupnsMode = container.CgroupnsMode("host")
+	// Apply network mode from policy.
+	if p.NetworkMode != "" {
+		hostCfg.NetworkMode = container.NetworkMode(p.NetworkMode)
 	}
 
 	networkCfg := &network.NetworkingConfig{}
-
-	// Network attachment. "bridge" (set by policy resolution when egress rules
-	// are present) must NOT use Docker's default bridge: that bridge has no
-	// embedded DNS resolver, so the container's resolv.conf points at an
-	// external nameserver on :53, and the egress default-deny blocks that —
-	// breaking all name resolution. Attach to a per-agent user-defined bridge
-	// instead, which runs Docker's embedded resolver at 127.0.0.11 (loopback,
-	// which the enforcer always allows). This mirrors how the MCP proxy
-	// attaches its backends. "none" and any explicit mode pass through.
-	if p.NetworkMode == "bridge" {
-		networkCfg.EndpointsConfig = map[string]*network.EndpointSettings{
-			agentNetworkName(cfg.Name): {},
-		}
-	} else if p.NetworkMode != "" {
-		hostCfg.NetworkMode = container.NetworkMode(p.NetworkMode)
-	}
 
 	// Map config mounts from devcontainer.json.
 	hostCfg.Mounts = parseMounts(cfg.Mounts)
@@ -821,33 +658,6 @@ func (d *DockerRuntime) buildContainerConfig(
 	}
 
 	return containerCfg, hostCfg, networkCfg
-}
-
-// agentNetworkName is the deterministic name of the per-agent user-defined
-// bridge network. Keyed by the agent name so repeated runs of the same config
-// reuse one network rather than accumulating per-run networks.
-func agentNetworkName(name string) string {
-	return "ac-net-" + name
-}
-
-// ensureAgentNetwork creates the per-agent user-defined bridge network if it
-// does not already exist. A user-defined bridge — unlike Docker's default
-// bridge — runs the embedded DNS resolver at 127.0.0.11, loopback traffic the
-// enforcer always allows, so name resolution works under default-deny egress.
-// Idempotent: an existing network is reused.
-func (d *DockerRuntime) ensureAgentNetwork(ctx context.Context, name string) error {
-	if _, err := d.client.NetworkInspect(ctx, name, client.NetworkInspectOptions{}); err == nil {
-		return nil
-	}
-	if _, err := d.client.NetworkCreate(ctx, name, client.NetworkCreateOptions{
-		Driver: "bridge",
-		Labels: map[string]string{
-			labelPrefix + "/managed": "true",
-		},
-	}); err != nil {
-		return fmt.Errorf("creating network %s: %w", name, err)
-	}
-	return nil
 }
 
 // defaultContainerPolicy returns a default-deny security policy when no
@@ -906,10 +716,6 @@ func parseMount(raw string) *mount.Mount {
 		target = fields["destination"]
 	}
 
-	if source == "" || target == "" {
-		return nil
-	}
-
 	mt := mount.TypeBind
 	if t, ok := fields["type"]; ok {
 		switch t {
@@ -920,6 +726,10 @@ func parseMount(raw string) *mount.Mount {
 		case "tmpfs":
 			mt = mount.TypeTmpfs
 		}
+	}
+
+	if target == "" || (source == "" && mt != mount.TypeTmpfs) {
+		return nil
 	}
 
 	_, readOnly := fields["readonly"]
@@ -942,8 +752,29 @@ func parseMount(raw string) *mount.Mount {
 			}
 		}
 	}
+	if mt == mount.TypeTmpfs {
+		if opts := parseTmpfsOptions(fields); opts != nil {
+			m.TmpfsOptions = opts
+		}
+	}
 
 	return m
+}
+
+func parseTmpfsOptions(fields map[string]string) *mount.TmpfsOptions {
+	var opts mount.TmpfsOptions
+	hasOpts := false
+
+	if mode, ok := fields["tmpfs-mode"]; ok && mode != "" {
+		if parsed, err := strconv.ParseUint(mode, 0, 32); err == nil {
+			opts.Mode = os.FileMode(parsed)
+			hasOpts = true
+		}
+	}
+	if !hasOpts {
+		return nil
+	}
+	return &opts
 }
 
 // parsePropagation maps a propagation string to a mount.Propagation constant.
@@ -1022,43 +853,7 @@ func validateMounts(mounts []mount.Mount) error {
 		if forbiddenBasenames[filepath.Base(source)] {
 			return fmt.Errorf("forbidden mount: %s (grants host control via container runtime socket)", m.Source)
 		}
-
-		// Deny WRITABLE mounts that re-open a cgroup or scheduler escape. The
-		// enforcer holds at the kernel (cgroup subtree-match + cgroup.procs-write
-		// deny), and the agent has no capabilities by default — but a writable
-		// host cgroupfs or scheduler bind-mount is an unnecessary escape surface
-		// that these checks refuse. A read-only mount is allowed (the agent
-		// can't write it).
-		if m.ReadOnly {
-			continue
-		}
-		target := filepath.Clean(m.Target)
-		if target == "/sys/fs/cgroup" || strings.HasPrefix(target, "/sys/fs/cgroup/") {
-			return fmt.Errorf("forbidden mount: writable %s at %s lets the agent migrate cgroups; mount it read-only if a cgroup view is required", m.Source, m.Target)
-		}
-		for _, sched := range schedulerMountPaths {
-			if source == sched || strings.HasPrefix(source, sched+"/") {
-				return fmt.Errorf("forbidden mount: writable host scheduler path %s lets the agent schedule out-of-cgroup execution (cron/systemd); mount it read-only", m.Source)
-			}
-		}
 	}
 
 	return nil
-}
-
-// schedulerMountPaths are host paths a writable bind-mount of which would let an
-// enforced agent plant a cron/at/systemd job that a host daemon later runs in
-// an unenforced cgroup — the delegation half of the cgroup-move escape.
-var schedulerMountPaths = []string{
-	"/etc/crontab",
-	"/etc/anacrontab",
-	"/etc/cron.d",
-	"/etc/cron.hourly",
-	"/etc/cron.daily",
-	"/etc/cron.weekly",
-	"/etc/cron.monthly",
-	"/var/spool/cron",
-	"/var/spool/at",
-	"/etc/systemd/system",
-	"/etc/systemd/user",
 }

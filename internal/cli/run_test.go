@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,27 +11,23 @@ import (
 	"testing"
 	"time"
 
+	"github.com/moby/moby/client"
+	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/config"
+	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/container"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/enforcement"
+	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/oci"
+	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/orgpolicy"
+	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/sidecar"
 )
 
 func TestMain(m *testing.M) {
 	// The package-level logger is nil until PersistentPreRunE runs. Set a nop
 	// logger so unit tests that call runEnforcerLiveness do not panic.
 	logger = zap.NewNop()
-	// Isolate enforcer-creds discovery to an empty temp dir so tests never read
-	// the developer's real ~/.ac/enforcer-creds (resolveEnforcerClientCreds falls
-	// back to it). Tests that exercise the fallback override this themselves.
-	credsDir, err := os.MkdirTemp("", "ac-cli-test-creds-")
-	if err != nil {
-		panic(err)
-	}
-	_ = os.Setenv("AC_ENFORCER_CREDS_HOST_DIR", credsDir)
-	code := m.Run()
-	_ = os.RemoveAll(credsDir)
-	os.Exit(code)
+	os.Exit(m.Run())
 }
 
 func TestRunCmd_DefaultFlags(t *testing.T) {
@@ -244,6 +241,44 @@ func TestRuntimeAutoFlag(t *testing.T) {
 	}
 }
 
+func TestRunRuntimeAutoUsesResolvedRuntime(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "agentcontainer.json")
+	if err := os.WriteFile(cfgPath, []byte(`{"name":"test","image":"alpine:3.19","agent":{"enforcer":{"required":false}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotRuntime string
+	restoreRunHooks(t)
+	runResolveSidecar = func(*cobra.Command, *config.AgentContainer) (*sidecar.SidecarHandle, string, error) {
+		return nil, "", nil
+	}
+	runRuntimeFactory = func(runtimeName string, _ *zap.Logger, _ enforcement.Level) (container.Runtime, error) {
+		gotRuntime = runtimeName
+		return &recordingRuntime{}, nil
+	}
+	runExtractPolicy = func(context.Context, string, ...oci.ResolverOption) (*orgpolicy.OrgPolicy, error) {
+		return orgpolicy.DefaultPolicy(), nil
+	}
+	runMergePolicy = func(*orgpolicy.OrgPolicy, *config.AgentContainer) error { return nil }
+	runVerifyImageSignature = func(*cobra.Command, *config.AgentContainer, string) error { return nil }
+
+	cmd := newRunCmd()
+	cmd.SetContext(context.Background())
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+
+	if err := runRun(cmd, true, time.Minute, cfgPath, "auto", true, false); err != nil {
+		t.Fatalf("runRun() error = %v", err)
+	}
+	if gotRuntime == "auto" || gotRuntime == "" {
+		t.Fatalf("runRuntimeFactory runtime = %q, want resolved runtime", gotRuntime)
+	}
+	if gotRuntime != string(container.RuntimeDocker) && gotRuntime != string(container.RuntimeSandbox) {
+		t.Fatalf("runRuntimeFactory runtime = %q, want docker or sandbox", gotRuntime)
+	}
+}
+
 func TestNewRuntime_UnknownRuntime(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -409,10 +444,10 @@ func TestBuildSecretsManager_InfisicalXORValidation(t *testing.T) {
 	}
 }
 
-func TestBuildSecretsManager_VaultWiring(t *testing.T) {
-	// A vault secret declared with structured fields must wire up the vault
-	// provider. The actual Vault resolve will fail (no server), but the
-	// provider wiring must not return "unknown secret provider".
+func TestBuildSecretsManager_URINormalization(t *testing.T) {
+	// A Provider field that is a vault:// URI should be normalised to "vault".
+	// The actual Vault resolve will fail (no server), but the provider wiring
+	// must not return "unknown secret provider".
 	t.Setenv("VAULT_ADDR", "http://127.0.0.1:19200")
 	t.Setenv("VAULT_TOKEN", "test-token")
 
@@ -421,7 +456,7 @@ func TestBuildSecretsManager_VaultWiring(t *testing.T) {
 		"image": "alpine:3.19",
 		"agent": {
 			"secrets": {
-				"V": {"provider": "vault", "path": "myapp/config", "mount": "secret"}
+				"V": {"provider": "vault://myapp/config"}
 			}
 		}
 	}`)
@@ -429,7 +464,7 @@ func TestBuildSecretsManager_VaultWiring(t *testing.T) {
 	_, _, err := buildSecretsManager(context.Background(), cfg)
 	// Expected: a connection/resolve error from Vault, NOT "unknown secret provider".
 	if err != nil && strings.Contains(err.Error(), "unknown secret provider") {
-		t.Errorf("vault provider wiring failed: %v", err)
+		t.Errorf("URI normalization failed: %v", err)
 	}
 }
 
@@ -725,6 +760,53 @@ func TestVerifyImageSignature_CosignNotInstalled(t *testing.T) {
 	}
 }
 
+func TestRunRun_StartupFailureStopsManagedSidecar(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "agentcontainer.json")
+	if err := os.WriteFile(cfgPath, []byte(`{"name":"test","image":"alpine:3.19"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stopCalls int
+	handle := &sidecar.SidecarHandle{ContainerID: "sidecar-123", Addr: "127.0.0.1:50051", Managed: true}
+	restoreRunHooks(t)
+	runResolveSidecar = func(*cobra.Command, *config.AgentContainer) (*sidecar.SidecarHandle, string, error) {
+		return handle, handle.Addr, nil
+	}
+	runRuntimeFactory = func(string, *zap.Logger, enforcement.Level) (container.Runtime, error) {
+		return &recordingRuntime{startErr: fmt.Errorf("boom")}, nil
+	}
+	runExtractPolicy = func(context.Context, string, ...oci.ResolverOption) (*orgpolicy.OrgPolicy, error) {
+		return nil, nil
+	}
+	runMergePolicy = func(*orgpolicy.OrgPolicy, *config.AgentContainer) error { return nil }
+	runVerifyImageSignature = func(*cobra.Command, *config.AgentContainer, string) error { return nil }
+	runNewDockerClient = func() (client.APIClient, error) { return nil, nil }
+	runStopSidecar = func(context.Context, client.APIClient, *sidecar.SidecarHandle) error {
+		stopCalls++
+		return nil
+	}
+
+	cmd := newRunCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetContext(context.Background())
+
+	err := runRun(cmd, false, time.Minute, cfgPath, "docker", false, false)
+	if err == nil {
+		t.Fatal("expected startup error")
+	}
+	if !strings.Contains(err.Error(), "starting container") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if stopCalls != 1 {
+		t.Fatalf("stop sidecar calls = %d, want 1", stopCalls)
+	}
+	if !strings.Contains(out.String(), "Enforcer stopped") {
+		t.Fatalf("expected sidecar teardown message, got %q", out.String())
+	}
+}
+
 // parseConfigJSON writes JSON to a temp file, parses it, and returns the config.
 func parseConfigJSON(t *testing.T, jsonStr string) *config.AgentContainer {
 	t.Helper()
@@ -738,4 +820,24 @@ func parseConfigJSON(t *testing.T, jsonStr string) *config.AgentContainer {
 		t.Fatalf("ParseFile: %v", err)
 	}
 	return cfg
+}
+
+func restoreRunHooks(t *testing.T) {
+	t.Helper()
+	prevRuntimeFactory := runRuntimeFactory
+	prevResolveSidecar := runResolveSidecar
+	prevExtractPolicy := runExtractPolicy
+	prevMergePolicy := runMergePolicy
+	prevVerifyImageSignature := runVerifyImageSignature
+	prevNewDockerClient := runNewDockerClient
+	prevStopSidecar := runStopSidecar
+	t.Cleanup(func() {
+		runRuntimeFactory = prevRuntimeFactory
+		runResolveSidecar = prevResolveSidecar
+		runExtractPolicy = prevExtractPolicy
+		runMergePolicy = prevMergePolicy
+		runVerifyImageSignature = prevVerifyImageSignature
+		runNewDockerClient = prevNewDockerClient
+		runStopSidecar = prevStopSidecar
+	})
 }

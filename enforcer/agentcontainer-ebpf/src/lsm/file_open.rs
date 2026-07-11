@@ -19,19 +19,18 @@ use aya_ebpf::macros::lsm;
 use aya_ebpf::programs::LsmContext;
 
 use agentcontainer_common::events::{
-    CredEvent, EventType, FsEvent, Verdict, COMM_MAX, CRED_REASON_NO_ACTIVE_TOOL,
-    CRED_REASON_TOOL_NOT_ALLOWED, CRED_REASON_TTL_EXPIRED, CRED_REASON_WRITE_DENIED,
-    EVENT_CRED_OPEN,
+    CredEvent, EventType, FsEvent, Verdict, COMM_MAX, CRED_REASON_TTL_EXPIRED,
+    CRED_REASON_WRITE_DENIED, EVENT_CRED_OPEN,
 };
 use agentcontainer_common::maps::{
-    FsInodeKey, KernelOffsets, SecretAclKey, SecretToolKey, CGROUP2_SUPER_MAGIC, DENTRY_NAME_LEN,
-    FS_PERM_WRITE, LSM_ALLOW, LSM_DENY, PROC_SUPER_MAGIC,
+    KernelOffsets, ScopedFsInodeKey, SecretAclKey, DENTRY_NAME_LEN, FS_PERM_WRITE, LSM_ALLOW,
+    LSM_DENY, PROC_SUPER_MAGIC,
 };
 
 use crate::maps::{
-    bump_cgroup_stat, ACTIVE_TOOL, ALLOWED_INODES, CGROUP_STAT_CRED_ALLOWED,
-    CGROUP_STAT_CRED_BLOCKED, CGROUP_STAT_FS_ALLOWED, CGROUP_STAT_FS_BLOCKED, CRED_EVENTS,
-    CRED_STATS, DENIED_INODES, FS_EVENTS, FS_STATS, KERNEL_OFFSETS, SECRET_ACLS, SECRET_TOOL_ACLS,
+    bump_cgroup_stat, ALLOWED_INODES, CGROUP_STAT_CRED_ALLOWED, CGROUP_STAT_CRED_BLOCKED,
+    CGROUP_STAT_FS_ALLOWED, CGROUP_STAT_FS_BLOCKED, CRED_EVENTS, CRED_STATS, DENIED_INODES,
+    FS_EVENTS, FS_STATS, KERNEL_OFFSETS, SECRET_ACLS,
 };
 
 // ---------------------------------------------------------------------------
@@ -65,7 +64,7 @@ fn bump_fs_stat(idx: u32) {
 
 /// Emit a filesystem block event to the ring buffer.
 #[inline(always)]
-fn emit_fs_block_event(cgroup_id: u64, inode_nr: u64, flags: u32) {
+fn emit_fs_block_event(inode_nr: u64, flags: u32) {
     if let Some(mut buf) = FS_EVENTS.reserve::<FsEvent>(0) {
         let event = buf.as_mut_ptr();
         unsafe {
@@ -79,7 +78,6 @@ fn emit_fs_block_event(cgroup_id: u64, inode_nr: u64, flags: u32) {
 
             (*event).event_type = EventType::FsOpen as u32;
             (*event).verdict = Verdict::Block as u32;
-            (*event).cgroup_id = cgroup_id;
             (*event).inode = inode_nr;
             (*event).flags = flags;
             (*event)._pad = 0;
@@ -149,6 +147,8 @@ unsafe fn is_proc_environ(file_ptr: *const u8, offs: &KernelOffsets) -> bool {
     if inode_ptr.is_null() {
         return false;
     }
+
+    // Read the superblock pointer from inode->i_sb.
     let sb_ptr: *const u8 = match read_at(inode_ptr, offs.inode_i_sb) {
         Ok(p) => p,
         Err(_) => return false,
@@ -156,6 +156,8 @@ unsafe fn is_proc_environ(file_ptr: *const u8, offs: &KernelOffsets) -> bool {
     if sb_ptr.is_null() {
         return false;
     }
+
+    // Check filesystem magic -- only proceed if this is procfs.
     let s_magic: u64 = match read_at(sb_ptr, offs.sb_s_magic) {
         Ok(v) => v,
         Err(_) => return false,
@@ -199,74 +201,6 @@ unsafe fn is_proc_environ(file_ptr: *const u8, offs: &KernelOffsets) -> bool {
         && name_buf[7] == 0
 }
 
-/// Detect a cgroup-migration control file (`cgroup.procs` / `cgroup.threads`) on
-/// a cgroup2 filesystem, by the same s_magic + dentry-name technique as
-/// [`is_proc_environ`]. Writing these files moves a task between cgroups; an
-/// enforced task writing one would migrate itself into a sibling/parent cgroup
-/// and escape enforcement.
-#[inline(always)]
-unsafe fn is_cgroup_migration_file(file_ptr: *const u8, offs: &KernelOffsets) -> bool {
-    let inode_ptr: *const u8 = match read_at(file_ptr, offs.file_f_inode) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    if inode_ptr.is_null() {
-        return false;
-    }
-    let sb_ptr: *const u8 = match read_at(inode_ptr, offs.inode_i_sb) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    if sb_ptr.is_null() {
-        return false;
-    }
-    let s_magic: u64 = match read_at(sb_ptr, offs.sb_s_magic) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    if s_magic != CGROUP2_SUPER_MAGIC {
-        return false;
-    }
-
-    let dentry_ptr: *const u8 = match read_at(file_ptr, offs.file_f_path + offs.path_dentry) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    if dentry_ptr.is_null() {
-        return false;
-    }
-    let name_ptr: *const u8 = match read_at(dentry_ptr, offs.dentry_d_name + offs.qstr_name) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    if name_ptr.is_null() {
-        return false;
-    }
-
-    let mut name_buf = [0u8; DENTRY_NAME_LEN];
-    if bpf_probe_read_kernel_buf(name_ptr, &mut name_buf[..DENTRY_NAME_LEN - 1]).is_err() {
-        return false;
-    }
-    name_is(&name_buf, b"cgroup.procs\0") || name_is(&name_buf, b"cgroup.threads\0")
-}
-
-/// Compare a null-padded dentry-name buffer against a null-terminated target.
-/// The `< DENTRY_NAME_LEN` guard gives the verifier a hard loop bound.
-#[inline(always)]
-fn name_is(buf: &[u8; DENTRY_NAME_LEN], target: &[u8]) -> bool {
-    let mut i = 0usize;
-    while i < DENTRY_NAME_LEN {
-        if i >= target.len() {
-            break;
-        }
-        if buf[i] != target[i] {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
-
 /// Read a byte buffer from kernel memory. Wraps bpf_probe_read_kernel for
 /// copying into a mutable slice.
 #[inline(always)]
@@ -293,33 +227,35 @@ unsafe fn bpf_probe_read_kernel_buf(src: *const u8, dst: &mut [u8]) -> Result<()
 pub fn ac_file_open(ctx: LsmContext) -> i32 {
     match try_file_open(&ctx) {
         Ok(ret) => ret,
-        Err(_) => LSM_ALLOW, // On error, fail open (same as C implementation)
+        // Fail-closed for subjects we already confirmed are under enforcement:
+        // try_file_open only returns Err after cgroup/PID sticky membership is
+        // established. Unenforced host tasks never reach those fallible paths
+        // (they return Ok(LSM_ALLOW) at the scoping gate).
+        Err(_) => LSM_DENY,
     }
 }
 
 #[inline(always)]
 fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
-    // 0. Cgroup scoping: only enforce for processes in target containers.
-    //    LSM hooks are system-wide; skip all non-container processes. Subtree
-    //    match: `cgid` is the enforced ANCESTOR when the task was moved into a
-    //    descendant cgroup, so the per-cgroup inode maps (keyed by the registered
-    //    cgroup id) are consulted for the descendant too.
+    // 0. Cgroup / process-tree scoping: only enforce for agent-container subjects.
+    //    LSM hooks are system-wide; skip all non-container processes.
+    //    `cgid` is the governing enforced cgroup (ancestor or sticky).
     let cgid = match crate::maps::enforced_cgroup_for_current() {
         Some(id) => id,
         None => return Ok(LSM_ALLOW),
     };
 
-    // BTF-resolved field offsets. Absent means userspace failed to populate them;
-    // file_open's error policy is fail-open (matches the `Err` arm below).
+    // BTF-resolved field offsets. Absent means userspace failed to populate them.
+    // For an enforced subject that is fail-closed: cannot verify → deny.
     let offs = match KERNEL_OFFSETS.get(0) {
         Some(o) => o,
-        None => return Ok(LSM_ALLOW),
+        None => return Ok(LSM_DENY),
     };
 
     // Get the file pointer from the LSM hook argument.
     let file_ptr: *const u8 = unsafe { ctx.arg::<*const u8>(0) };
     if file_ptr.is_null() {
-        return Ok(LSM_ALLOW);
+        return Ok(LSM_DENY);
     }
 
     // 1. Check for /proc/*/environ -- always block to protect credentials.
@@ -328,16 +264,17 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
     if unsafe { is_proc_environ(file_ptr, offs) } {
         bump_fs_stat(agentcontainer_common::events::STAT_FS_BLOCKED);
         bump_cgroup_stat(cgid, CGROUP_STAT_FS_BLOCKED);
-        emit_fs_block_event(cgid, 0, 0);
+        emit_fs_block_event(0, 0);
         return Ok(LSM_DENY);
     }
 
     // Read the inode via file->f_inode (stable since v3.9 — no dentry walk).
+    // Unverifiable identity for an enforced subject is fail-closed.
     let inode_ptr: *const u8 = unsafe { read_at(file_ptr, offs.file_f_inode)? };
     if inode_ptr.is_null() {
-        bump_fs_stat(agentcontainer_common::events::STAT_FS_ALLOWED);
-        bump_cgroup_stat(cgid, CGROUP_STAT_FS_ALLOWED);
-        return Ok(LSM_ALLOW);
+        bump_fs_stat(agentcontainer_common::events::STAT_FS_BLOCKED);
+        bump_cgroup_stat(cgid, CGROUP_STAT_FS_BLOCKED);
+        return Ok(LSM_DENY);
     }
 
     // Read inode number.
@@ -346,42 +283,23 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
     // Read file flags (file.f_flags) at its BTF-resolved offset.
     let flags: u32 = unsafe { read_at(file_ptr, offs.file_f_flags)? };
 
-    // Deny an enforced task migrating itself out of the governed cgroup by
-    // WRITING cgroup.procs/cgroup.threads. Subtree-match keeps descendants
-    // governed; this blocks a move into a sibling/parent (non-descendant) cgroup
-    // — the self-migration half of the cgroup-move escape (Escape-the-Box T11
-    // cgroup.procs vector). Reads (listing members) are allowed; only the
-    // migrating write is denied. Kernel-enforced, so it holds even where
-    // cgroupfs is writable (an adversarial substrate). Initial placement is done
-    // by a not-yet-enforced launcher, so legitimate placement still works.
-    let cgroup_write = (flags & 0x01) != 0    // O_WRONLY
-        || (flags & 0x02) != 0                 // O_RDWR
-        || (flags & 0o100) != 0               // O_CREAT
-        || (flags & 0o1000) != 0              // O_TRUNC
-        || (flags & 0o2000) != 0; // O_APPEND
-    if cgroup_write && unsafe { is_cgroup_migration_file(file_ptr, offs) } {
-        bump_fs_stat(agentcontainer_common::events::STAT_FS_BLOCKED);
-        bump_cgroup_stat(cgid, CGROUP_STAT_FS_BLOCKED);
-        emit_fs_block_event(cgid, 0, flags);
-        return Ok(LSM_DENY);
-    }
-
     // Read the superblock to get the device number.
     let sb_ptr: *const u8 = unsafe { read_at(inode_ptr, offs.inode_i_sb)? };
     if sb_ptr.is_null() {
-        bump_fs_stat(agentcontainer_common::events::STAT_FS_ALLOWED);
-        bump_cgroup_stat(cgid, CGROUP_STAT_FS_ALLOWED);
-        return Ok(LSM_ALLOW);
+        bump_fs_stat(agentcontainer_common::events::STAT_FS_BLOCKED);
+        bump_cgroup_stat(cgid, CGROUP_STAT_FS_BLOCKED);
+        return Ok(LSM_DENY);
     }
 
     let s_dev: u32 = unsafe { read_at(sb_ptr, offs.sb_s_dev)? };
 
     // Build lookup key with actual device numbers.
     // Linux dev_t: MAJOR(dev) = (dev >> 20) & 0xfff, MINOR(dev) = dev & 0xfffff
-    let key = FsInodeKey {
+    let key = ScopedFsInodeKey {
         inode: ino,
         dev_major: (s_dev >> 20) & 0xfff,
         dev_minor: s_dev & 0xfffff,
+        // ScopedFsInodeKey is now cgroup-scoped; use this hook's own exact-match cgid.
         cgroup_id: cgid,
     };
 
@@ -421,68 +339,19 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
             return Ok(LSM_DENY);
         }
 
-        // Per-tool restriction: a restricted secret (non-empty allowed-tools)
-        // may be read only while one of its allowed tools has an active
-        // tool-call window for this cgroup. An empty allowed-tools list leaves
-        // restricted == 0 and keeps container-wide access.
-        if acl.restricted != 0 {
-            match unsafe { ACTIVE_TOOL.get(&cgid) } {
-                None => {
-                    // No tool-call window open — deny.
-                    bump_cred_stat(agentcontainer_common::events::STAT_CRED_BLOCKED);
-                    bump_cgroup_stat(cgid, CGROUP_STAT_CRED_BLOCKED);
-                    emit_cred_block_event(ino, cgid, CRED_REASON_NO_ACTIVE_TOOL);
-                    return Ok(LSM_DENY);
-                }
-                Some(active_tool) => {
-                    // Expired window (a lost CompleteToolCall): treat as closed
-                    // and deny, so access cannot stay open indefinitely.
-                    if active_tool.expires_at_ns != 0 && now_ns > active_tool.expires_at_ns {
-                        bump_cred_stat(agentcontainer_common::events::STAT_CRED_BLOCKED);
-                        bump_cgroup_stat(cgid, CGROUP_STAT_CRED_BLOCKED);
-                        emit_cred_block_event(ino, cgid, CRED_REASON_NO_ACTIVE_TOOL);
-                        return Ok(LSM_DENY);
-                    }
-                    let tool_key = SecretToolKey {
-                        inode: ino,
-                        dev_major: (s_dev >> 20) & 0xfff,
-                        dev_minor: s_dev & 0xfffff,
-                        cgroup_id: cgid,
-                        tool_id: active_tool.tool_id,
-                    };
-                    if unsafe { SECRET_TOOL_ACLS.get(&tool_key) }.is_none() {
-                        // The active tool is not allowed this secret — deny.
-                        bump_cred_stat(agentcontainer_common::events::STAT_CRED_BLOCKED);
-                        bump_cgroup_stat(cgid, CGROUP_STAT_CRED_BLOCKED);
-                        emit_cred_block_event(ino, cgid, CRED_REASON_TOOL_NOT_ALLOWED);
-                        return Ok(LSM_DENY);
-                    }
-                }
-            }
-        }
-
         // Allowed — this cgroup may read this secret.
         bump_cred_stat(agentcontainer_common::events::STAT_CRED_ALLOWED);
         bump_cgroup_stat(cgid, CGROUP_STAT_CRED_ALLOWED);
         return Ok(LSM_ALLOW);
     }
     // No ACL entry — fall through to general FS enforcement.
-    //
-    // A secret file is identified here only by the presence of its SECRET_ACLS
-    // entry (keyed by inode); the kernel cannot tell from the inode alone that
-    // an un-ACL'd file is a secret. The fail-closed guarantee therefore lives in
-    // userspace: the runtime injects every secret and installs its ACL while the
-    // container is paused, and aborts (tearing the container down) if any ACL
-    // cannot be resolved. By the time the container runs, every injected secret
-    // has an ACL entry above — so there is no "registered secret without an ACL"
-    // case that could reach this default-allow path.
 
     // 2. Check denied inodes (deny list takes priority).
     let denied = unsafe { DENIED_INODES.get(&key) };
     if denied.is_some() {
         bump_fs_stat(agentcontainer_common::events::STAT_FS_BLOCKED);
         bump_cgroup_stat(cgid, CGROUP_STAT_FS_BLOCKED);
-        emit_fs_block_event(cgid, ino, flags);
+        emit_fs_block_event(ino, flags);
         return Ok(LSM_DENY);
     }
 
@@ -499,7 +368,7 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
         if write_access && (*perm & FS_PERM_WRITE) == 0 {
             bump_fs_stat(agentcontainer_common::events::STAT_FS_BLOCKED);
             bump_cgroup_stat(cgid, CGROUP_STAT_FS_BLOCKED);
-            emit_fs_block_event(cgid, ino, flags);
+            emit_fs_block_event(ino, flags);
             return Ok(LSM_DENY);
         }
 
@@ -508,16 +377,9 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
         return Ok(LSM_ALLOW);
     }
 
-    // 4. Deny-list mode default: ALLOW. Kernel read/write *allowlist*
-    //    enforcement (default-deny) is deferred until inode-ancestry
-    //    matching lands — exact-inode matching cannot cover files beneath
-    //    allowed directories, so default-deny would block every container
-    //    file not explicitly listed (libc, /etc/ld.so.cache, ...).
-    //    DENIED_INODES, SECRET_ACLS, /proc/*/environ, and write-protection
-    //    on explicitly listed read-only inodes remain enforced above.
-    //    No event emission here: allow-path file opens are far too frequent
-    //    for the ring buffer.
-    bump_fs_stat(agentcontainer_common::events::STAT_FS_ALLOWED);
-    bump_cgroup_stat(cgid, CGROUP_STAT_FS_ALLOWED);
-    Ok(LSM_ALLOW)
+    // 4. Default deny.
+    bump_fs_stat(agentcontainer_common::events::STAT_FS_BLOCKED);
+    bump_cgroup_stat(cgid, CGROUP_STAT_FS_BLOCKED);
+    emit_fs_block_event(ino, flags);
+    Ok(LSM_DENY)
 }

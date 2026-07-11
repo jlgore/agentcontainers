@@ -32,12 +32,11 @@ use agentcontainer_common::events::{NetworkEvent, STAT_NET_ALLOWED, STAT_NET_BLO
 use agentcontainer_common::helpers::{
     extract_v4_from_mapped, is_loopback_v4, is_loopback_v6, is_v4_mapped_v6,
 };
-use agentcontainer_common::maps::{LpmDataV4, LpmDataV6, PortKeyV4, PortKeyV6, LPM_CGROUP_PREFIX};
+use agentcontainer_common::maps::{ScopedLpmKeyV4, ScopedLpmKeyV6, ScopedPortKeyV4};
 
 use crate::maps::{
     bump_cgroup_stat, ALLOWED_PORTS, ALLOWED_V4, ALLOWED_V6, BLOCKED_CIDRS_V4, BLOCKED_CIDRS_V6,
-    CGROUP_STAT_NET_ALLOWED, CGROUP_STAT_NET_BLOCKED, NET_EVENTS, NET_STATS, TRANSIENT_PORTS,
-    TRANSIENT_PORTS_V6,
+    CGROUP_STAT_NET_ALLOWED, CGROUP_STAT_NET_BLOCKED, NET_EVENTS, NET_STATS,
 };
 
 // --- Inline helpers ---
@@ -54,7 +53,7 @@ fn bump_stat(idx: u32) {
 
 /// Emit a block event for an IPv4 connection to the NET_EVENTS ring buffer.
 #[inline(always)]
-fn emit_block_event_v4(cgroup_id: u64, dst_ip: u32, dst_port: u16, proto: u8, event_type: u32) {
+fn emit_block_event_v4(dst_ip: u32, dst_port: u16, proto: u8, event_type: u32) {
     if let Some(mut entry) = NET_EVENTS.reserve::<NetworkEvent>(0) {
         let ev = entry.as_mut_ptr();
         unsafe {
@@ -68,7 +67,6 @@ fn emit_block_event_v4(cgroup_id: u64, dst_ip: u32, dst_port: u16, proto: u8, ev
 
             (*ev).event_type = event_type;
             (*ev).verdict = 1; // Block
-            (*ev).cgroup_id = cgroup_id;
 
             (*ev).dst_ip4 = dst_ip;
             (*ev).dst_ip6 = [0, 0, 0, 0];
@@ -87,13 +85,7 @@ fn emit_block_event_v4(cgroup_id: u64, dst_ip: u32, dst_port: u16, proto: u8, ev
 
 /// Emit a block event for an IPv6 connection to the NET_EVENTS ring buffer.
 #[inline(always)]
-fn emit_block_event_v6(
-    cgroup_id: u64,
-    dst_ip6: [u32; 4],
-    dst_port: u16,
-    proto: u8,
-    event_type: u32,
-) {
+fn emit_block_event_v6(dst_ip6: [u32; 4], dst_port: u16, proto: u8, event_type: u32) {
     if let Some(mut entry) = NET_EVENTS.reserve::<NetworkEvent>(0) {
         let ev = entry.as_mut_ptr();
         unsafe {
@@ -107,7 +99,6 @@ fn emit_block_event_v6(
 
             (*ev).event_type = event_type;
             (*ev).verdict = 1; // Block
-            (*ev).cgroup_id = cgroup_id;
 
             (*ev).dst_ip4 = 0;
             (*ev).dst_ip6 = dst_ip6;
@@ -124,9 +115,7 @@ fn emit_block_event_v6(
     }
 }
 
-/// Returns Some(enforced cgroup id) if the current task is under an enforced
-/// cgroup — directly OR as a descendant (subtree match; see
-/// [`crate::maps::enforced_cgroup_for_current`]).
+/// Check if the current cgroup is enforced. Returns Some(cgroup_id) if enforcement applies.
 #[inline(always)]
 fn get_enforced_cgroup() -> Option<u64> {
     crate::maps::enforced_cgroup_for_current()
@@ -136,6 +125,27 @@ fn get_enforced_cgroup() -> Option<u64> {
 
 const EVENT_NET_CONNECT: u32 = 1; // EventType::NetworkConnect
 
+const CGROUP_PREFIX_BITS: u32 = 64;
+const IPV4_PREFIX_BITS: u32 = CGROUP_PREFIX_BITS + 32;
+const IPV6_PREFIX_BITS: u32 = CGROUP_PREFIX_BITS + 128;
+
+#[inline(always)]
+fn scoped_lpm_v4(cgroup_id: u64, addr: u32) -> Key<ScopedLpmKeyV4> {
+    Key::new(
+        IPV4_PREFIX_BITS,
+        ScopedLpmKeyV4 {
+            cgroup_id,
+            addr,
+            _pad: 0,
+        },
+    )
+}
+
+#[inline(always)]
+fn scoped_lpm_v6(cgroup_id: u64, addr: [u32; 4]) -> Key<ScopedLpmKeyV6> {
+    Key::new(IPV6_PREFIX_BITS, ScopedLpmKeyV6 { cgroup_id, addr })
+}
+
 // ---------------------------------------------------------------------------
 // cgroup/connect4 -- intercepts IPv4 connect() syscalls.
 // ---------------------------------------------------------------------------
@@ -144,7 +154,7 @@ const EVENT_NET_CONNECT: u32 = 1; // EventType::NetworkConnect
 pub fn ac_connect4(ctx: SockAddrContext) -> i32 {
     match try_connect4(&ctx) {
         Ok(ret) => ret,
-        Err(_) => 1, // Allow on error (fail-open for hooks)
+        Err(_) => 0, // Block on BPF errors; cgroup_sock_addr uses 1=allow, 0=deny.
     }
 }
 
@@ -165,24 +175,17 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
         None => return Ok(1),
     };
 
-    // 3. Check blocked CIDRs (deny list takes priority), scoped per-cgroup.
-    let lpm = Key::new(
-        LPM_CGROUP_PREFIX + 32,
-        LpmDataV4 {
-            cgroup_id,
-            addr: dst,
-            _pad: 0,
-        },
-    );
+    // 3. Check blocked CIDRs (deny list takes priority).
+    let lpm = Key::new(32, dst);
     if unsafe { BLOCKED_CIDRS_V4.get(&lpm) }.is_some() {
         bump_stat(STAT_NET_BLOCKED);
         bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_BLOCKED);
-        emit_block_event_v4(cgroup_id, dst, port, proto, EVENT_NET_CONNECT);
+        emit_block_event_v4(dst, port, proto, EVENT_NET_CONNECT);
         return Ok(0);
     }
 
     // 4. Check allowed ports (specific IP+port+protocol tuples).
-    let pk = PortKeyV4 {
+    let pk = ScopedPortKeyV4 {
         cgroup_id,
         ip: dst,
         port,
@@ -196,29 +199,17 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
     }
 
     // 5. Check allowed CIDRs (LPM trie longest prefix match).
-    if unsafe { ALLOWED_V4.get(&lpm) }.is_some() {
+    let scoped_lpm = scoped_lpm_v4(cgroup_id, dst);
+    if unsafe { ALLOWED_V4.get(&scoped_lpm) }.is_some() {
         bump_stat(STAT_NET_ALLOWED);
         bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_ALLOWED);
         return Ok(1);
     }
 
-    // 5b. Check transient per-tool-call egress (G4: URI-scoped egress). The
-    // entry is keyed like ALLOWED_PORTS; the value is a CLOCK_MONOTONIC
-    // expiry. A non-expired entry grants egress only for this tool-call
-    // window; an expired one (lost CompleteToolCall) falls through to deny.
-    if let Some(&expires_at_ns) = unsafe { TRANSIENT_PORTS.get(&pk) } {
-        let now_ns = unsafe { bpf_ktime_get_ns() };
-        if expires_at_ns == 0 || now_ns <= expires_at_ns {
-            bump_stat(STAT_NET_ALLOWED);
-            bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_ALLOWED);
-            return Ok(1);
-        }
-    }
-
     // 6. Default deny.
     bump_stat(STAT_NET_BLOCKED);
     bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_BLOCKED);
-    emit_block_event_v4(cgroup_id, dst, port, proto, EVENT_NET_CONNECT);
+    emit_block_event_v4(dst, port, proto, EVENT_NET_CONNECT);
     Ok(0)
 }
 
@@ -230,7 +221,7 @@ fn try_connect4(ctx: &SockAddrContext) -> Result<i32, i64> {
 pub fn ac_connect6(ctx: SockAddrContext) -> i32 {
     match try_connect6(&ctx) {
         Ok(ret) => ret,
-        Err(_) => 1, // Allow on error (fail-open for hooks)
+        Err(_) => 0, // Block on BPF errors; cgroup_sock_addr uses 1=allow, 0=deny.
     }
 }
 
@@ -262,25 +253,18 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
     //    IPv4 blocked/allowed rules to prevent bypass via dual-stack (RT-C3).
     if is_v4_mapped_v6(&dst6) {
         let v4addr = extract_v4_from_mapped(&dst6);
-        let lpm4 = Key::new(
-            LPM_CGROUP_PREFIX + 32,
-            LpmDataV4 {
-                cgroup_id,
-                addr: v4addr,
-                _pad: 0,
-            },
-        );
+        let lpm4 = Key::new(32, v4addr);
 
         // Check IPv4 blocked CIDRs (metadata endpoint, etc.).
         if unsafe { BLOCKED_CIDRS_V4.get(&lpm4) }.is_some() {
             bump_stat(STAT_NET_BLOCKED);
             bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_BLOCKED);
-            emit_block_event_v6(cgroup_id, dst6, port, proto, EVENT_NET_CONNECT);
+            emit_block_event_v6(dst6, port, proto, EVENT_NET_CONNECT);
             return Ok(0);
         }
 
         // Check IPv4 allowed ports.
-        let pk = PortKeyV4 {
+        let pk = ScopedPortKeyV4 {
             cgroup_id,
             ip: v4addr,
             port,
@@ -293,19 +277,9 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
             return Ok(1);
         }
 
-        // Check IPv4 transient per-tool-call egress (G4) — a dual-stack/v4-mapped
-        // socket must honor the same transient window as a native-v4 connect.
-        if let Some(&expires_at_ns) = unsafe { TRANSIENT_PORTS.get(&pk) } {
-            let now_ns = unsafe { bpf_ktime_get_ns() };
-            if expires_at_ns == 0 || now_ns <= expires_at_ns {
-                bump_stat(STAT_NET_ALLOWED);
-                bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_ALLOWED);
-                return Ok(1);
-            }
-        }
-
         // Check IPv4 allowed CIDRs.
-        if unsafe { ALLOWED_V4.get(&lpm4) }.is_some() {
+        let scoped_lpm4 = scoped_lpm_v4(cgroup_id, v4addr);
+        if unsafe { ALLOWED_V4.get(&scoped_lpm4) }.is_some() {
             bump_stat(STAT_NET_ALLOWED);
             bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_ALLOWED);
             return Ok(1);
@@ -315,52 +289,26 @@ fn try_connect6(ctx: &SockAddrContext) -> Result<i32, i64> {
         // also have ::ffff-mapped entries for defense-in-depth.
     }
 
-    // 4. Check IPv6 blocked CIDRs, scoped per-cgroup.
-    let lpm6 = Key::new(
-        LPM_CGROUP_PREFIX + 128,
-        LpmDataV6 {
-            cgroup_id,
-            addr: dst6,
-        },
-    );
+    // 4. Check IPv6 blocked CIDRs.
+    let lpm6 = Key::new(128, dst6);
     if unsafe { BLOCKED_CIDRS_V6.get(&lpm6) }.is_some() {
         bump_stat(STAT_NET_BLOCKED);
         bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_BLOCKED);
-        emit_block_event_v6(cgroup_id, dst6, port, proto, EVENT_NET_CONNECT);
+        emit_block_event_v6(dst6, port, proto, EVENT_NET_CONNECT);
         return Ok(0);
     }
 
     // 5. Check IPv6 allowed CIDRs.
-    if unsafe { ALLOWED_V6.get(&lpm6) }.is_some() {
+    let scoped_lpm6 = scoped_lpm_v6(cgroup_id, dst6);
+    if unsafe { ALLOWED_V6.get(&scoped_lpm6) }.is_some() {
         bump_stat(STAT_NET_ALLOWED);
         bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_ALLOWED);
         return Ok(1);
     }
 
-    // 5b. Check IPv6 transient per-tool-call egress (G4: URI-scoped egress).
-    // The only port-scoped v6 check; keyed like TRANSIENT_PORTS but on the full
-    // 128-bit address. A non-expired entry grants egress for this window only;
-    // an expired one (lost CompleteToolCall) falls through to deny.
-    let pk6 = PortKeyV6 {
-        cgroup_id,
-        addr: dst6,
-        port,
-        protocol: proto,
-        _pad: 0,
-        _pad2: 0,
-    };
-    if let Some(&expires_at_ns) = unsafe { TRANSIENT_PORTS_V6.get(&pk6) } {
-        let now_ns = unsafe { bpf_ktime_get_ns() };
-        if expires_at_ns == 0 || now_ns <= expires_at_ns {
-            bump_stat(STAT_NET_ALLOWED);
-            bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_ALLOWED);
-            return Ok(1);
-        }
-    }
-
     // 6. Default deny.
     bump_stat(STAT_NET_BLOCKED);
     bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_BLOCKED);
-    emit_block_event_v6(cgroup_id, dst6, port, proto, EVENT_NET_CONNECT);
+    emit_block_event_v6(dst6, port, proto, EVENT_NET_CONNECT);
     Ok(0)
 }

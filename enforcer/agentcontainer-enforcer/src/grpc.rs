@@ -10,6 +10,7 @@
 //! write lock.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use sha2::{Digest as ShaDigest, Sha256};
@@ -132,8 +133,6 @@ impl Enforcer for EnforcerService {
             .map_err(|e| Status::internal(e.to_string()))?;
 
         // Store init PID if provided (non-zero means caller supplied it).
-        // The manager keeps its own copy for policy-path resolution; this
-        // one serves inject_secrets.
         if req.init_pid != 0 {
             self.container_pids
                 .write()
@@ -177,58 +176,6 @@ impl Enforcer for EnforcerService {
         Ok(Response::new(UnregisterContainerResponse {}))
     }
 
-    async fn prepare_tool_call(
-        &self,
-        request: Request<PrepareToolCallRequest>,
-    ) -> Result<Response<PrepareToolCallResponse>, Status> {
-        let req = request.into_inner();
-        tracing::debug!(
-            container_id = %req.container_id,
-            correlation_id = %req.correlation_id,
-            tool = %req.tool_name,
-            transient_egress = req.transient_egress.len(),
-            "preparing tool-call correlation window"
-        );
-        // G4: convert proto transient egress rules to the policy type.
-        let transient_egress: Vec<policy::EgressRule> = req
-            .transient_egress
-            .into_iter()
-            .map(|r| policy::EgressRule {
-                host: r.host,
-                port: r.port as u16,
-                protocol: r.protocol,
-            })
-            .collect();
-        self.manager
-            .prepare_tool_call(
-                &req.container_id,
-                &req.correlation_id,
-                &req.tool_name,
-                &transient_egress,
-                req.window_timeout_ms,
-            )
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(PrepareToolCallResponse {}))
-    }
-
-    async fn complete_tool_call(
-        &self,
-        request: Request<CompleteToolCallRequest>,
-    ) -> Result<Response<CompleteToolCallResponse>, Status> {
-        let req = request.into_inner();
-        tracing::debug!(
-            container_id = %req.container_id,
-            correlation_id = %req.correlation_id,
-            "completing tool-call correlation window"
-        );
-        self.manager
-            .complete_tool_call(&req.container_id, &req.correlation_id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        Ok(Response::new(CompleteToolCallResponse {}))
-    }
-
     async fn apply_network_policy(
         &self,
         request: Request<NetworkPolicyRequest>,
@@ -253,7 +200,6 @@ impl Enforcer for EnforcerService {
                 return Ok(Response::new(PolicyResponse {
                     success: false,
                     error: format!("port out of range: {}", r.port),
-                    unresolved_hosts: vec![],
                 }));
             }
         }
@@ -292,9 +238,6 @@ impl Enforcer for EnforcerService {
                 })
                 .collect(),
             dns_servers: req.dns_servers,
-            // Not part of the bundle-baseline check above: blocked CIDRs
-            // only narrow what the baseline allows, never widen it.
-            blocked_cidrs: req.blocked_cidrs,
         };
 
         match self
@@ -302,13 +245,12 @@ impl Enforcer for EnforcerService {
             .apply_network(&req.container_id, &net_policy)
             .await
         {
-            Ok(report) => {
+            Ok(()) => {
                 #[cfg(feature = "otel")]
                 _span.set_attribute(ac::enforcement::VERDICT, "allow");
                 Ok(Response::new(PolicyResponse {
                     success: true,
                     error: String::new(),
-                    unresolved_hosts: report.unresolved_hosts,
                 }))
             }
             Err(e) => {
@@ -317,7 +259,6 @@ impl Enforcer for EnforcerService {
                 Ok(Response::new(PolicyResponse {
                     success: false,
                     error: e.to_string(),
-                    unresolved_hosts: vec![],
                 }))
             }
         }
@@ -372,7 +313,6 @@ impl Enforcer for EnforcerService {
                 Ok(Response::new(PolicyResponse {
                     success: true,
                     error: String::new(),
-                    unresolved_hosts: vec![],
                 }))
             }
             Err(e) => {
@@ -381,7 +321,6 @@ impl Enforcer for EnforcerService {
                 Ok(Response::new(PolicyResponse {
                     success: false,
                     error: e.to_string(),
-                    unresolved_hosts: vec![],
                 }))
             }
         }
@@ -421,9 +360,16 @@ impl Enforcer for EnforcerService {
             }
         }
 
-        let proc_policy = policy::ProcessPolicy {
-            allowed_binaries: req.allowed_binaries,
+        let allowed_binaries = if let Some(init_pid) = {
+            let pids = self.container_pids.read().await;
+            pids.get(&req.container_id).copied()
+        } {
+            resolve_process_binaries(init_pid, &req.allowed_binaries)?
+        } else {
+            req.allowed_binaries
         };
+
+        let proc_policy = policy::ProcessPolicy { allowed_binaries };
 
         match self
             .manager
@@ -436,7 +382,6 @@ impl Enforcer for EnforcerService {
                 Ok(Response::new(PolicyResponse {
                     success: true,
                     error: String::new(),
-                    unresolved_hosts: vec![],
                 }))
             }
             Err(e) => {
@@ -445,7 +390,6 @@ impl Enforcer for EnforcerService {
                 Ok(Response::new(PolicyResponse {
                     success: false,
                     error: e.to_string(),
-                    unresolved_hosts: vec![],
                 }))
             }
         }
@@ -558,7 +502,6 @@ impl Enforcer for EnforcerService {
                 Ok(Response::new(PolicyResponse {
                     success: true,
                     error: String::new(),
-                    unresolved_hosts: vec![],
                 }))
             }
             Err(e) => {
@@ -567,7 +510,6 @@ impl Enforcer for EnforcerService {
                 Ok(Response::new(PolicyResponse {
                     success: false,
                     error: e.to_string(),
-                    unresolved_hosts: vec![],
                 }))
             }
         }
@@ -610,8 +552,6 @@ impl Enforcer for EnforcerService {
                     pid: ev.pid,
                     comm: ev.comm,
                     details: ev.details.into_iter().collect(),
-                    cgroup_id: ev.cgroup_id,
-                    correlation_id: ev.correlation_id,
                 };
                 if tx.send(Ok(proto_event)).await.is_err() {
                     break;
@@ -646,8 +586,6 @@ impl Enforcer for EnforcerService {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let lsm = self.manager.lsm_status();
-
         Ok(Response::new(StatsResponse {
             network_allowed: stats.network_allowed,
             network_blocked: stats.network_blocked,
@@ -657,8 +595,6 @@ impl Enforcer for EnforcerService {
             process_blocked: stats.process_blocked,
             credential_allowed: stats.credential_allowed,
             credential_blocked: stats.credential_blocked,
-            lsm_active: lsm.active,
-            lsm_detail: lsm.detail,
         }))
     }
 
@@ -1038,6 +974,229 @@ impl Enforcer for EnforcerService {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Deny-set, bind, and reverse shell RPCs
+    // -----------------------------------------------------------------------
+
+    async fn apply_deny_set_policy(
+        &self,
+        request: Request<ApplyDenySetPolicyRequest>,
+    ) -> Result<Response<PolicyResponse>, Status> {
+        let req = request.into_inner();
+        tracing::info!(
+            container_id = %req.container_id,
+            entries = req.allowed_entries.len(),
+            transitions = req.transitions.len(),
+            "applying deny-set policy"
+        );
+
+        // Look up init_pid from the registered containers.
+        let init_pid = {
+            let pids = self.container_pids.read().await;
+            pids.get(&req.container_id).copied().ok_or_else(|| {
+                Status::not_found(format!("container {} not registered", req.container_id))
+            })?
+        };
+
+        // Resolve each DenySetEntry through the same container-root path
+        // validator used by process policy. Do not concatenate untrusted gRPC
+        // paths into /proc/<pid>/root.
+        let mut resolved_entries = Vec::with_capacity(req.allowed_entries.len());
+        for entry in &req.allowed_entries {
+            let proc_path = resolve_deny_set_binary(init_pid, &entry.binary_path)?;
+            let (inode, dev_major, dev_minor) = stat_binary(&proc_path)?;
+            resolved_entries.push(policy::ResolvedDenySetEntry {
+                deny_set_id: entry.deny_set_id,
+                inode,
+                dev_major,
+                dev_minor,
+            });
+        }
+
+        // Resolve each DenySetTransition child binary through the validated
+        // container-root resolver.
+        let mut resolved_transitions = Vec::with_capacity(req.transitions.len());
+        for t in &req.transitions {
+            let proc_path = resolve_deny_set_binary(init_pid, &t.child_binary_path)?;
+            let (inode, dev_major, dev_minor) = stat_binary(&proc_path)?;
+            resolved_transitions.push(policy::ResolvedDenySetTransition {
+                parent_deny_set_id: t.parent_deny_set_id,
+                child_inode: inode,
+                child_dev_major: dev_major,
+                child_dev_minor: dev_minor,
+                child_deny_set_id: t.child_deny_set_id,
+            });
+        }
+
+        let deny_set_policy = policy::DenySetPolicy {
+            entries: resolved_entries,
+            transitions: resolved_transitions,
+            init_pid,
+            init_deny_set_id: req.init_deny_set_id,
+        };
+
+        match self
+            .manager
+            .apply_deny_set(&req.container_id, &deny_set_policy)
+            .await
+        {
+            Ok(()) => Ok(Response::new(PolicyResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(PolicyResponse {
+                success: false,
+                error: e.to_string(),
+            })),
+        }
+    }
+
+    async fn update_deny_set_policy(
+        &self,
+        request: Request<UpdateDenySetPolicyRequest>,
+    ) -> Result<Response<PolicyResponse>, Status> {
+        let req = request.into_inner();
+        tracing::info!(
+            container_id = %req.container_id,
+            deny_set_id = req.deny_set_id,
+            binary_path = %req.binary_path,
+            "updating deny-set policy entry"
+        );
+
+        // Look up init_pid from the registered containers.
+        let init_pid = {
+            let pids = self.container_pids.read().await;
+            pids.get(&req.container_id).copied().ok_or_else(|| {
+                Status::not_found(format!("container {} not registered", req.container_id))
+            })?
+        };
+
+        // Stat the binary via the validated /proc/<init_pid>/root resolver.
+        let proc_path = resolve_deny_set_binary(init_pid, &req.binary_path)?;
+        let (inode, dev_major, dev_minor) = stat_binary(&proc_path)?;
+
+        let entry = policy::ResolvedDenySetEntry {
+            deny_set_id: req.deny_set_id,
+            inode,
+            dev_major,
+            dev_minor,
+        };
+
+        match self
+            .manager
+            .update_deny_set(&req.container_id, &entry)
+            .await
+        {
+            Ok(()) => Ok(Response::new(PolicyResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(PolicyResponse {
+                success: false,
+                error: e.to_string(),
+            })),
+        }
+    }
+
+    async fn apply_bind_policy(
+        &self,
+        request: Request<BindPolicyRequest>,
+    ) -> Result<Response<PolicyResponse>, Status> {
+        let req = request.into_inner();
+        tracing::info!(
+            container_id = %req.container_id,
+            rules = req.allowed_binds.len(),
+            "applying bind policy"
+        );
+
+        // Validate port ranges before casting to u16.
+        for r in &req.allowed_binds {
+            if r.port > 65535 {
+                return Ok(Response::new(PolicyResponse {
+                    success: false,
+                    error: format!("port out of range: {}", r.port),
+                }));
+            }
+        }
+
+        let bind_policy = policy::BindPolicy {
+            rules: req
+                .allowed_binds
+                .into_iter()
+                .map(|r| {
+                    let protocol = match r.protocol.as_str() {
+                        "tcp" => 6u8,
+                        "udp" => 17u8,
+                        _ => 0u8,
+                    };
+                    policy::BindRule {
+                        port: r.port as u16,
+                        protocol,
+                    }
+                })
+                .collect(),
+        };
+
+        match self
+            .manager
+            .apply_bind(&req.container_id, &bind_policy)
+            .await
+        {
+            Ok(()) => Ok(Response::new(PolicyResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(PolicyResponse {
+                success: false,
+                error: e.to_string(),
+            })),
+        }
+    }
+
+    async fn configure_reverse_shell_detection(
+        &self,
+        request: Request<ReverseShellConfigRequest>,
+    ) -> Result<Response<PolicyResponse>, Status> {
+        let req = request.into_inner();
+        tracing::info!(
+            container_id = %req.container_id,
+            mode = %req.mode,
+            "configuring reverse shell detection"
+        );
+
+        let mode = match req.mode.as_str() {
+            "enforce" => 0u8,
+            "log" => 1u8,
+            "off" => 2u8,
+            other => {
+                return Ok(Response::new(PolicyResponse {
+                    success: false,
+                    error: format!(
+                        "unknown mode {:?}: expected \"enforce\", \"log\", or \"off\"",
+                        other
+                    ),
+                }));
+            }
+        };
+
+        let config = policy::ReverseShellConfig { mode };
+
+        match self
+            .manager
+            .configure_reverse_shell(&req.container_id, &config)
+            .await
+        {
+            Ok(()) => Ok(Response::new(PolicyResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(PolicyResponse {
+                success: false,
+                error: e.to_string(),
+            })),
+        }
+    }
+
     async fn inject_secrets(
         &self,
         request: Request<InjectSecretsRequest>,
@@ -1083,27 +1242,6 @@ impl Enforcer for EnforcerService {
         std::fs::create_dir_all(&proc_root)
             .map_err(|e| Status::internal(format!("mkdir {}: {}", proc_root, e)))?;
 
-        // Own the secrets by the account the container actually runs as. The
-        // enforcer writes them as root (it is root), so a non-root agent
-        // (USER != root in the image) cannot read its own secrets unless we
-        // chown them. The uid/gid is read from the init process's
-        // /proc/<pid>/status (real uid/gid, first field after the label).
-        let (agent_uid, agent_gid) = {
-            let status = std::fs::read_to_string(format!("/proc/{}/status", init_pid))
-                .map_err(|e| Status::internal(format!("read /proc/{}/status: {}", init_pid, e)))?;
-            let field = |label: &str| -> u32 {
-                status
-                    .lines()
-                    .find_map(|l| l.strip_prefix(label))
-                    .and_then(|r| r.split_whitespace().next())
-                    .and_then(|t| t.parse().ok())
-                    .unwrap_or(0)
-            };
-            (field("Uid:"), field("Gid:"))
-        };
-        std::os::unix::fs::chown(&proc_root, Some(agent_uid), Some(agent_gid))
-            .map_err(|e| Status::internal(format!("chown {}: {}", proc_root, e)))?;
-
         let mut count = 0u32;
         for secret in &req.secrets {
             let path = format!("{}/{}", proc_root, secret.name);
@@ -1121,9 +1259,6 @@ impl Enforcer for EnforcerService {
             std::fs::rename(&tmp_path, &path)
                 .map_err(|e| Status::internal(format!("rename {} -> {}: {}", tmp_path, path, e)))?;
 
-            std::os::unix::fs::chown(&path, Some(agent_uid), Some(agent_gid))
-                .map_err(|e| Status::internal(format!("chown {}: {}", path, e)))?;
-
             count += 1;
         }
 
@@ -1140,123 +1275,72 @@ impl Enforcer for EnforcerService {
             injected_count: count,
         }))
     }
-
-    async fn set_immutable(
-        &self,
-        request: Request<SetImmutableRequest>,
-    ) -> Result<Response<SetImmutableResponse>, Status> {
-        let req = request.into_inner();
-
-        // Look up init PID, copying the value so the read guard can be dropped.
-        let init_pid = {
-            let pids = self.container_pids.read().await;
-            pids.get(&req.container_id).copied().ok_or_else(|| {
-                Status::not_found(format!("container {} not registered", req.container_id))
-            })?
-        };
-
-        // SEC: validate every path up-front. Paths are absolute in the agent
-        // namespace; a ".." component could escape /proc/<pid>/root back onto the
-        // host. The run flow only sends trusted Catalog paths, but the enforcer
-        // never trusts its caller.
-        for p in &req.paths {
-            if !p.starts_with('/') || p.split('/').any(|c| c == "..") {
-                return Err(Status::invalid_argument(format!(
-                    "invalid path {:?}: must be absolute with no \"..\" component",
-                    p
-                )));
-            }
-        }
-
-        let mut changed = 0u32;
-        for p in &req.paths {
-            let full = format!("/proc/{}/root{}", init_pid, p);
-            match set_immutable_flag(&full, req.immutable) {
-                Ok(true) => changed += 1,
-                Ok(false) => {}                        // already in desired state
-                Err(SetImmutableError::NotFound) => {} // missing file — skip, not fatal
-                Err(SetImmutableError::Io(e)) => {
-                    return Err(Status::internal(format!(
-                        "set immutable={} on {}: {}",
-                        req.immutable, full, e
-                    )));
-                }
-            }
-        }
-
-        tracing::info!(
-            container_id = %req.container_id,
-            immutable = req.immutable,
-            changed = changed,
-            "execution-config immutability updated via /proc/{}/root",
-            init_pid,
-        );
-
-        Ok(Response::new(SetImmutableResponse {
-            success: true,
-            error: String::new(),
-            changed_count: changed,
-        }))
-    }
 }
 
-/// Outcome-distinguishing error for [`set_immutable_flag`]: a missing target is
-/// skippable (the Catalog surface simply does not exist in this image), while an
-/// I/O/ioctl failure is fatal.
-#[allow(dead_code)] // NotFound is only constructed on Linux.
-enum SetImmutableError {
-    NotFound,
-    Io(std::io::Error),
+/// Stat a binary path and return (inode, dev_major, dev_minor).
+///
+/// Used by deny-set handlers to resolve binary paths inside a container's
+/// root filesystem via `/proc/<pid>/root/<path>`.
+fn stat_binary(path: &str) -> Result<(u64, u32, u32), Status> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = std::fs::metadata(path)
+        .map_err(|e| Status::internal(format!("failed to stat {}: {}", path, e)))?;
+    let dev = meta.dev();
+    let dev_major = (((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff)) as u32;
+    let dev_minor = ((dev & 0xff) | ((dev >> 12) & !0xff)) as u32;
+    Ok((meta.ino(), dev_major, dev_minor))
 }
 
-/// Set (`on=true`) or clear (`on=false`) `FS_IMMUTABLE_FL` on `path` via ioctl,
-/// returning `Ok(true)` if the bit changed and `Ok(false)` if it was already in
-/// the desired state. Requires `CAP_LINUX_IMMUTABLE` (granted to the enforcer
-/// sidecar). Mirrors `internal/harness/immutable_linux.go`: `O_RDONLY` is
-/// sufficient — the flag ioctl does not need write permission.
-#[cfg(target_os = "linux")]
-fn set_immutable_flag(path: &str, on: bool) -> Result<bool, SetImmutableError> {
-    use std::os::unix::io::AsRawFd;
+fn resolve_process_binaries(init_pid: u32, binaries: &[String]) -> Result<Vec<String>, Status> {
+    let mut resolved = Vec::with_capacity(binaries.len());
+    for binary in binaries {
+        resolved.push(resolve_process_binary(init_pid, binary)?);
+    }
+    Ok(resolved)
+}
 
-    // Fixed kernel ABI values (libc 0.2 does not export the FS_IOC_* requests).
-    const FS_IOC_GETFLAGS: libc::c_ulong = 0x8008_6601;
-    const FS_IOC_SETFLAGS: libc::c_ulong = 0x4008_6602;
-    const FS_IMMUTABLE_FL: libc::c_int = 0x0000_0010;
+fn resolve_deny_set_binary(init_pid: u32, binary: &str) -> Result<String, Status> {
+    if !binary.starts_with('/') {
+        return Err(Status::invalid_argument(
+            "deny-set binary path must be absolute",
+        ));
+    }
+    resolve_process_binary(init_pid, binary)
+}
 
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(SetImmutableError::NotFound)
+fn resolve_process_binary(init_pid: u32, binary: &str) -> Result<String, Status> {
+    if binary.trim().is_empty() {
+        return Err(Status::invalid_argument("process binary must not be empty"));
+    }
+    if binary.contains("..") {
+        return Err(Status::invalid_argument(
+            "process binary must not contain '..'",
+        ));
+    }
+
+    let proc_root = format!("/proc/{}/root", init_pid);
+    if binary.starts_with('/') {
+        let candidate = format!("{}{}", proc_root, binary);
+        if Path::new(&candidate).exists() {
+            return Ok(candidate);
         }
-        Err(e) => return Err(SetImmutableError::Io(e)),
-    };
-    let fd = file.as_raw_fd();
+        return Err(Status::invalid_argument(format!(
+            "allowed binary {} does not exist in container root",
+            binary
+        )));
+    }
 
-    let mut flags: libc::c_int = 0;
-    // SAFETY: fd is a live open file; &mut flags is a valid out-pointer for the request.
-    if unsafe { libc::ioctl(fd, FS_IOC_GETFLAGS, &mut flags) } != 0 {
-        return Err(SetImmutableError::Io(std::io::Error::last_os_error()));
+    for dir in ["/bin", "/usr/bin", "/usr/local/bin", "/sbin", "/usr/sbin"] {
+        let candidate = format!("{proc_root}{dir}/{binary}");
+        if Path::new(&candidate).exists() {
+            return Ok(candidate);
+        }
     }
-    if (flags & FS_IMMUTABLE_FL != 0) == on {
-        return Ok(false); // already in the desired state — idempotent
-    }
-    if on {
-        flags |= FS_IMMUTABLE_FL;
-    } else {
-        flags &= !FS_IMMUTABLE_FL;
-    }
-    // SAFETY: fd is a live open file; &flags is a valid in-pointer for the request.
-    if unsafe { libc::ioctl(fd, FS_IOC_SETFLAGS, &flags) } != 0 {
-        return Err(SetImmutableError::Io(std::io::Error::last_os_error()));
-    }
-    Ok(true)
-}
 
-#[cfg(not(target_os = "linux"))]
-fn set_immutable_flag(_path: &str, _on: bool) -> Result<bool, SetImmutableError> {
-    Err(SetImmutableError::Io(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "immutable flag is only supported on Linux",
+    Err(Status::invalid_argument(format!(
+        "allowed binary {} could not be resolved in container PATH",
+        binary
     )))
 }
 
@@ -1361,7 +1445,6 @@ mod tests {
                     protocol: "tcp".into(),
                 }],
                 dns_servers: vec!["8.8.8.8".into()],
-                blocked_cidrs: vec![],
             })
             .await
             .unwrap()
@@ -1386,7 +1469,6 @@ mod tests {
                     protocol: "tcp".into(),
                 }],
                 dns_servers: vec![],
-                blocked_cidrs: vec![],
             })
             .await
             .unwrap()
@@ -1609,85 +1691,18 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::Internal);
     }
 
-    #[tokio::test]
-    async fn test_set_immutable_not_registered_returns_not_found() {
-        let (uri, _handle) = start_test_server().await;
-        let mut client = EnforcerClient::connect(uri).await.unwrap();
-
-        let result = client
-            .set_immutable(SetImmutableRequest {
-                container_id: "ctr-never-registered".into(),
-                paths: vec!["/etc/crontab".into()],
-                immutable: true,
-            })
-            .await;
-
-        assert!(
-            result.is_err(),
-            "set_immutable on unregistered container should fail"
-        );
-        assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
+    #[test]
+    fn test_resolve_deny_set_binary_rejects_relative_path() {
+        let err = resolve_deny_set_binary(12345, "bin/sh").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("must be absolute"));
     }
 
-    #[tokio::test]
-    async fn test_set_immutable_rejects_path_traversal() {
-        let (uri, _handle) = start_test_server().await;
-        let mut client = EnforcerClient::connect(uri).await.unwrap();
-
-        client
-            .register_container(RegisterContainerRequest {
-                container_id: "ctr-immutable-traversal".into(),
-                cgroup_path: "/sys/fs/cgroup/test".into(),
-                init_pid: 12345,
-            })
-            .await
-            .unwrap();
-
-        // A ".." component could escape /proc/<pid>/root back onto the host.
-        for bad in ["/etc/../../escape", "relative/path"] {
-            let result = client
-                .set_immutable(SetImmutableRequest {
-                    container_id: "ctr-immutable-traversal".into(),
-                    paths: vec![bad.into()],
-                    immutable: true,
-                })
-                .await;
-            assert!(result.is_err(), "path {bad:?} should be rejected");
-            assert_eq!(
-                result.unwrap_err().code(),
-                tonic::Code::InvalidArgument,
-                "path {bad:?} should be InvalidArgument"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_set_immutable_missing_paths_succeed() {
-        // Registered container, valid paths that do not exist under /proc/<pid>/root:
-        // the enforcer skips non-existent surfaces rather than erroring.
-        let (uri, _handle) = start_test_server().await;
-        let mut client = EnforcerClient::connect(uri).await.unwrap();
-
-        client
-            .register_container(RegisterContainerRequest {
-                container_id: "ctr-immutable-missing".into(),
-                cgroup_path: "/sys/fs/cgroup/test".into(),
-                init_pid: 99999999,
-            })
-            .await
-            .unwrap();
-
-        let resp = client
-            .set_immutable(SetImmutableRequest {
-                container_id: "ctr-immutable-missing".into(),
-                paths: vec!["/etc/crontab".into(), "/root/.bashrc".into()],
-                immutable: true,
-            })
-            .await
-            .expect("missing paths must be skipped, not error")
-            .into_inner();
-        assert!(resp.success);
-        assert_eq!(resp.changed_count, 0, "no existing surface should change");
+    #[test]
+    fn test_resolve_deny_set_binary_rejects_path_traversal() {
+        let err = resolve_deny_set_binary(12345, "/../../../etc/shadow").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("must not contain '..'"));
     }
 
     #[tokio::test]
@@ -2109,7 +2124,6 @@ mod tests {
                 allowed_hosts: vec!["api.example.com".into()],
                 egress_rules: vec![],
                 dns_servers: vec!["8.8.8.8".into()],
-                blocked_cidrs: vec![],
             })
             .await
             .unwrap()
@@ -2133,7 +2147,6 @@ mod tests {
                 allowed_hosts: vec!["evil.example.com".into()], // not in bundle
                 egress_rules: vec![],
                 dns_servers: vec![],
-                blocked_cidrs: vec![],
             })
             .await;
 

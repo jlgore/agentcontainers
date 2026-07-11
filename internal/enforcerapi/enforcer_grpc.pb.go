@@ -19,24 +19,28 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Enforcer_RegisterContainer_FullMethodName     = "/agentcontainers.enforcer.v1.Enforcer/RegisterContainer"
-	Enforcer_UnregisterContainer_FullMethodName   = "/agentcontainers.enforcer.v1.Enforcer/UnregisterContainer"
-	Enforcer_PrepareToolCall_FullMethodName       = "/agentcontainers.enforcer.v1.Enforcer/PrepareToolCall"
-	Enforcer_CompleteToolCall_FullMethodName      = "/agentcontainers.enforcer.v1.Enforcer/CompleteToolCall"
-	Enforcer_ApplyNetworkPolicy_FullMethodName    = "/agentcontainers.enforcer.v1.Enforcer/ApplyNetworkPolicy"
-	Enforcer_ApplyFilesystemPolicy_FullMethodName = "/agentcontainers.enforcer.v1.Enforcer/ApplyFilesystemPolicy"
-	Enforcer_ApplyProcessPolicy_FullMethodName    = "/agentcontainers.enforcer.v1.Enforcer/ApplyProcessPolicy"
-	Enforcer_ApplyCredentialPolicy_FullMethodName = "/agentcontainers.enforcer.v1.Enforcer/ApplyCredentialPolicy"
-	Enforcer_InjectSecrets_FullMethodName         = "/agentcontainers.enforcer.v1.Enforcer/InjectSecrets"
-	Enforcer_LoadPolicyBundle_FullMethodName      = "/agentcontainers.enforcer.v1.Enforcer/LoadPolicyBundle"
-	Enforcer_StreamEvents_FullMethodName          = "/agentcontainers.enforcer.v1.Enforcer/StreamEvents"
-	Enforcer_GetStats_FullMethodName              = "/agentcontainers.enforcer.v1.Enforcer/GetStats"
-	Enforcer_LoadComponent_FullMethodName         = "/agentcontainers.enforcer.v1.Enforcer/LoadComponent"
-	Enforcer_UnloadComponent_FullMethodName       = "/agentcontainers.enforcer.v1.Enforcer/UnloadComponent"
-	Enforcer_ListComponents_FullMethodName        = "/agentcontainers.enforcer.v1.Enforcer/ListComponents"
-	Enforcer_ListTools_FullMethodName             = "/agentcontainers.enforcer.v1.Enforcer/ListTools"
-	Enforcer_CallTool_FullMethodName              = "/agentcontainers.enforcer.v1.Enforcer/CallTool"
-	Enforcer_SetImmutable_FullMethodName          = "/agentcontainers.enforcer.v1.Enforcer/SetImmutable"
+	Enforcer_RegisterContainer_FullMethodName              = "/agentcontainers.enforcer.v1.Enforcer/RegisterContainer"
+	Enforcer_UnregisterContainer_FullMethodName            = "/agentcontainers.enforcer.v1.Enforcer/UnregisterContainer"
+	Enforcer_PrepareToolCall_FullMethodName                = "/agentcontainers.enforcer.v1.Enforcer/PrepareToolCall"
+	Enforcer_CompleteToolCall_FullMethodName               = "/agentcontainers.enforcer.v1.Enforcer/CompleteToolCall"
+	Enforcer_ApplyNetworkPolicy_FullMethodName             = "/agentcontainers.enforcer.v1.Enforcer/ApplyNetworkPolicy"
+	Enforcer_ApplyFilesystemPolicy_FullMethodName          = "/agentcontainers.enforcer.v1.Enforcer/ApplyFilesystemPolicy"
+	Enforcer_ApplyProcessPolicy_FullMethodName             = "/agentcontainers.enforcer.v1.Enforcer/ApplyProcessPolicy"
+	Enforcer_ApplyCredentialPolicy_FullMethodName          = "/agentcontainers.enforcer.v1.Enforcer/ApplyCredentialPolicy"
+	Enforcer_InjectSecrets_FullMethodName                  = "/agentcontainers.enforcer.v1.Enforcer/InjectSecrets"
+	Enforcer_ApplyDenySetPolicy_FullMethodName             = "/agentcontainers.enforcer.v1.Enforcer/ApplyDenySetPolicy"
+	Enforcer_UpdateDenySetPolicy_FullMethodName            = "/agentcontainers.enforcer.v1.Enforcer/UpdateDenySetPolicy"
+	Enforcer_ApplyBindPolicy_FullMethodName                = "/agentcontainers.enforcer.v1.Enforcer/ApplyBindPolicy"
+	Enforcer_ConfigureReverseShellDetection_FullMethodName = "/agentcontainers.enforcer.v1.Enforcer/ConfigureReverseShellDetection"
+	Enforcer_LoadPolicyBundle_FullMethodName               = "/agentcontainers.enforcer.v1.Enforcer/LoadPolicyBundle"
+	Enforcer_StreamEvents_FullMethodName                   = "/agentcontainers.enforcer.v1.Enforcer/StreamEvents"
+	Enforcer_GetStats_FullMethodName                       = "/agentcontainers.enforcer.v1.Enforcer/GetStats"
+	Enforcer_LoadComponent_FullMethodName                  = "/agentcontainers.enforcer.v1.Enforcer/LoadComponent"
+	Enforcer_UnloadComponent_FullMethodName                = "/agentcontainers.enforcer.v1.Enforcer/UnloadComponent"
+	Enforcer_ListComponents_FullMethodName                 = "/agentcontainers.enforcer.v1.Enforcer/ListComponents"
+	Enforcer_ListTools_FullMethodName                      = "/agentcontainers.enforcer.v1.Enforcer/ListTools"
+	Enforcer_CallTool_FullMethodName                       = "/agentcontainers.enforcer.v1.Enforcer/CallTool"
+	Enforcer_SetImmutable_FullMethodName                   = "/agentcontainers.enforcer.v1.Enforcer/SetImmutable"
 )
 
 // EnforcerClient is the client API for Enforcer service.
@@ -54,6 +58,13 @@ type EnforcerClient interface {
 	ApplyProcessPolicy(ctx context.Context, in *ProcessPolicyRequest, opts ...grpc.CallOption) (*PolicyResponse, error)
 	ApplyCredentialPolicy(ctx context.Context, in *CredentialPolicyRequest, opts ...grpc.CallOption) (*PolicyResponse, error)
 	InjectSecrets(ctx context.Context, in *InjectSecretsRequest, opts ...grpc.CallOption) (*InjectSecretsResponse, error)
+	// Deny-set process-tree policy.
+	ApplyDenySetPolicy(ctx context.Context, in *ApplyDenySetPolicyRequest, opts ...grpc.CallOption) (*PolicyResponse, error)
+	UpdateDenySetPolicy(ctx context.Context, in *UpdateDenySetPolicyRequest, opts ...grpc.CallOption) (*PolicyResponse, error)
+	// Bind (listen) policy.
+	ApplyBindPolicy(ctx context.Context, in *BindPolicyRequest, opts ...grpc.CallOption) (*PolicyResponse, error)
+	// Reverse shell detection configuration.
+	ConfigureReverseShellDetection(ctx context.Context, in *ReverseShellConfigRequest, opts ...grpc.CallOption) (*PolicyResponse, error)
 	// Policy bundle — content trust for ACL re-derivation.
 	// Must be called before ApplyCredentialPolicy.  The enforcer stores a hash
 	// of the policy JSON so that subsequent ApplyCredentialPolicy calls can be
@@ -177,6 +188,46 @@ func (c *enforcerClient) InjectSecrets(ctx context.Context, in *InjectSecretsReq
 	return out, nil
 }
 
+func (c *enforcerClient) ApplyDenySetPolicy(ctx context.Context, in *ApplyDenySetPolicyRequest, opts ...grpc.CallOption) (*PolicyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PolicyResponse)
+	err := c.cc.Invoke(ctx, Enforcer_ApplyDenySetPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *enforcerClient) UpdateDenySetPolicy(ctx context.Context, in *UpdateDenySetPolicyRequest, opts ...grpc.CallOption) (*PolicyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PolicyResponse)
+	err := c.cc.Invoke(ctx, Enforcer_UpdateDenySetPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *enforcerClient) ApplyBindPolicy(ctx context.Context, in *BindPolicyRequest, opts ...grpc.CallOption) (*PolicyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PolicyResponse)
+	err := c.cc.Invoke(ctx, Enforcer_ApplyBindPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *enforcerClient) ConfigureReverseShellDetection(ctx context.Context, in *ReverseShellConfigRequest, opts ...grpc.CallOption) (*PolicyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PolicyResponse)
+	err := c.cc.Invoke(ctx, Enforcer_ConfigureReverseShellDetection_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *enforcerClient) LoadPolicyBundle(ctx context.Context, in *LoadPolicyBundleRequest, opts ...grpc.CallOption) (*LoadPolicyBundleResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(LoadPolicyBundleResponse)
@@ -291,6 +342,13 @@ type EnforcerServer interface {
 	ApplyProcessPolicy(context.Context, *ProcessPolicyRequest) (*PolicyResponse, error)
 	ApplyCredentialPolicy(context.Context, *CredentialPolicyRequest) (*PolicyResponse, error)
 	InjectSecrets(context.Context, *InjectSecretsRequest) (*InjectSecretsResponse, error)
+	// Deny-set process-tree policy.
+	ApplyDenySetPolicy(context.Context, *ApplyDenySetPolicyRequest) (*PolicyResponse, error)
+	UpdateDenySetPolicy(context.Context, *UpdateDenySetPolicyRequest) (*PolicyResponse, error)
+	// Bind (listen) policy.
+	ApplyBindPolicy(context.Context, *BindPolicyRequest) (*PolicyResponse, error)
+	// Reverse shell detection configuration.
+	ConfigureReverseShellDetection(context.Context, *ReverseShellConfigRequest) (*PolicyResponse, error)
 	// Policy bundle — content trust for ACL re-derivation.
 	// Must be called before ApplyCredentialPolicy.  The enforcer stores a hash
 	// of the policy JSON so that subsequent ApplyCredentialPolicy calls can be
@@ -350,6 +408,18 @@ func (UnimplementedEnforcerServer) ApplyCredentialPolicy(context.Context, *Crede
 }
 func (UnimplementedEnforcerServer) InjectSecrets(context.Context, *InjectSecretsRequest) (*InjectSecretsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method InjectSecrets not implemented")
+}
+func (UnimplementedEnforcerServer) ApplyDenySetPolicy(context.Context, *ApplyDenySetPolicyRequest) (*PolicyResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ApplyDenySetPolicy not implemented")
+}
+func (UnimplementedEnforcerServer) UpdateDenySetPolicy(context.Context, *UpdateDenySetPolicyRequest) (*PolicyResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method UpdateDenySetPolicy not implemented")
+}
+func (UnimplementedEnforcerServer) ApplyBindPolicy(context.Context, *BindPolicyRequest) (*PolicyResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ApplyBindPolicy not implemented")
+}
+func (UnimplementedEnforcerServer) ConfigureReverseShellDetection(context.Context, *ReverseShellConfigRequest) (*PolicyResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ConfigureReverseShellDetection not implemented")
 }
 func (UnimplementedEnforcerServer) LoadPolicyBundle(context.Context, *LoadPolicyBundleRequest) (*LoadPolicyBundleResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method LoadPolicyBundle not implemented")
@@ -561,6 +631,78 @@ func _Enforcer_InjectSecrets_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Enforcer_ApplyDenySetPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ApplyDenySetPolicyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EnforcerServer).ApplyDenySetPolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Enforcer_ApplyDenySetPolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EnforcerServer).ApplyDenySetPolicy(ctx, req.(*ApplyDenySetPolicyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Enforcer_UpdateDenySetPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateDenySetPolicyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EnforcerServer).UpdateDenySetPolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Enforcer_UpdateDenySetPolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EnforcerServer).UpdateDenySetPolicy(ctx, req.(*UpdateDenySetPolicyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Enforcer_ApplyBindPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BindPolicyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EnforcerServer).ApplyBindPolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Enforcer_ApplyBindPolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EnforcerServer).ApplyBindPolicy(ctx, req.(*BindPolicyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Enforcer_ConfigureReverseShellDetection_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReverseShellConfigRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EnforcerServer).ConfigureReverseShellDetection(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Enforcer_ConfigureReverseShellDetection_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EnforcerServer).ConfigureReverseShellDetection(ctx, req.(*ReverseShellConfigRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Enforcer_LoadPolicyBundle_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(LoadPolicyBundleRequest)
 	if err := dec(in); err != nil {
@@ -758,6 +900,22 @@ var Enforcer_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "InjectSecrets",
 			Handler:    _Enforcer_InjectSecrets_Handler,
+		},
+		{
+			MethodName: "ApplyDenySetPolicy",
+			Handler:    _Enforcer_ApplyDenySetPolicy_Handler,
+		},
+		{
+			MethodName: "UpdateDenySetPolicy",
+			Handler:    _Enforcer_UpdateDenySetPolicy_Handler,
+		},
+		{
+			MethodName: "ApplyBindPolicy",
+			Handler:    _Enforcer_ApplyBindPolicy_Handler,
+		},
+		{
+			MethodName: "ConfigureReverseShellDetection",
+			Handler:    _Enforcer_ConfigureReverseShellDetection_Handler,
 		},
 		{
 			MethodName: "LoadPolicyBundle",

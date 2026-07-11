@@ -25,7 +25,7 @@ use agentcontainer_common::helpers::{
     extract_v4_from_mapped, is_loopback_v4, is_loopback_v6, is_v4_mapped_v6, ntohl,
 };
 use agentcontainer_common::maps::{
-    LpmDataV4, LpmDataV6, PortKeyV4, LPM_CGROUP_PREFIX, VERDICT_ALLOW, VERDICT_BLOCK,
+    ScopedLpmKeyV4, ScopedLpmKeyV6, ScopedPortKeyV4, VERDICT_ALLOW, VERDICT_BLOCK,
 };
 
 use crate::maps::{
@@ -36,9 +36,28 @@ use crate::maps::{
 /// Event type for sendmsg hooks (matches C AC_EVENT_NET_SENDMSG = 2).
 const EVENT_NET_SENDMSG: u32 = 2;
 
-/// Get the enforced cgroup id if the current task is under an enforced cgroup —
-/// directly OR as a descendant (subtree match; see
-/// [`crate::maps::enforced_cgroup_for_current`]).
+const CGROUP_PREFIX_BITS: u32 = 64;
+const IPV4_PREFIX_BITS: u32 = CGROUP_PREFIX_BITS + 32;
+const IPV6_PREFIX_BITS: u32 = CGROUP_PREFIX_BITS + 128;
+
+#[inline(always)]
+fn scoped_lpm_v4(cgroup_id: u64, addr: u32) -> Key<ScopedLpmKeyV4> {
+    Key::new(
+        IPV4_PREFIX_BITS,
+        ScopedLpmKeyV4 {
+            cgroup_id,
+            addr,
+            _pad: 0,
+        },
+    )
+}
+
+#[inline(always)]
+fn scoped_lpm_v6(cgroup_id: u64, addr: [u32; 4]) -> Key<ScopedLpmKeyV6> {
+    Key::new(IPV6_PREFIX_BITS, ScopedLpmKeyV6 { cgroup_id, addr })
+}
+
+/// Get the cgroup_id if the current cgroup is enforced, or None.
 #[inline(always)]
 fn get_enforced_cgroup() -> Option<u64> {
     crate::maps::enforced_cgroup_for_current()
@@ -62,7 +81,7 @@ fn bump_stat(idx: u32) {
 // ---------------------------------------------------------------------------
 
 #[inline(always)]
-fn emit_block_event_v4(cgroup_id: u64, dst_ip: u32, dst_port: u16, proto: u8) {
+fn emit_block_event_v4(dst_ip: u32, dst_port: u16, proto: u8) {
     if let Some(mut buf) = NET_EVENTS.reserve::<NetworkEvent>(0) {
         let ev = unsafe { &mut *buf.as_mut_ptr() };
         ev.timestamp_ns = unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() };
@@ -75,7 +94,6 @@ fn emit_block_event_v4(cgroup_id: u64, dst_ip: u32, dst_port: u16, proto: u8) {
 
         ev.event_type = EVENT_NET_SENDMSG;
         ev.verdict = Verdict::Block as u32;
-        ev.cgroup_id = cgroup_id;
 
         ev.dst_ip4 = dst_ip;
         ev.dst_ip6 = [0, 0, 0, 0];
@@ -93,7 +111,7 @@ fn emit_block_event_v4(cgroup_id: u64, dst_ip: u32, dst_port: u16, proto: u8) {
 }
 
 #[inline(always)]
-fn emit_block_event_v6(cgroup_id: u64, dst_ip6: &[u32; 4], dst_port: u16, proto: u8) {
+fn emit_block_event_v6(dst_ip6: &[u32; 4], dst_port: u16, proto: u8) {
     if let Some(mut buf) = NET_EVENTS.reserve::<NetworkEvent>(0) {
         let ev = unsafe { &mut *buf.as_mut_ptr() };
         ev.timestamp_ns = unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() };
@@ -106,7 +124,6 @@ fn emit_block_event_v6(cgroup_id: u64, dst_ip6: &[u32; 4], dst_port: u16, proto:
 
         ev.event_type = EVENT_NET_SENDMSG;
         ev.verdict = Verdict::Block as u32;
-        ev.cgroup_id = cgroup_id;
 
         ev.dst_ip4 = 0;
         ev.dst_ip6 = *dst_ip6;
@@ -131,7 +148,7 @@ fn emit_block_event_v6(cgroup_id: u64, dst_ip6: &[u32; 4], dst_port: u16, proto:
 pub fn ac_sendmsg4(ctx: SockAddrContext) -> i32 {
     match try_sendmsg4(&ctx) {
         Ok(ret) => ret,
-        Err(_) => 1, // fail-open on BPF errors
+        Err(_) => 0, // Block on BPF errors; cgroup_sock_addr uses 1=allow, 0=deny.
     }
 }
 
@@ -154,24 +171,17 @@ fn try_sendmsg4(ctx: &SockAddrContext) -> Result<i32, i64> {
         None => return Ok(VERDICT_ALLOW),
     };
 
-    // 3. Check blocked CIDRs (deny list takes priority), scoped per-cgroup.
-    let lpm = Key::new(
-        LPM_CGROUP_PREFIX + 32,
-        LpmDataV4 {
-            cgroup_id,
-            addr: dst,
-            _pad: 0,
-        },
-    );
+    // 3. Check blocked CIDRs (deny list takes priority).
+    let lpm = Key::new(32, dst);
     if unsafe { BLOCKED_CIDRS_V4.get(&lpm) }.is_some() {
         bump_stat(STAT_NET_BLOCKED);
         bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_BLOCKED);
-        emit_block_event_v4(cgroup_id, dst, port, proto);
+        emit_block_event_v4(dst, port, proto);
         return Ok(VERDICT_BLOCK);
     }
 
     // 4. Check allowed ports (specific IP+port+protocol tuples).
-    let pk = PortKeyV4 {
+    let pk = ScopedPortKeyV4 {
         cgroup_id,
         ip: dst,
         port,
@@ -185,7 +195,8 @@ fn try_sendmsg4(ctx: &SockAddrContext) -> Result<i32, i64> {
     }
 
     // 5. Check allowed CIDRs (LPM trie longest prefix match).
-    if unsafe { ALLOWED_V4.get(&lpm) }.is_some() {
+    let scoped_lpm = scoped_lpm_v4(cgroup_id, dst);
+    if unsafe { ALLOWED_V4.get(&scoped_lpm) }.is_some() {
         bump_stat(STAT_NET_ALLOWED);
         bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_ALLOWED);
         return Ok(VERDICT_ALLOW);
@@ -194,7 +205,7 @@ fn try_sendmsg4(ctx: &SockAddrContext) -> Result<i32, i64> {
     // 6. Default deny.
     bump_stat(STAT_NET_BLOCKED);
     bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_BLOCKED);
-    emit_block_event_v4(cgroup_id, dst, port, proto);
+    emit_block_event_v4(dst, port, proto);
     Ok(VERDICT_BLOCK)
 }
 
@@ -206,7 +217,7 @@ fn try_sendmsg4(ctx: &SockAddrContext) -> Result<i32, i64> {
 pub fn ac_sendmsg6(ctx: SockAddrContext) -> i32 {
     match try_sendmsg6(&ctx) {
         Ok(ret) => ret,
-        Err(_) => 1, // fail-open on BPF errors
+        Err(_) => 0, // Block on BPF errors; cgroup_sock_addr uses 1=allow, 0=deny.
     }
 }
 
@@ -237,25 +248,18 @@ fn try_sendmsg6(ctx: &SockAddrContext) -> Result<i32, i64> {
     // 3. Check for IPv4-mapped IPv6 -- enforce IPv4 rules too (RT-C3).
     if is_v4_mapped_v6(&dst6) {
         let v4addr = extract_v4_from_mapped(&dst6);
-        let lpm4 = Key::new(
-            LPM_CGROUP_PREFIX + 32,
-            LpmDataV4 {
-                cgroup_id,
-                addr: v4addr,
-                _pad: 0,
-            },
-        );
+        let lpm4 = Key::new(32, v4addr);
 
         // 3a. Block if IPv4 address is in blocked CIDRs.
         if unsafe { BLOCKED_CIDRS_V4.get(&lpm4) }.is_some() {
             bump_stat(STAT_NET_BLOCKED);
             bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_BLOCKED);
-            emit_block_event_v6(cgroup_id, &dst6, port, proto);
+            emit_block_event_v6(&dst6, port, proto);
             return Ok(VERDICT_BLOCK);
         }
 
         // 3b. Allow if IPv4 address matches an allowed port rule.
-        let pk = PortKeyV4 {
+        let pk = ScopedPortKeyV4 {
             cgroup_id,
             ip: v4addr,
             port,
@@ -269,30 +273,26 @@ fn try_sendmsg6(ctx: &SockAddrContext) -> Result<i32, i64> {
         }
 
         // 3c. Allow if IPv4 address matches an allowed CIDR.
-        if unsafe { ALLOWED_V4.get(&lpm4) }.is_some() {
+        let scoped_lpm4 = scoped_lpm_v4(cgroup_id, v4addr);
+        if unsafe { ALLOWED_V4.get(&scoped_lpm4) }.is_some() {
             bump_stat(STAT_NET_ALLOWED);
             bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_ALLOWED);
             return Ok(VERDICT_ALLOW);
         }
     }
 
-    // 4. Check IPv6 blocked CIDRs, scoped per-cgroup.
-    let lpm = Key::new(
-        LPM_CGROUP_PREFIX + 128,
-        LpmDataV6 {
-            cgroup_id,
-            addr: dst6,
-        },
-    );
+    // 4. Check IPv6 blocked CIDRs.
+    let lpm = Key::new(128, dst6);
     if unsafe { BLOCKED_CIDRS_V6.get(&lpm) }.is_some() {
         bump_stat(STAT_NET_BLOCKED);
         bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_BLOCKED);
-        emit_block_event_v6(cgroup_id, &dst6, port, proto);
+        emit_block_event_v6(&dst6, port, proto);
         return Ok(VERDICT_BLOCK);
     }
 
     // 5. Check IPv6 allowed CIDRs.
-    if unsafe { ALLOWED_V6.get(&lpm) }.is_some() {
+    let scoped_lpm = scoped_lpm_v6(cgroup_id, dst6);
+    if unsafe { ALLOWED_V6.get(&scoped_lpm) }.is_some() {
         bump_stat(STAT_NET_ALLOWED);
         bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_ALLOWED);
         return Ok(VERDICT_ALLOW);
@@ -301,6 +301,6 @@ fn try_sendmsg6(ctx: &SockAddrContext) -> Result<i32, i64> {
     // 6. Default deny.
     bump_stat(STAT_NET_BLOCKED);
     bump_cgroup_stat(cgroup_id, CGROUP_STAT_NET_BLOCKED);
-    emit_block_event_v6(cgroup_id, &dst6, port, proto);
+    emit_block_event_v6(&dst6, port, proto);
     Ok(VERDICT_BLOCK)
 }

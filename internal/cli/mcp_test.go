@@ -17,7 +17,6 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/config"
-	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/enforcement"
 )
 
 // writeSelfSignedCerts writes a self-signed cert (reused as both CA and client
@@ -83,24 +82,26 @@ func TestBuildMCPDepsUsesMTLSProfileFromEnv(t *testing.T) {
 	t.Setenv("AC_ENFORCER_TLS_CERT", certFile)
 	t.Setenv("AC_ENFORCER_TLS_KEY", keyFile)
 
-	var gotProfile enforcement.ConnectionProfile
-	orig := enforcerProfileProbe
-	enforcerProfileProbe = func(p enforcement.ConnectionProfile) bool {
-		gotProfile = p
+	// The proxy dials via enforcement.GRPCOptsFromEnv/NewGRPCStrategy, which
+	// select mTLS from AC_ENFORCER_TLS_* (exercised directly in the enforcement
+	// package's mtls_test). Here we assert buildMCPDeps probes the configured
+	// address and wires an enforcer client from that env, not a hardcoded dial.
+	var gotAddr string
+	withEnforcerProbe(t, func(addr string) bool {
+		gotAddr = addr
 		return true
-	}
-	t.Cleanup(func() { enforcerProfileProbe = orig })
+	})
 
-	_, cleanup, err := buildMCPDeps(mcpDepsConfig(nil), zap.NewNop())
+	deps, cleanup, err := buildMCPDeps(mcpDepsConfig(nil), zap.NewNop())
 	defer cleanup()
 	if err != nil {
 		t.Fatalf("buildMCPDeps: %v", err)
 	}
-	if !gotProfile.HasMTLS() {
-		t.Errorf("expected an mTLS profile from env, got %+v", gotProfile)
+	if gotAddr != "10.0.0.9:50051" {
+		t.Errorf("probe addr = %q, want 10.0.0.9:50051", gotAddr)
 	}
-	if gotProfile.Addr != "10.0.0.9:50051" {
-		t.Errorf("addr = %q, want 10.0.0.9:50051", gotProfile.Addr)
+	if deps.Enforcer == nil {
+		t.Error("expected enforcer client wired from AC_ENFORCER_* env, got nil")
 	}
 }
 

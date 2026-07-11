@@ -10,9 +10,10 @@ use aya_ebpf::macros::map;
 use aya_ebpf::maps::{Array, HashMap, LpmTrie, PerCpuArray, PerCpuHashMap, RingBuf};
 
 use agentcontainer_common::maps::{
-    ActiveTool, CgroupStats, FsInodeKey, KernelOffsets, LpmDataV4, LpmDataV6, PortKeyV4, PortKeyV6,
-    SecretAclKey, SecretAclValue, SecretToolKey,
+    CgroupStats, DenySetKey, KernelOffsets, ScopedBindKey, ScopedFsInodeKey, ScopedLpmKeyV4,
+    ScopedLpmKeyV6, ScopedPortKeyV4, SecretAclKey, SecretAclValue, CGROUP_FLAG_ENFORCED,
 };
+use agentcontainer_common::siphash::SipHashKey;
 
 // --- Cgroup scoping ---
 
@@ -21,24 +22,27 @@ use agentcontainer_common::maps::{
 #[map]
 pub static ENFORCED_CGROUPS: HashMap<u64, u8> = HashMap::with_max_entries(256, 0);
 
-/// Max cgroup-hierarchy levels walked for subtree enforcement. Container cgroup
-/// depth (kubepods/…/pod/container, or a systemd slice) is well under this; the
-/// bound keeps the ancestor walk verifier-friendly.
+/// Ancestor-walk depth bound. The kernel cgroup tree is shallow in practice; the
+/// bound keeps the walk verifier-friendly.
 pub const MAX_CGROUP_DEPTH: i32 = 16;
 
-/// The enforced cgroup (id + its policy flags) governing the current task: its
-/// own cgroup if directly registered, otherwise the nearest ancestor present in
-/// `ENFORCED_CGROUPS` (SUBTREE match). Returning the registered ancestor means a
-/// task moved into a descendant cgroup — `mkdir <enforced>/x; echo $$ >
-/// x/cgroup.procs`, the Escape-the-Box T11 vector — stays governed by that
-/// ancestor's policy/stats/inode maps instead of escaping enforcement. `None`
-/// when neither the task nor any ancestor is enforced.
+/// The enforced cgroup (id + its policy flags) governing the current task.
 ///
-/// Perf: the fast path is one lookup for a directly-registered cgroup (the
-/// normal container case). Only tasks NOT directly enforced pay the bounded
-/// ancestor walk — including unenforced host processes on the system-wide LSM
-/// hooks. A future optimization is registering descendants at cgroup-creation
-/// time (a `cgroup_mkdir` hook) so the hot path stays a single lookup.
+/// Lookup order (closed domain):
+/// 1. Exact `cgroup_id` in `ENFORCED_CGROUPS` (normal container leaf/root).
+/// 2. Bounded ancestor walk — task in a **descendant** of a registered cgroup
+///    (T11 child-cgroup escape: `mkdir <enforced>/x; echo $$ > x/cgroup.procs`).
+/// 3. Process-tree sticky map `PROC_ENFORCED` — task (or its ancestor process)
+///    was seeded at container register / fork inheritance. Closes **sibling**
+///    and non-ancestor cgroup moves (e.g. in-container cron/systemd scopes that
+///    are not under the registered leaf in the cgroup tree).
+///
+/// Host processes that were never registered return `None` so system-wide LSM
+/// hooks stay no-ops outside agent containers.
+///
+/// Perf: direct cgroup hit is one map lookup. Ancestor walk and PID sticky are
+/// only paid on miss (unregistered host tasks pay the walk; sticky is one more
+/// lookup after that).
 #[inline(always)]
 pub fn enforced_cgroup_flags_for_current() -> Option<(u64, u8)> {
     let cgid = unsafe { aya_ebpf::helpers::bpf_get_current_cgroup_id() };
@@ -56,66 +60,74 @@ pub fn enforced_cgroup_flags_for_current() -> Option<(u64, u8)> {
             return Some((id, flags));
         }
     }
+    // Process-tree sticky: pid → governing cgroup_id (seeded at register, inherited on fork).
+    let pid = (unsafe { aya_ebpf::helpers::bpf_get_current_pid_tgid() } >> 32) as u32;
+    if let Some(&gov_cgid) = unsafe { PROC_ENFORCED.get(&pid) } {
+        if let Some(&flags) = unsafe { ENFORCED_CGROUPS.get(&gov_cgid) } {
+            return Some((gov_cgid, flags));
+        }
+        // Governing cgroup was unregistered but sticky entry remains: still treat
+        // as enforced with the bare ENFORCED flag so fail-closed hooks apply.
+        return Some((gov_cgid, CGROUP_FLAG_ENFORCED));
+    }
     None
 }
 
 /// Id-only [`enforced_cgroup_flags_for_current`] for callers that don't read the
-/// per-cgroup policy flags (the egress and file hooks).
+/// per-cgroup policy flags (the egress, bind, process, and file hooks).
 #[inline(always)]
 pub fn enforced_cgroup_for_current() -> Option<u64> {
     enforced_cgroup_flags_for_current().map(|(id, _)| id)
 }
 
-/// Kernel struct field byte-offsets, resolved from BTF and populated by
-/// userspace at startup (before any program is attached). The LSM hooks read
-/// index 0 to walk `linux_binprm`/`file`/`inode`/`super_block` portably across
-/// kernel versions instead of via hardcoded offsets. See [`KernelOffsets`].
+/// Resolve the governing enforced cgroup for a known PID (fork inheritance).
+/// Prefers sticky map, then falls back to the *current* task's cgroup walk
+/// (only valid when the current task is that PID — i.e. the parent at fork).
+#[inline(always)]
+pub fn governing_cgroup_for_pid(pid: u32) -> Option<u64> {
+    if let Some(&gov) = unsafe { PROC_ENFORCED.get(&pid) } {
+        return Some(gov);
+    }
+    // Parent is current task at sched_process_fork: reuse full resolver.
+    let cur_pid = (unsafe { aya_ebpf::helpers::bpf_get_current_pid_tgid() } >> 32) as u32;
+    if cur_pid == pid {
+        return enforced_cgroup_for_current();
+    }
+    None
+}
+
+// --- Kernel field offsets (CO-RE substitute) ---
+
+/// Single-entry array: BTF-resolved kernel struct field offsets for LSM hooks.
+/// Userspace populates index 0 before attach; hooks fail-closed if absent.
 #[map]
 pub static KERNEL_OFFSETS: Array<KernelOffsets> = Array::with_max_entries(1, 0);
 
 // --- Network maps ---
 
-/// IPv4 CIDRs that are permitted (LPM trie longest prefix match),
-/// scoped per-cgroup. LPM data = (cgroup_id ++ addr in network byte order);
-/// prefix_len = 64 + cidr_bits via `Key::new` at lookup/insert time.
-/// NEVER insert with prefix_len < 64 — that would match across cgroups.
+/// Per-cgroup IPv4 CIDRs that are permitted (LPM trie longest prefix match).
+/// Prefix length includes the 64-bit cgroup ID plus IPv4 prefix bits.
 #[map]
-pub static ALLOWED_V4: LpmTrie<LpmDataV4, u8> = LpmTrie::with_max_entries(4096, 0);
+pub static ALLOWED_V4: LpmTrie<ScopedLpmKeyV4, u8> = LpmTrie::with_max_entries(4096, 0);
 
-/// IPv6 CIDRs that are permitted, scoped per-cgroup.
-/// LPM data = (cgroup_id ++ four 32-bit words of IPv6 address in network order).
+/// Per-cgroup IPv6 CIDRs that are permitted.
+/// Prefix length includes the 64-bit cgroup ID plus IPv6 prefix bits.
 #[map]
-pub static ALLOWED_V6: LpmTrie<LpmDataV6, u8> = LpmTrie::with_max_entries(4096, 0);
+pub static ALLOWED_V6: LpmTrie<ScopedLpmKeyV6, u8> = LpmTrie::with_max_entries(4096, 0);
 
-/// IPv4 CIDRs that are always denied (e.g., cloud metadata endpoints),
-/// scoped per-cgroup. Checked BEFORE the allow lists.
+/// IPv4 CIDRs that are always denied (e.g., cloud metadata endpoints).
+/// Checked BEFORE the allow lists.
 #[map]
-pub static BLOCKED_CIDRS_V4: LpmTrie<LpmDataV4, u8> = LpmTrie::with_max_entries(256, 0);
+pub static BLOCKED_CIDRS_V4: LpmTrie<u32, u8> = LpmTrie::with_max_entries(256, 0);
 
-/// IPv6 CIDRs that are always denied, scoped per-cgroup.
+/// IPv6 CIDRs that are always denied.
 #[map]
-pub static BLOCKED_CIDRS_V6: LpmTrie<LpmDataV6, u8> = LpmTrie::with_max_entries(256, 0);
+pub static BLOCKED_CIDRS_V6: LpmTrie<[u32; 4], u8> = LpmTrie::with_max_entries(256, 0);
 
-/// IPv4 IP+port+protocol tuples that are explicitly permitted.
+/// Per-cgroup IPv4 IP+port+protocol tuples that are explicitly permitted.
 /// Checked after blocked CIDRs but before broad allowed CIDRs.
 #[map]
-pub static ALLOWED_PORTS: HashMap<PortKeyV4, u8> = HashMap::with_max_entries(1024, 0);
-
-/// Transient per-tool-call egress allowlist (G4: URI-scoped egress). Keyed
-/// exactly like ALLOWED_PORTS (cgroup+ip+port+proto); the value is the
-/// `CLOCK_MONOTONIC` (`bpf_ktime_get_ns`) expiry after which the entry no
-/// longer grants egress. Userspace inserts entries on PrepareToolCall and
-/// removes them on CompleteToolCall; the expiry bounds the blast radius of a
-/// lost CompleteToolCall, mirroring the ACTIVE_TOOL window.
-#[map]
-pub static TRANSIENT_PORTS: HashMap<PortKeyV4, u64> = HashMap::with_max_entries(256, 0);
-
-/// IPv6 analogue of TRANSIENT_PORTS (G4: URI-scoped egress). Keyed by
-/// (cgroup+128-bit addr+port+proto); value is the `CLOCK_MONOTONIC` expiry.
-/// connect6 consults it (native-v6 path) for port-scoped transient egress —
-/// the only port-scoped v6 map (ALLOWED_V6 is CIDR-only).
-#[map]
-pub static TRANSIENT_PORTS_V6: HashMap<PortKeyV6, u64> = HashMap::with_max_entries(256, 0);
+pub static ALLOWED_PORTS: HashMap<ScopedPortKeyV4, u8> = HashMap::with_max_entries(1024, 0);
 
 /// Ring buffer for network enforcement events.
 #[map]
@@ -127,22 +139,19 @@ pub static NET_STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(16, 0);
 
 // --- DNS maps ---
 
-/// Scratch buffer size for DNS payload parsing — a power of two so buffer
-/// indices can be mask-bounded for the verifier. 512 bytes covers classic
-/// UDP DNS responses; longer (EDNS) replies are parsed up to truncation.
-pub const DNS_SCRATCH_SIZE: usize = 512;
-
-/// Per-CPU scratch the DNS parser copies each reply into (one
-/// bpf_skb_load_bytes call) before parsing from memory — per-byte skb
-/// helper loads exploded the verifier budget. Safe per-CPU: cgroup_skb
-/// programs run to completion in softirq context.
-#[repr(C)]
-pub struct DnsScratch {
-    pub data: [u8; DNS_SCRATCH_SIZE],
-}
-
+/// SipHash-2-4 key shared between BPF and userspace.
+/// Single entry (index 0). Userspace writes the key at enforcer startup;
+/// BPF programs read it to hash domain names identically.
 #[map]
-pub static DNS_SCRATCH: PerCpuArray<DnsScratch> = PerCpuArray::with_max_entries(1, 0);
+pub static SIPHASH_KEY: Array<SipHashKey> = Array::with_max_entries(1, 0);
+
+/// Set of tracked domain hashes. Userspace inserts SipHash-128 digests of
+/// domains it cares about (from the network policy allowed_hosts list).
+/// BPF DNS parser hashes each response domain and only emits a ring buffer
+/// event if the hash is found in this map — unrelated DNS traffic is dropped
+/// silently, reducing ring buffer bandwidth.
+#[map]
+pub static TRACKED_DOMAINS: HashMap<[u8; 16], u8> = HashMap::with_max_entries(4096, 0);
 
 /// Ring buffer for DNS response events.
 #[map]
@@ -152,11 +161,11 @@ pub static DNS_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 
 /// Allowed inodes with permission bits (read/write).
 #[map]
-pub static ALLOWED_INODES: HashMap<FsInodeKey, u8> = HashMap::with_max_entries(4096, 0);
+pub static ALLOWED_INODES: HashMap<ScopedFsInodeKey, u8> = HashMap::with_max_entries(4096, 0);
 
 /// Denied inodes (always blocked).
 #[map]
-pub static DENIED_INODES: HashMap<FsInodeKey, u8> = HashMap::with_max_entries(4096, 0);
+pub static DENIED_INODES: HashMap<ScopedFsInodeKey, u8> = HashMap::with_max_entries(4096, 0);
 
 /// Ring buffer for filesystem enforcement events.
 #[map]
@@ -169,9 +178,9 @@ pub static FS_STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(16, 0);
 // --- Process maps ---
 
 /// Allowed executable inodes (binary allowlist).
-/// Uses FsInodeKey since exec inodes have the same layout.
+/// Uses ScopedFsInodeKey since exec inodes have the same layout.
 #[map]
-pub static ALLOWED_EXECS: HashMap<FsInodeKey, u8> = HashMap::with_max_entries(4096, 0);
+pub static ALLOWED_EXECS: HashMap<ScopedFsInodeKey, u8> = HashMap::with_max_entries(4096, 0);
 
 /// Ring buffer for process enforcement events.
 #[map]
@@ -188,19 +197,6 @@ pub static PROC_STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(16, 0);
 #[map]
 pub static SECRET_ACLS: HashMap<SecretAclKey, SecretAclValue> = HashMap::with_max_entries(1024, 0);
 
-/// Allowed tool identities for restricted secrets. An entry keyed by
-/// (secret inode/dev/cgroup ++ tool_id) means that tool may read the secret
-/// while its tool-call window is active. Only consulted for secrets whose
-/// `SecretAclValue.restricted` is set.
-#[map]
-pub static SECRET_TOOL_ACLS: HashMap<SecretToolKey, u8> = HashMap::with_max_entries(4096, 0);
-
-/// The tool identity currently active for a cgroup, written by PrepareToolCall
-/// and removed by CompleteToolCall. Absent means no tool-call window is open, so
-/// a restricted secret in that cgroup is denied.
-#[map]
-pub static ACTIVE_TOOL: HashMap<u64, ActiveTool> = HashMap::with_max_entries(256, 0);
-
 /// Ring buffer for credential enforcement events.
 #[map]
 pub static CRED_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
@@ -208,6 +204,54 @@ pub static CRED_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 /// Per-CPU stats counters for credential enforcement.
 #[map]
 pub static CRED_STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(16, 0);
+
+// --- Process deny-set maps ---
+
+/// Process-tree sticky enforcement: pid → governing enforced cgroup_id.
+///
+/// Seeded with the container init PID at register; inherited on
+/// `sched_process_fork`. Survives cgroup migrations to sibling/non-ancestor
+/// cgroups so enforcement subject stays closed under "things Linux will run."
+#[map]
+pub static PROC_ENFORCED: HashMap<u32, u64> = HashMap::with_max_entries(16384, 0);
+
+/// Per-process deny-set membership (pid → deny_set_id).
+#[map]
+pub static PROC_DENY_SETS: HashMap<u32, u32> = HashMap::with_max_entries(8192, 0);
+
+/// Deny-set policy: (deny_set_id, inode, dev) → blocked.
+#[map]
+pub static DENY_SET_POLICY: HashMap<DenySetKey, u8> = HashMap::with_max_entries(16384, 0);
+
+/// Deny-set transitions: (deny_set_id, inode, dev) → new deny_set_id.
+#[map]
+pub static DENY_SET_TRANSITIONS: HashMap<DenySetKey, u32> = HashMap::with_max_entries(4096, 0);
+
+// --- Bind maps ---
+
+/// Allowed bind ports (port + protocol).
+#[map]
+pub static ALLOWED_BINDS: HashMap<ScopedBindKey, u8> = HashMap::with_max_entries(256, 0);
+
+/// Ring buffer for bind enforcement events.
+#[map]
+pub static BIND_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+
+// --- Reverse shell detection ---
+
+/// Mode flag for reverse shell detection (index 0: 0=disabled, 1=enabled).
+#[map]
+pub static REVERSE_SHELL_MODE: Array<u8> = Array::with_max_entries(1, 0);
+
+/// Ring buffer for reverse shell detection events.
+#[map]
+pub static REVERSE_SHELL_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
+
+// --- Memfd blocking ---
+
+/// Ring buffer for memfd blocking events.
+#[map]
+pub static MEMFD_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 
 // --- Per-cgroup statistics ---
 
@@ -228,6 +272,10 @@ pub const CGROUP_STAT_PROC_ALLOWED: usize = 4;
 pub const CGROUP_STAT_PROC_BLOCKED: usize = 5;
 pub const CGROUP_STAT_CRED_ALLOWED: usize = 6;
 pub const CGROUP_STAT_CRED_BLOCKED: usize = 7;
+pub const CGROUP_STAT_BIND_ALLOWED: usize = 8;
+pub const CGROUP_STAT_BIND_BLOCKED: usize = 9;
+pub const CGROUP_STAT_DENYSET_ALLOWED: usize = 10;
+pub const CGROUP_STAT_DENYSET_BLOCKED: usize = 11;
 
 /// Increment a specific counter in the per-cgroup stats map for the given cgroup_id.
 ///
@@ -252,6 +300,10 @@ pub fn bump_cgroup_stat(cgroup_id: u64, field_offset: usize) {
                 process_blocked: 0,
                 credential_allowed: 0,
                 credential_blocked: 0,
+                bind_allowed: 0,
+                bind_blocked: 0,
+                denyset_allowed: 0,
+                denyset_blocked: 0,
             };
             let base = &mut stats as *mut CgroupStats as *mut u8;
             let counter = base.add(field_offset * 8) as *mut u64;

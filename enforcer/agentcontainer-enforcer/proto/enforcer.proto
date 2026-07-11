@@ -10,8 +10,6 @@ service Enforcer {
   // Container lifecycle — register/unregister cgroups for enforcement.
   rpc RegisterContainer(RegisterContainerRequest) returns (RegisterContainerResponse);
   rpc UnregisterContainer(UnregisterContainerRequest) returns (UnregisterContainerResponse);
-  rpc PrepareToolCall(PrepareToolCallRequest) returns (PrepareToolCallResponse);
-  rpc CompleteToolCall(CompleteToolCallRequest) returns (CompleteToolCallResponse);
 
   // Per-boundary-class policy application.
   rpc ApplyNetworkPolicy(NetworkPolicyRequest) returns (PolicyResponse);
@@ -19,6 +17,16 @@ service Enforcer {
   rpc ApplyProcessPolicy(ProcessPolicyRequest) returns (PolicyResponse);
   rpc ApplyCredentialPolicy(CredentialPolicyRequest) returns (PolicyResponse);
   rpc InjectSecrets(InjectSecretsRequest) returns (InjectSecretsResponse);
+
+  // Deny-set process-tree policy.
+  rpc ApplyDenySetPolicy(ApplyDenySetPolicyRequest) returns (PolicyResponse);
+  rpc UpdateDenySetPolicy(UpdateDenySetPolicyRequest) returns (PolicyResponse);
+
+  // Bind (listen) policy.
+  rpc ApplyBindPolicy(BindPolicyRequest) returns (PolicyResponse);
+
+  // Reverse shell detection configuration.
+  rpc ConfigureReverseShellDetection(ReverseShellConfigRequest) returns (PolicyResponse);
 
   // Policy bundle — content trust for ACL re-derivation.
   // Must be called before ApplyCredentialPolicy.  The enforcer stores a hash
@@ -38,15 +46,6 @@ service Enforcer {
   // Tool invocation.
   rpc ListTools(ListToolsRequest) returns (ListToolsResponse);
   rpc CallTool(CallToolRequest) returns (CallToolResponse);
-
-  // Freeze (or unfreeze) execution-config files inside the agent's mount
-  // namespace by setting the immutable inode flag (chattr +i). Auto-invoked by
-  // the run flow after secret injection to lock the harness guard hook, cron/
-  // systemd, and shell rc the agent could otherwise rewrite to run code out-of-
-  // band or disable its own guard. Runs in the same /proc/<init_pid>/root
-  // namespace as InjectSecrets; the enforcer holds CAP_LINUX_IMMUTABLE.
-  // Declared last so adding it does not renumber the generated method table.
-  rpc SetImmutable(SetImmutableRequest) returns (SetImmutableResponse);
 }
 
 // --- Container lifecycle ---
@@ -67,30 +66,6 @@ message UnregisterContainerRequest {
 
 message UnregisterContainerResponse {}
 
-message PrepareToolCallRequest {
-  string correlation_id = 1;
-  string container_id = 2;
-  string tool_name = 3;
-  // transient_egress opens kernel egress to exactly these host:port targets
-  // for the duration of this tool-call window (G4: URI-scoped egress). The
-  // entries are removed on CompleteToolCall, or expire after
-  // window_timeout_ms — whichever comes first. Empty = no transient egress
-  // (unchanged behavior).
-  repeated EgressRule transient_egress = 4;
-  // window_timeout_ms bounds the transient egress entries as a safety net
-  // against a lost CompleteToolCall. 0 = use the enforcer default horizon.
-  uint64 window_timeout_ms = 5;
-}
-
-message PrepareToolCallResponse {}
-
-message CompleteToolCallRequest {
-  string correlation_id = 1;
-  string container_id = 2;
-}
-
-message CompleteToolCallResponse {}
-
 // --- Network policy ---
 
 message NetworkPolicyRequest {
@@ -98,12 +73,6 @@ message NetworkPolicyRequest {
   repeated string allowed_hosts = 2;
   repeated EgressRule egress_rules = 3;
   repeated string dns_servers = 4;
-  // CIDRs (or bare IPs) denied even when an allow entry covers them —
-  // checked before the allow maps in the BPF connect/sendmsg hooks.
-  // The enforcer additionally always blocks the cloud metadata endpoints
-  // for every enforced cgroup; these entries narrow policy, never widen
-  // it, so they are not part of the signed-bundle baseline check.
-  repeated string blocked_cidrs = 5;
 }
 
 message EgressRule {
@@ -126,6 +95,52 @@ message FilesystemPolicyRequest {
 message ProcessPolicyRequest {
   string container_id = 1;
   repeated string allowed_binaries = 2;
+}
+
+// --- Deny-set process-tree policy ---
+
+message DenySetEntry {
+  uint32 deny_set_id = 1;
+  string binary_path = 2;
+}
+
+message DenySetTransition {
+  uint32 parent_deny_set_id = 1;
+  string child_binary_path = 2;
+  uint32 child_deny_set_id = 3;
+}
+
+message ApplyDenySetPolicyRequest {
+  string container_id = 1;
+  repeated DenySetEntry allowed_entries = 2;
+  repeated DenySetTransition transitions = 3;
+  uint32 init_pid = 4;
+  uint32 init_deny_set_id = 5;
+}
+
+message UpdateDenySetPolicyRequest {
+  string container_id = 1;
+  uint32 deny_set_id = 2;
+  string binary_path = 3;
+}
+
+// --- Bind (listen) policy ---
+
+message BindPolicyRequest {
+  string container_id = 1;
+  repeated BindRule allowed_binds = 2;
+}
+
+message BindRule {
+  uint32 port = 1;
+  string protocol = 2;
+}
+
+// --- Reverse shell detection ---
+
+message ReverseShellConfigRequest {
+  string container_id = 1;
+  string mode = 2;
 }
 
 // --- Credential policy ---
@@ -193,10 +208,6 @@ message LoadPolicyBundleResponse {
 message PolicyResponse {
   bool success = 1;
   string error = 2;
-  // Network policy only: hosts whose DNS resolution failed, so no allow
-  // entries were installed for them (the policy applied PARTIALLY —
-  // narrower than declared, never wider). Empty on full application.
-  repeated string unresolved_hosts = 3;
 }
 
 // --- Events ---
@@ -213,8 +224,6 @@ message EnforcementEvent {
   uint32 pid = 5;
   string comm = 6;
   map<string, string> details = 7;
-  uint64 cgroup_id = 8;
-  string correlation_id = 9;
 }
 
 // --- Stats ---
@@ -232,15 +241,6 @@ message StatsResponse {
   uint64 process_blocked = 6;
   uint64 credential_allowed = 7;
   uint64 credential_blocked = 8;
-
-  // lsm_active reports whether the kernel BPF LSM hooks (file_open,
-  // bprm_check) are attached. Network/cgroup hooks can attach on kernels
-  // without BPF LSM, so the enforcer can be SERVING while filesystem deny-list
-  // and exec enforcement are silently inactive. Clients running kernel-primary
-  // (Docker Engine, no sandboxd VM) refuse to start containers when this is
-  // false. lsm_detail carries the reason for the negative case.
-  bool lsm_active = 9;
-  string lsm_detail = 10;
 }
 
 // --- WASM Component lifecycle ---
@@ -326,26 +326,4 @@ message CallToolResponse {
   string result_json = 3;          // JSON-encoded result
   uint64 execution_time_ns = 4;    // Wall-clock execution time
   uint64 fuel_consumed = 5;        // Instructions consumed
-}
-
-// --- Immutable execution-config (harness freeze) ---
-// Defined at the end of the file so inserting these messages does not renumber
-// the generated msgType indices of the messages above.
-
-message SetImmutableRequest {
-  string container_id = 1;
-  // paths are absolute in the agent's mount namespace (e.g. "/etc/crontab",
-  // "/home/node/.bashrc"). The enforcer resolves each as
-  // /proc/<init_pid>/root<path>. A path that does not exist is skipped, not an
-  // error. Paths containing a ".." component are rejected.
-  repeated string paths = 2;
-  // immutable=true sets FS_IMMUTABLE_FL (freeze); false clears it (unfreeze),
-  // mirroring `ac harness protect`/`unprotect`.
-  bool immutable = 3;
-}
-
-message SetImmutableResponse {
-  bool success = 1;
-  string error = 2;
-  uint32 changed_count = 3;  // paths whose immutable bit actually changed
 }

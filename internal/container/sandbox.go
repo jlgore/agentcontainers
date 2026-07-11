@@ -65,17 +65,14 @@ type sidecarStarterFunc func(ctx context.Context, dockerClient client.APIClient,
 // Defaults to sidecar.StopSidecar. Tests can override this.
 type sidecarStopperFunc func(ctx context.Context, dockerClient client.APIClient, handle *sidecar.SidecarHandle) error
 
-// strategyFactory creates an enforcement.Strategy for a given connection
-// profile (address + mTLS material). This indirection allows tests to
-// substitute a mock strategy.
-type strategyFactory func(profile enforcement.ConnectionProfile) (enforcement.Strategy, error)
+// strategyFactory creates an enforcement.Strategy for a given gRPC target address.
+// This indirection allows tests to substitute a mock strategy.
+type strategyFactory func(target string) (enforcement.Strategy, error)
 
-// defaultStrategyFactory creates a real gRPC enforcement strategy for the
-// connection profile, applying the standard TLS policy (mTLS when credentials
-// are present; plaintext only for a loopback endpoint or an explicit
-// insecure-dev opt-in).
-func defaultStrategyFactory(profile enforcement.ConnectionProfile) (enforcement.Strategy, error) {
-	return enforcement.NewStrategyFromProfile(profile, nil)
+// defaultStrategyFactory creates a real gRPC enforcement strategy connected to
+// the given target address using insecure transport.
+func defaultStrategyFactory(target string) (enforcement.Strategy, error) {
+	return enforcement.NewGRPCStrategy(target, enforcement.WithInsecure())
 }
 
 // SandboxRuntime implements the Runtime interface using Docker Sandbox microVMs
@@ -86,7 +83,6 @@ type SandboxRuntime struct {
 	client          SandboxAPI
 	dockerFactory   dockerClientFactory
 	enfLevel        enforcement.Level
-	insecureDev     bool
 	sidecarStarter  sidecarStarterFunc
 	sidecarStopper  sidecarStopperFunc
 	strategyFactory strategyFactory
@@ -107,7 +103,6 @@ type sandboxOptions struct {
 	client          SandboxAPI
 	dockerFactory   dockerClientFactory
 	enfLevel        enforcement.Level
-	insecureDev     bool
 	sidecarStarter  sidecarStarterFunc
 	sidecarStopper  sidecarStopperFunc
 	strategyFactory strategyFactory
@@ -135,15 +130,6 @@ func WithSandboxClient(c SandboxAPI) SandboxOption {
 func WithSandboxEnforcementLevel(l enforcement.Level) SandboxOption {
 	return func(o *sandboxOptions) {
 		o.enfLevel = l
-	}
-}
-
-// WithSandboxInsecureDev disables mutual TLS for the per-VM enforcer control
-// plane. It is a development-only opt-in; by default the in-VM enforcer runs
-// ephemeral mTLS.
-func WithSandboxInsecureDev(insecure bool) SandboxOption {
-	return func(o *sandboxOptions) {
-		o.insecureDev = insecure
 	}
 }
 
@@ -231,7 +217,6 @@ func NewSandboxRuntime(opts ...SandboxOption) (*SandboxRuntime, error) {
 		client:            o.client,
 		dockerFactory:     factory,
 		enfLevel:          o.enfLevel,
-		insecureDev:       o.insecureDev,
 		sidecarStarter:    starter,
 		sidecarStopper:    stopper,
 		strategyFactory:   sf,
@@ -410,14 +395,6 @@ func (s *SandboxRuntime) Start(ctx context.Context, cfg *config.AgentContainer, 
 			handle, startErr := s.sidecarStarter(ctx, dockerCli, sidecar.StartOptions{
 				Required:        false, // non-fatal: VM works without enforcer
 				HealthCheckAddr: enforcerAddr,
-				// In-VM enforcer: reachable from the host at the VM IP (no
-				// HostBindIP), authenticated with ephemeral mTLS unless the
-				// operator opted into plaintext development mode. The enforcer
-				// cert covers localhost/127.0.0.1, not the VM IP, so verify the
-				// TLS hostname against "localhost".
-				MTLS:        !s.insecureDev,
-				InsecureDev: s.insecureDev,
-				ServerName:  sidecar.EnforcerCertServerName,
 			})
 			if startErr != nil {
 				s.logger.Warn("failed to start enforcer in VM",
@@ -434,9 +411,8 @@ func (s *SandboxRuntime) Start(ctx context.Context, cfg *config.AgentContainer, 
 					zap.String("enforcer_addr", enforcerAddr),
 				)
 
-				// Create enforcement strategy connected to the in-VM enforcer,
-				// using the credentials retrieved into the sidecar handle.
-				strategy, stratErr := s.strategyFactory(handle.Profile())
+				// Create enforcement strategy connected to the in-VM enforcer.
+				strategy, stratErr := s.strategyFactory(enforcerAddr)
 				if stratErr != nil {
 					s.logger.Warn("failed to create enforcement strategy",
 						zap.String("vm_name", vmName),
@@ -451,22 +427,7 @@ func (s *SandboxRuntime) Start(ctx context.Context, cfg *config.AgentContainer, 
 							zap.Error(findErr),
 						)
 					} else {
-						// Resolve the agent container's init PID inside the VM so
-						// the in-VM enforcer can resolve container-namespace policy
-						// paths (incl. /run/secrets/<name>) via /proc/<pid>/root.
-						// sandboxd has already injected the secret files at VM
-						// creation, so credential ACLs resolve here.
-						var agentPID uint32
-						if insp, inspErr := dockerCli.ContainerInspect(ctx, agentContainerID, client.ContainerInspectOptions{}); inspErr != nil {
-							s.logger.Warn("failed to inspect agent container for init PID; credential ACLs may not resolve",
-								zap.String("vm_name", vmName),
-								zap.String("container_id", agentContainerID),
-								zap.Error(inspErr),
-							)
-						} else if insp.Container.State != nil {
-							agentPID = uint32(insp.Container.State.Pid)
-						}
-						if applyErr := strategy.Apply(ctx, agentContainerID, agentPID, opts.Policy); applyErr != nil {
+						if applyErr := strategy.Apply(ctx, agentContainerID, 0, opts.Policy); applyErr != nil {
 							s.logger.Warn("failed to apply enforcement policy",
 								zap.String("vm_name", vmName),
 								zap.String("container_id", agentContainerID),
