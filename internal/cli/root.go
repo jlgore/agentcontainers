@@ -58,6 +58,9 @@ for AI agent runtime environments.`,
 		newAttestCmd(),
 		newTUFCmd(),
 		newPolicyCmd(),
+		newMCPCmd(),
+		newApproveCmd(),
+		newGuardCmd(),
 	)
 
 	return cmd

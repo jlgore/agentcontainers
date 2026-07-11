@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -88,6 +89,20 @@ type FilesystemCaps struct {
 type NetworkCaps struct {
 	Egress []EgressRule `json:"egress,omitempty"`
 	Deny   []string     `json:"deny,omitempty"`
+
+	// URIEgress opts the server into URI-scoped transient egress (G4): when
+	// true, the proxy extracts user-supplied https URLs from a tool call's
+	// arguments and asks the enforcer to open kernel egress to exactly those
+	// host:port targets for the duration of that one tool-call window. Off
+	// by default — static egress policy is unchanged unless enabled.
+	URIEgress bool `json:"uriEgress,omitempty"`
+
+	// URIEgressDeny lists hosts that are never eligible for URI-scoped
+	// transient egress, regardless of who requests them (G4). It is a hard
+	// ceiling on URIEgress: a denied host is rejected even when the user
+	// attests it. Distinct from Deny (static CIDR egress blocking) — this is
+	// hostname-scoped and only governs the transient URI path.
+	URIEgressDeny []string `json:"uriEgressDeny,omitempty"`
 }
 
 // EgressRule defines an allowed outbound connection.
@@ -181,6 +196,157 @@ type MCPToolConfig struct {
 	// Limits applies resource constraints to WASM Components.
 	// Only valid when Type is "component"; rejected for container-type tools.
 	Limits *ComponentLimits `json:"limits,omitempty"`
+
+	// Transport is the MCP transport for container-type tools:
+	// "stdio" (default) or "http".
+	Transport string `json:"transport,omitempty"`
+
+	// Port is the container port for HTTP transport. Required when
+	// transport is "http". Container type only.
+	Port int `json:"port,omitempty"`
+
+	// Path is the HTTP path of the MCP Streamable HTTP endpoint for
+	// container-type tools with transport "http" (e.g. "/mcp"). Defaults to
+	// "/". Only valid for container + http.
+	Path string `json:"path,omitempty"`
+
+	// URL is the endpoint of a "remote" server. Remote type only.
+	URL string `json:"url,omitempty"`
+
+	// Command overrides the container entrypoint. Container type only.
+	Command []string `json:"command,omitempty"`
+
+	// User sets the uid[:gid] (or name[:group]) the container process runs as,
+	// passed through to the container runtime's user setting. Container type
+	// only. When empty, the image's baked user is used (root if none).
+	//
+	// This matters under the proxy's hardening: backends run with all Linux
+	// capabilities dropped, so a default-root process has no CAP_DAC_OVERRIDE
+	// and is subject to ordinary DAC checks. To write a bind-mounted host
+	// directory, set User to a uid that owns (or shares a group with) that
+	// directory rather than relying on root's bypass.
+	User string `json:"user,omitempty"`
+
+	// Env sets environment variables. Container type only.
+	Env map[string]string `json:"env,omitempty"`
+
+	// Policy declares per-server enforcement rules. Valid on all types;
+	// which sub-fields are valid depends on type (see Resolve).
+	Policy *MCPServerPolicy `json:"policy,omitempty"`
+}
+
+// MCPKind is the resolved hosting model of an MCP tool. Type "" resolves to
+// KindContainer.
+type MCPKind string
+
+const (
+	KindContainer MCPKind = "container"
+	KindComponent MCPKind = "component"
+	KindRemote    MCPKind = "remote"
+)
+
+// ResolvedTool is a discriminated, type-checked view of an MCPToolConfig.
+// Exactly one of Container/Component/Remote is non-nil, selected by Kind.
+// Resolve is the only constructor; a ResolvedTool therefore witnesses that
+// the underlying wire struct passed type-appropriate validation.
+type ResolvedTool struct {
+	Name      string
+	Kind      MCPKind
+	Container *ContainerTool
+	Component *ComponentTool
+	Remote    *RemoteTool
+}
+
+// ContainerTool exposes the fields legal for a container-type MCP tool.
+type ContainerTool struct {
+	Image        string
+	Capabilities []string
+	Secrets      []string
+	Mounts       []string
+	Transport    string
+	Port         int
+	Path         string
+	Command      []string
+	Env          map[string]string
+	User         string
+	Policy       *MCPServerPolicy
+}
+
+// ComponentTool exposes the fields legal for a component-type MCP tool.
+type ComponentTool struct {
+	Image        string
+	Capabilities []string
+	Secrets      []string
+	Limits       *ComponentLimits
+	Policy       *MCPServerPolicy
+}
+
+// RemoteTool exposes the fields legal for a remote-type MCP tool.
+type RemoteTool struct {
+	URL          string
+	Capabilities []string
+	Policy       *MCPServerPolicy
+}
+
+// MCPServerPolicy declares per-MCP-server enforcement rules evaluated by
+// the MCP proxy (allowedTools, requireApproval, maxConcurrentTools) and,
+// for container-type servers, kernel-enforced capabilities
+// (network/filesystem/shell) plus an optional security YAML policy file.
+type MCPServerPolicy struct {
+	// AllowedTools filters the server's tool list; empty means all tools.
+	AllowedTools []string `json:"allowedTools,omitempty"`
+
+	// RequireApproval lists tools that pause for human confirmation.
+	RequireApproval []string `json:"requireApproval,omitempty"`
+
+	// MaxConcurrentTools serializes tool calls per server. Defaults to 1.
+	// Shadows the agent-level policy.maxConcurrentTools.
+	MaxConcurrentTools int `json:"maxConcurrentTools,omitempty"`
+
+	// Network/Filesystem/Shell are kernel-class capabilities, valid only
+	// on container-type servers (there is no cgroup to enforce against on
+	// component or remote servers).
+	Network    *NetworkCaps    `json:"network,omitempty"`
+	Filesystem *FilesystemCaps `json:"filesystem,omitempty"`
+	Shell      *ShellCaps      `json:"shell,omitempty"`
+
+	// SecurityYAML is a path to a security policy file, resolved relative
+	// to the config file directory. Container type only.
+	SecurityYAML string `json:"securityYaml,omitempty"`
+
+	// OverrideCeiling lists the policy categories (Rego package names, e.g.
+	// "network", "dangerous_flags") that a per-invocation operator override
+	// VC (G3) is permitted to waive for a single tool call. Empty (the
+	// default) means no override can widen anything — fail closed. Structural
+	// decomposition denials are never waivable regardless of this list.
+	OverrideCeiling []string `json:"overrideCeiling,omitempty"`
+
+	// OperatorDIDs lists the did:key identities whose override VCs (G3) this
+	// server honors. An override signed by a DID outside this list is refused
+	// even if its signature is valid. Empty (the default) means overrides are
+	// off for this server — fail closed — regardless of OverrideCeiling.
+	OperatorDIDs []string `json:"operatorDids,omitempty"`
+
+	// ShellTools declares which of the server's MCP tools take shell
+	// commands as arguments, and how to map the arguments for policy
+	// decomposition. Tools not declared here fall back to a heuristic: an
+	// argument object with a string "binary" field (plus optional
+	// "extra_args" array) is treated as a shell command.
+	ShellTools map[string]ShellToolSpec `json:"shellTools,omitempty"`
+}
+
+// ShellToolSpec maps an MCP tool's arguments onto a shell command for
+// policy decomposition. Either CommandArg (a single free-form command
+// string) or BinaryArg/ArgsArg (pre-tokenized) — not both.
+type ShellToolSpec struct {
+	// BinaryArg names the argument holding the binary (default "binary").
+	BinaryArg string `json:"binaryArg,omitempty"`
+	// ArgsArg names the argument holding the argument array
+	// (default "extra_args").
+	ArgsArg string `json:"argsArg,omitempty"`
+	// CommandArg names an argument holding a free-form shell command
+	// string, parsed with a real shell parser.
+	CommandArg string `json:"commandArg,omitempty"`
 }
 
 // ComponentLimits constrains WASM Component resource usage per tool invocation.
@@ -385,38 +551,281 @@ func (c *AgentContainer) Validate() error {
 		}
 	}
 
-	// Validate MCP tool entries.
+	// Validate MCP tool entries. Validation falls out of resolution: each tool
+	// is resolved into its typed view (container / component / remote), which
+	// rejects fields not legal for the type. Using Resolve here keeps the JSON
+	// config validation consistent with the transport/enforcement layers, which
+	// also drive off Resolve — an inline allowlist here would (and did) diverge,
+	// e.g. rejecting the "remote" type that the proxy fully supports.
 	if c.Agent != nil && c.Agent.Tools != nil {
 		for name, tool := range c.Agent.Tools.MCP {
-			if tool.Image == "" {
-				errs = append(errs, fmt.Errorf("agent.tools.mcp[%q].image: image must not be empty", name))
-			}
-			switch tool.Type {
-			case "", "container", "component":
-				// Valid values.
-			default:
-				errs = append(errs, fmt.Errorf("agent.tools.mcp[%q].type: invalid value %q (must be \"container\" or \"component\")", name, tool.Type))
-			}
-			isComponent := tool.Type == "component"
-			if isComponent && len(tool.Mounts) > 0 {
-				errs = append(errs, fmt.Errorf("agent.tools.mcp[%q].mounts: mounts are not valid for component-type tools", name))
-			}
-			if !isComponent && tool.Limits != nil {
-				errs = append(errs, fmt.Errorf("agent.tools.mcp[%q].limits: limits are only valid for component-type tools", name))
-			}
-			if tool.Limits != nil {
-				if tool.Limits.MemoryMB < 0 {
-					errs = append(errs, fmt.Errorf("agent.tools.mcp[%q].limits.memory_mb: must be >= 0", name))
-				}
-				if tool.Limits.TimeoutMs < 0 {
-					errs = append(errs, fmt.Errorf("agent.tools.mcp[%q].limits.timeout_ms: must be >= 0", name))
-				}
-				if tool.Limits.Fuel < 0 {
-					errs = append(errs, fmt.Errorf("agent.tools.mcp[%q].limits.fuel: must be >= 0", name))
-				}
+			if _, rerrs := tool.Resolve(name); len(rerrs) > 0 {
+				errs = append(errs, rerrs...)
 			}
 		}
 	}
 
 	return errors.Join(errs...)
+}
+
+// Resolve maps the wire MCPToolConfig onto its typed accessor view,
+// validating as it goes. It returns a ResolvedTool whose Kind selects the
+// single non-nil typed view (Container/Component/Remote), plus every
+// validation error encountered. Validation falls out of resolution: any
+// field set on the wire struct but not legal for the resolved type yields an
+// error. Type "" resolves to KindContainer.
+//
+// Per-type field allowlist (the matrix this enforces):
+//
+//	field                                  container  component  remote
+//	image                                  required   required   rejected
+//	url                                    rejected   rejected   required
+//	transport, port, path                  ok         rejected   rejected
+//	command, env, mounts                   ok         rejected   rejected
+//	secrets                                ok         ok         rejected
+//	limits                                 rejected   ok         rejected
+//	policy.allowedTools/requireApproval/
+//	  maxConcurrentTools                   ok         ok         ok
+//	policy.network/filesystem/shell/
+//	  securityYaml                         ok         rejected   rejected
+//
+// On a fatal type error (unknown Type) the returned ResolvedTool is zero and
+// the only error describes the invalid type.
+func (t MCPToolConfig) Resolve(name string) (ResolvedTool, []error) {
+	field := func(f string) string { return fmt.Sprintf("agent.tools.mcp[%q].%s", name, f) }
+
+	switch t.Type {
+	case "", "container":
+		return t.resolveContainer(name, field)
+	case "component":
+		return t.resolveComponent(name, field)
+	case "remote":
+		return t.resolveRemote(name, field)
+	default:
+		return ResolvedTool{}, []error{fmt.Errorf("%s: invalid value %q (must be \"container\", \"component\", or \"remote\")", field("type"), t.Type)}
+	}
+}
+
+func (t MCPToolConfig) resolveContainer(name string, field func(string) string) (ResolvedTool, []error) {
+	var errs []error
+
+	if t.Image == "" {
+		errs = append(errs, fmt.Errorf("%s: image must not be empty", field("image")))
+	}
+
+	switch t.Transport {
+	case "", "stdio", "http":
+		// Valid values.
+	default:
+		errs = append(errs, fmt.Errorf("%s: invalid value %q (must be \"stdio\" or \"http\")", field("transport"), t.Transport))
+	}
+	if t.Transport == "http" && t.Port <= 0 {
+		errs = append(errs, fmt.Errorf("%s: port must be > 0 when transport is \"http\"", field("port")))
+	}
+	if t.Transport != "http" && t.Port != 0 {
+		errs = append(errs, fmt.Errorf("%s: port is only valid when transport is \"http\"", field("port")))
+	}
+	if t.Transport != "http" && t.Path != "" {
+		errs = append(errs, fmt.Errorf("%s: path is only valid when transport is \"http\"", field("path")))
+	}
+
+	if t.Limits != nil {
+		errs = append(errs, fmt.Errorf("%s: limits are only valid for component-type tools", field("limits")))
+		errs = append(errs, validateLimits(t.Limits, field)...)
+	}
+
+	errs = append(errs, validateSharedPolicy(t.Policy, field)...)
+	errs = append(errs, validateContainerPolicy(t.Policy, field)...)
+
+	view := &ContainerTool{
+		Image:        t.Image,
+		Capabilities: t.Capabilities,
+		Secrets:      t.Secrets,
+		Mounts:       t.Mounts,
+		Transport:    t.Transport,
+		Port:         t.Port,
+		Path:         t.Path,
+		Command:      t.Command,
+		Env:          t.Env,
+		User:         t.User,
+		Policy:       t.Policy,
+	}
+	return ResolvedTool{Name: name, Kind: KindContainer, Container: view}, errs
+}
+
+func (t MCPToolConfig) resolveComponent(name string, field func(string) string) (ResolvedTool, []error) {
+	var errs []error
+
+	if t.Image == "" {
+		errs = append(errs, fmt.Errorf("%s: image must not be empty", field("image")))
+	}
+	if t.URL != "" {
+		errs = append(errs, fmt.Errorf("%s: url is only valid for remote-type tools", field("url")))
+	}
+	if t.Transport != "" {
+		errs = append(errs, fmt.Errorf("%s: transport is only valid for container-type tools", field("transport")))
+	}
+	if t.Port != 0 {
+		errs = append(errs, fmt.Errorf("%s: port is only valid for container-type tools", field("port")))
+	}
+	if t.Path != "" {
+		errs = append(errs, fmt.Errorf("%s: path is only valid for container-type tools", field("path")))
+	}
+	if len(t.Command) > 0 {
+		errs = append(errs, fmt.Errorf("%s: command is only valid for container-type tools", field("command")))
+	}
+	if len(t.Env) > 0 {
+		errs = append(errs, fmt.Errorf("%s: env is only valid for container-type tools", field("env")))
+	}
+	if t.User != "" {
+		errs = append(errs, fmt.Errorf("%s: user is only valid for container-type tools", field("user")))
+	}
+	if len(t.Mounts) > 0 {
+		errs = append(errs, fmt.Errorf("%s: mounts are not valid for component-type tools", field("mounts")))
+	}
+	if t.Limits != nil {
+		errs = append(errs, validateLimits(t.Limits, field)...)
+	}
+
+	errs = append(errs, validateSharedPolicy(t.Policy, field)...)
+	errs = append(errs, validateNonContainerPolicy(t.Policy, "component", field)...)
+
+	view := &ComponentTool{
+		Image:        t.Image,
+		Capabilities: t.Capabilities,
+		Secrets:      t.Secrets,
+		Limits:       t.Limits,
+		Policy:       t.Policy,
+	}
+	return ResolvedTool{Name: name, Kind: KindComponent, Component: view}, errs
+}
+
+func (t MCPToolConfig) resolveRemote(name string, field func(string) string) (ResolvedTool, []error) {
+	var errs []error
+
+	if t.Image != "" {
+		errs = append(errs, fmt.Errorf("%s: image is not valid for remote-type tools", field("image")))
+	}
+	if t.URL == "" {
+		errs = append(errs, fmt.Errorf("%s: url is required for remote-type tools", field("url")))
+	} else if u, err := url.Parse(t.URL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		errs = append(errs, fmt.Errorf("%s: invalid URL %q (must be http or https)", field("url"), t.URL))
+	}
+	if t.Transport != "" {
+		errs = append(errs, fmt.Errorf("%s: transport is only valid for container-type tools", field("transport")))
+	}
+	if t.Port != 0 {
+		errs = append(errs, fmt.Errorf("%s: port is only valid for container-type tools", field("port")))
+	}
+	if t.Path != "" {
+		errs = append(errs, fmt.Errorf("%s: path is only valid for container-type tools", field("path")))
+	}
+	if len(t.Command) > 0 {
+		errs = append(errs, fmt.Errorf("%s: command is only valid for container-type tools", field("command")))
+	}
+	if len(t.Env) > 0 {
+		errs = append(errs, fmt.Errorf("%s: env is only valid for container-type tools", field("env")))
+	}
+	if t.User != "" {
+		errs = append(errs, fmt.Errorf("%s: user is only valid for container-type tools", field("user")))
+	}
+	if len(t.Mounts) > 0 {
+		errs = append(errs, fmt.Errorf("%s: mounts are not valid for remote-type tools", field("mounts")))
+	}
+	if len(t.Secrets) > 0 {
+		errs = append(errs, fmt.Errorf("%s: secrets are not valid for remote-type tools", field("secrets")))
+	}
+	if t.Limits != nil {
+		errs = append(errs, fmt.Errorf("%s: limits are only valid for component-type tools", field("limits")))
+		errs = append(errs, validateLimits(t.Limits, field)...)
+	}
+
+	errs = append(errs, validateSharedPolicy(t.Policy, field)...)
+	errs = append(errs, validateNonContainerPolicy(t.Policy, "remote", field)...)
+
+	view := &RemoteTool{
+		URL:          t.URL,
+		Capabilities: t.Capabilities,
+		Policy:       t.Policy,
+	}
+	return ResolvedTool{Name: name, Kind: KindRemote, Remote: view}, errs
+}
+
+// validateLimits checks the non-negativity of component limit fields. The
+// type-appropriateness of limits is checked by the caller.
+func validateLimits(l *ComponentLimits, field func(string) string) []error {
+	var errs []error
+	if l.MemoryMB < 0 {
+		errs = append(errs, fmt.Errorf("%s: must be >= 0", field("limits.memory_mb")))
+	}
+	if l.TimeoutMs < 0 {
+		errs = append(errs, fmt.Errorf("%s: must be >= 0", field("limits.timeout_ms")))
+	}
+	if l.Fuel < 0 {
+		errs = append(errs, fmt.Errorf("%s: must be >= 0", field("limits.fuel")))
+	}
+	return errs
+}
+
+// validateSharedPolicy checks policy fields legal on every tool type:
+// maxConcurrentTools (>= 0), shell command binaries, shellTools arg shape,
+// and network egress hosts.
+func validateSharedPolicy(p *MCPServerPolicy, field func(string) string) []error {
+	if p == nil {
+		return nil
+	}
+	var errs []error
+	if p.MaxConcurrentTools < 0 {
+		errs = append(errs, fmt.Errorf("%s: must be >= 0, got %d", field("policy.maxConcurrentTools"), p.MaxConcurrentTools))
+	}
+	if p.Shell != nil {
+		for i, cmd := range p.Shell.Commands {
+			if cmd.Binary == "" {
+				errs = append(errs, fmt.Errorf("%s: binary must not be empty", field(fmt.Sprintf("policy.shell.commands[%d]", i))))
+			}
+		}
+	}
+	for toolName, spec := range p.ShellTools {
+		if spec.CommandArg != "" && (spec.BinaryArg != "" || spec.ArgsArg != "") {
+			errs = append(errs, fmt.Errorf("%s: commandArg and binaryArg/argsArg are mutually exclusive", field(fmt.Sprintf("policy.shellTools[%q]", toolName))))
+		}
+	}
+	if p.Network != nil {
+		for i, rule := range p.Network.Egress {
+			if rule.Host == "" {
+				errs = append(errs, fmt.Errorf("%s: host must not be empty", field(fmt.Sprintf("policy.network.egress[%d]", i))))
+			}
+		}
+	}
+	return errs
+}
+
+// validateContainerPolicy is a no-op placeholder: kernel-class policy fields
+// (network/filesystem/shell/securityYaml) are all legal on container-type
+// tools. Kept symmetric with validateNonContainerPolicy for clarity.
+func validateContainerPolicy(_ *MCPServerPolicy, _ func(string) string) []error {
+	return nil
+}
+
+// validateNonContainerPolicy rejects kernel-class policy fields that cannot
+// be enforced without a cgroup (component and remote tools). kind is the
+// tool type label used in the error message.
+func validateNonContainerPolicy(p *MCPServerPolicy, kind string, field func(string) string) []error {
+	if p == nil {
+		return nil
+	}
+	var errs []error
+	if p.Network != nil {
+		errs = append(errs, fmt.Errorf("%s: network policy is not enforceable for %s-type tools", field("policy.network"), kind))
+	}
+	if p.Filesystem != nil {
+		errs = append(errs, fmt.Errorf("%s: filesystem policy is not enforceable for %s-type tools", field("policy.filesystem"), kind))
+	}
+	if p.Shell != nil {
+		errs = append(errs, fmt.Errorf("%s: shell policy is not enforceable for %s-type tools", field("policy.shell"), kind))
+	}
+	if p.SecurityYAML != "" {
+		errs = append(errs, fmt.Errorf("%s: securityYaml is not enforceable for %s-type tools", field("policy.securityYaml"), kind))
+	}
+	return errs
 }

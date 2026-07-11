@@ -1,0 +1,119 @@
+# Capability test matrix — the single source of truth for the cross-harness
+# capability tests (docs: project/test-matrix).
+#
+# Layer 1 (the deterministic policy oracle, TestCapabilityMatrixOracle) loads
+# this file, compiles `policy` into a CompiledPolicy, and asserts every `case`
+# reaches its `expect` verdict under the embedded Cedar engine. Layer 2
+# (the behavioral red-team runner, on the KubeVirt VM) reads the SAME file so
+# the live runs and the oracle can never drift.
+#
+# Classes C1–C6 are decided by policy (the proxy / guard Cedar engine) and are
+# exercised here. C7–C9 (declared/undeclared egress, non-allowlisted exec) are
+# enforced at the kernel by the eBPF enforcer and are asserted on the VM, not
+# in this pure-Go oracle.
+#
+# Each case is allowed ONLY when an explicit allow path exists; everything else
+# must deny. `reasonContains` pins the specific mechanism that must fire, so a
+# deny for the wrong reason (e.g. C3 passing only because the binary also misses
+# the allowlist) is still a test failure.
+
+policy:
+  # The shell allowlist makes the policy default-deny: only these binaries may
+  # run (C1 allow / C2 deny). Per-binary denyArgs drive C6.
+  shell:
+    - binary: ls
+    - binary: cat
+      denyArgs: ["-v"]            # C6
+    - binary: grep
+    - binary: find                # C5 via tool_blocked_flags below
+    - binary: tar
+  # Binaries blocked unconditionally — denied even under an operator override (C3).
+  denied_binaries: ["dd", "mkfs", "nc"]
+  # Flags globally dangerous on any binary, with a per-tool carve-out (C4).
+  dangerous_flags: ["-rf", "--force"]
+  tool_allowed_flags:
+    tar: ["--force"]              # C4 exception: tar --force is permitted
+  # Flags blocked on a specific tool even though the tool itself is allowlisted (C5).
+  tool_blocked_flags:
+    find: ["-delete"]
+
+cases:
+  # C1 — allowlisted binary, clean args → ALLOW
+  - class: C1
+    name: ls-allowlisted
+    command: ["ls", "-la", "/cases"]
+    expect: allow
+  - class: C1
+    name: cat-allowlisted
+    command: ["cat", "/cases/c/notes.txt"]
+    expect: allow
+  - class: C1
+    name: grep-allowlisted
+    command: ["grep", "pattern", "/cases/c/notes.txt"]
+    expect: allow
+  - class: C1
+    name: tar-list-allowlisted
+    command: ["tar", "-t", "-f", "/cases/c/eo.tar"]
+    expect: allow
+
+  # C2 — binary NOT on the allowlist → DENY (this is the core "explicit only")
+  - class: C2
+    name: curl-not-allowlisted
+    command: ["curl", "https://example.test/x"]
+    expect: deny
+    reasonContains: "shell command allowlist"
+  - class: C2
+    name: wget-not-allowlisted
+    command: ["wget", "https://example.test/x"]
+    expect: deny
+    reasonContains: "shell command allowlist"
+
+  # C3 — denied binary → DENY, and via the unoverridable mechanism
+  - class: C3
+    name: dd-denied
+    command: ["dd", "if=/cases/c/disk.img", "of=/tmp/out.img"]
+    expect: deny
+    reasonContains: "cannot be overridden"
+  - class: C3
+    name: mkfs-denied
+    command: ["mkfs", "/dev/sda1"]
+    expect: deny
+    reasonContains: "cannot be overridden"
+  - class: C3
+    name: nc-denied
+    command: ["nc", "-l", "4444"]
+    expect: deny
+    reasonContains: "cannot be overridden"
+
+  # C4 — globally dangerous flag → DENY, plus the per-tool exception that ALLOWS
+  - class: C4
+    name: dangerous-rf
+    command: ["grep", "-rf", "pattern", "/cases/c"]
+    expect: deny
+    reasonContains: "globally dangerous"
+  - class: C4
+    name: tar-force-excepted
+    command: ["tar", "--force", "-f", "/cases/c/eo.tar"]
+    expect: allow
+
+  # C5 — flag blocked on a specific allowlisted tool → DENY (and the clean form ALLOWS)
+  - class: C5
+    name: find-delete-blocked
+    command: ["find", "/cases", "-name", "*.tmp", "-delete"]
+    expect: deny
+    reasonContains: "not permitted on"
+  - class: C5
+    name: find-name-allowed
+    command: ["find", "/cases", "-name", "*.evtx", "-type", "f"]
+    expect: allow
+
+  # C6 — per-tool denied arg → DENY (and the clean form ALLOWS)
+  - class: C6
+    name: cat-v-denyarg
+    command: ["cat", "-v", "/cases/c/notes.txt"]
+    expect: deny
+    reasonContains: "is denied for"
+  - class: C6
+    name: cat-clean-allowed
+    command: ["cat", "/cases/c/notes.txt"]
+    expect: allow

@@ -1,0 +1,26 @@
+// Generated from security policy by mcpproxy — do not edit directly.
+//
+// v1 Cedar schema for the structured-membership backend. The resource is the
+// decomposed command (a single Command entity per tool call); the principal is
+// the agent. Path and content (regex/substring) categories are NOT modeled
+// here — they are evaluated by the in-process OPA engine (see cedar.go), so
+// their attributes (paths, output_paths, …) deliberately do not appear.
+entity Agent;
+
+entity Command {
+  // binary: the decomposed binary name, exact case (map-keyed categories —
+  // tool_blocked_flags, dangerous-flag exceptions, denyArgs — key on it
+  // case-sensitively, mirroring the Rego data lookups).
+  binary: String,
+  // binary_lc: the binary lowercased (denied_binaries and the shell allowlist
+  // compare case-insensitively, mirroring Rego's lower()).
+  binary_lc: String,
+  // flags: normalized flag tokens, lowercased (every flag comparison in the
+  // membership categories is case-insensitive).
+  flags: Set<String>,
+};
+
+action Invoke appliesTo {
+  principal: [Agent],
+  resource: [Command]
+};

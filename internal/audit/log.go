@@ -3,6 +3,7 @@ package audit
 import (
 	"bufio"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,38 @@ import (
 
 const zeroHash = "0000000000000000000000000000000000000000000000000000000000000000"
 
+// entryVersion is the hash-scheme version written on new entries. Version 1
+// hashes the full canonicalized entry (all fields except EntryHash); the
+// legacy version 0 covered only the chain fields, leaving Metadata and
+// Detail outside the hash.
+const entryVersion = 1
+
+// envAuditDir overrides the default audit directory when set.
+const envAuditDir = "AC_AUDIT_DIR"
+
+// DefaultDir returns the audit directory to use when none is specified:
+// $AC_AUDIT_DIR if set, otherwise ~/.ac/audit.
+func DefaultDir() (string, error) {
+	if dir := os.Getenv(envAuditDir); dir != "" {
+		return dir, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("audit: resolving home directory: %w", err)
+	}
+	return filepath.Join(home, ".ac", "audit"), nil
+}
+
+// Signer signs audit entries with a stable cryptographic identity (G1).
+// internal/identity.FileKeyStore satisfies it. A nil signer leaves entries
+// unsigned (DID/Signature empty), which still hash-chain and verify.
+type Signer interface {
+	// DID returns the signer's did:key.
+	DID() string
+	// Sign returns a raw signature over message.
+	Sign(message []byte) ([]byte, error)
+}
+
 // Logger provides append-only audit logging with hash chain integrity.
 type Logger struct {
 	mu        sync.Mutex
@@ -23,6 +56,7 @@ type Logger struct {
 	sequence  uint64
 	prevHash  string
 	closed    bool
+	signer    Signer
 }
 
 // LoggerOption configures a Logger.
@@ -32,6 +66,15 @@ type LoggerOption func(*Logger)
 func WithDir(dir string) LoggerOption {
 	return func(l *Logger) {
 		l.dir = dir
+	}
+}
+
+// WithSigner attaches a signing identity. Every appended entry is then stamped
+// with the signer's DID and an Ed25519 signature over its EntryHash. A nil
+// signer is a no-op (entries stay unsigned).
+func WithSigner(s Signer) LoggerOption {
+	return func(l *Logger) {
+		l.signer = s
 	}
 }
 
@@ -47,11 +90,11 @@ func NewLogger(sessionID string, opts ...LoggerOption) (*Logger, error) {
 	}
 
 	if l.dir == "" {
-		home, err := os.UserHomeDir()
+		dir, err := DefaultDir()
 		if err != nil {
-			return nil, fmt.Errorf("audit: resolving home directory: %w", err)
+			return nil, err
 		}
-		l.dir = filepath.Join(home, ".ac", "audit")
+		l.dir = dir
 	}
 
 	if err := os.MkdirAll(l.dir, 0o700); err != nil {
@@ -59,6 +102,25 @@ func NewLogger(sessionID string, opts ...LoggerOption) (*Logger, error) {
 	}
 
 	path := filepath.Join(l.dir, sessionID+".jsonl")
+	if info, err := os.Stat(path); err == nil && info.Size() > 0 {
+		entries, err := ReadLog(path)
+		if err != nil {
+			return nil, fmt.Errorf("audit: reading existing log: %w", err)
+		}
+		if err := ValidateChain(entries); err != nil {
+			return nil, fmt.Errorf("audit: refusing to append to invalid existing log: %w", err)
+		}
+		for i := range entries {
+			if entries[i].SessionID != sessionID {
+				return nil, fmt.Errorf("audit: existing log entry %d has session ID %q, want %q", i, entries[i].SessionID, sessionID)
+			}
+		}
+		l.sequence = uint64(len(entries))
+		l.prevHash = entries[len(entries)-1].EntryHash
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("audit: inspecting existing log: %w", err)
+	}
+
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("audit: opening log file: %w", err)
@@ -91,11 +153,17 @@ func WithDetail(detail string) LogEntryOption {
 	return func(e *Entry) { e.Detail = detail }
 }
 
-// WithMetadata adds a key-value pair to the entry metadata.
+// WithMetadata adds a string key-value pair to the entry metadata.
 func WithMetadata(key, value string) LogEntryOption {
+	return WithMetadataAny(key, value)
+}
+
+// WithMetadataAny adds a typed value to the entry metadata. Values must be
+// JSON-serializable; they are covered by the entry hash.
+func WithMetadataAny(key string, value any) LogEntryOption {
 	return func(e *Entry) {
 		if e.Metadata == nil {
-			e.Metadata = make(map[string]string)
+			e.Metadata = make(map[string]any)
 		}
 		e.Metadata[key] = value
 	}
@@ -116,6 +184,7 @@ func (l *Logger) Log(eventType EventType, actor Actor, opts ...LogEntryOption) e
 		Sequence:  l.sequence,
 		EventType: eventType,
 		Actor:     actor,
+		Version:   entryVersion,
 		PrevHash:  l.prevHash,
 	}
 
@@ -123,7 +192,26 @@ func (l *Logger) Log(eventType EventType, actor Actor, opts ...LogEntryOption) e
 		opt(&entry)
 	}
 
-	entry.EntryHash = computeHash(entry)
+	// Set DID before hashing (it is attested content covered by the hash),
+	// then sign over the computed hash. Signature is excluded from the hash
+	// (computeHashCanonical zeroes it), so this ordering is consistent.
+	if l.signer != nil {
+		entry.DID = l.signer.DID()
+	}
+
+	hash, err := computeHash(entry)
+	if err != nil {
+		return err
+	}
+	entry.EntryHash = hash
+
+	if l.signer != nil {
+		sig, err := l.signer.Sign([]byte(entry.EntryHash))
+		if err != nil {
+			return fmt.Errorf("audit: signing entry: %w", err)
+		}
+		entry.Signature = base64.StdEncoding.EncodeToString(sig)
+	}
 
 	data, err := json.Marshal(entry)
 	if err != nil {
@@ -159,8 +247,46 @@ func (l *Logger) Path() string {
 	return filepath.Join(l.dir, l.sessionID+".jsonl")
 }
 
-// computeHash computes the SHA-256 hash for an entry using the chain fields.
-func computeHash(e Entry) string {
+// computeHash computes the SHA-256 hash for an entry, dispatching on the
+// entry's hash-scheme version.
+func computeHash(e Entry) (string, error) {
+	if e.Version >= 1 {
+		return computeHashCanonical(e)
+	}
+	return computeHashLegacy(e), nil
+}
+
+// computeHashCanonical hashes the full entry as canonicalized JSON: the
+// entry is serialized, decoded into generic values, and re-serialized so
+// map keys are emitted in sorted order regardless of the in-memory
+// representation (e.g. int vs. float64 after a JSON round trip). EntryHash
+// is zeroed first, since it is the output of this function.
+func computeHashCanonical(e Entry) (string, error) {
+	e.EntryHash = ""
+	// Signature is excluded from the hash for the same reason as EntryHash:
+	// it is computed *over* the hash, so it cannot also be an input to it.
+	// DID is intentionally NOT excluded — it is attested content.
+	e.Signature = ""
+	raw, err := json.Marshal(e)
+	if err != nil {
+		return "", fmt.Errorf("audit: canonicalizing entry: %w", err)
+	}
+	var generic any
+	if err := json.Unmarshal(raw, &generic); err != nil {
+		return "", fmt.Errorf("audit: canonicalizing entry: %w", err)
+	}
+	canon, err := json.Marshal(generic)
+	if err != nil {
+		return "", fmt.Errorf("audit: canonicalizing entry: %w", err)
+	}
+	sum := sha256.Sum256(canon)
+	return fmt.Sprintf("%x", sum), nil
+}
+
+// computeHashLegacy is the version-0 scheme: only the chain fields are
+// hashed; Metadata and Detail are not covered. Kept verbatim so logs
+// written before the versioned scheme still verify.
+func computeHashLegacy(e Entry) string {
 	h := sha256.New()
 	_, _ = fmt.Fprintf(h, "%s|%s|%s|%d|%s|%s:%s|%s|%s",
 		e.PrevHash,
@@ -223,7 +349,10 @@ func ValidateChain(entries []Entry) error {
 		}
 
 		// Verify the entry's own hash.
-		expected := computeHash(entry)
+		expected, err := computeHash(entry)
+		if err != nil {
+			return fmt.Errorf("audit: entry %d: %w", i, err)
+		}
 		if entry.EntryHash != expected {
 			return fmt.Errorf("audit: entry %d: hash mismatch: expected %s, got %s", i, expected, entry.EntryHash)
 		}
@@ -237,15 +366,59 @@ func ValidateChain(entries []Entry) error {
 	return nil
 }
 
+// SignatureVerifier verifies a raw signature by a DID over a message.
+// internal/identity.DIDKeyResolver satisfies it.
+type SignatureVerifier interface {
+	Verify(did string, message, sig []byte) error
+}
+
+// VerifySignatures checks the cryptographic signature on every signed entry
+// (G1). It is independent of, and complementary to, ValidateChain: the chain
+// proves the entries are intact and ordered; the signatures prove who wrote
+// them. An entry with neither DID nor Signature is treated as legacy/unsigned
+// and skipped. An entry carrying only one of the two is malformed and fails.
+// Verification fails closed on any decode error, hash mismatch, or bad
+// signature. Returns the count of entries whose signatures were verified.
+func VerifySignatures(entries []Entry, v SignatureVerifier) (int, error) {
+	verified := 0
+	for i, e := range entries {
+		if e.DID == "" && e.Signature == "" {
+			continue
+		}
+		if e.DID == "" || e.Signature == "" {
+			return verified, fmt.Errorf("audit: entry %d: incomplete signature (did=%q, sig set=%v)", i, e.DID, e.Signature != "")
+		}
+		sig, err := base64.StdEncoding.DecodeString(e.Signature)
+		if err != nil {
+			return verified, fmt.Errorf("audit: entry %d: malformed signature: %w", i, err)
+		}
+		// Recompute the hash and confirm it matches the stored EntryHash, so
+		// the signature is bound to the actual entry content, not a stale or
+		// swapped hash value.
+		expected, err := computeHash(e)
+		if err != nil {
+			return verified, fmt.Errorf("audit: entry %d: %w", i, err)
+		}
+		if e.EntryHash != expected {
+			return verified, fmt.Errorf("audit: entry %d: hash mismatch under signature check: expected %s, got %s", i, expected, e.EntryHash)
+		}
+		if err := v.Verify(e.DID, []byte(e.EntryHash), sig); err != nil {
+			return verified, fmt.Errorf("audit: entry %d: %w", i, err)
+		}
+		verified++
+	}
+	return verified, nil
+}
+
 // ListLogs returns all session audit log files in the audit directory.
 // Each returned path is relative to the audit directory.
 func ListLogs(dir string) ([]string, error) {
 	if dir == "" {
-		home, err := os.UserHomeDir()
+		d, err := DefaultDir()
 		if err != nil {
-			return nil, fmt.Errorf("audit: resolving home directory: %w", err)
+			return nil, err
 		}
-		dir = filepath.Join(home, ".ac", "audit")
+		dir = d
 	}
 
 	entries, err := os.ReadDir(dir)

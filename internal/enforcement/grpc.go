@@ -370,6 +370,14 @@ func (s *GRPCStrategy) Level() Level {
 	return s.level
 }
 
+// Client exposes the underlying enforcer gRPC client so callers that need to
+// issue enforcer RPCs directly (e.g. the MCP proxy's tool-call correlation and
+// audit stream) can reuse this strategy's dialled, TLS-configured connection
+// instead of opening a second one.
+func (s *GRPCStrategy) Client() enforcerapi.EnforcerClient {
+	return s.client
+}
+
 // Close closes the gRPC connection.
 // The mutex is held for the full duration so that no concurrent Apply() call
 // can observe a partially-closed connection.

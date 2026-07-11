@@ -1,0 +1,24 @@
+{{- /*
+sift.dangerous_flags — global dangerous flags with per-tool exceptions
+(Rego: some flag in flags; lower(flag) in lower(dangerous); not exception).
+The default policy applies the full dangerous set to every binary EXCEPT
+those with an effective exception, which each get their own policy carrying
+the reduced (dangerous \ exceptions) set. Flags are compared lowercased.
+*/ -}}
+{{- if .HasDangerous}}
+@id("dangerous_flags")
+@reason("flag is globally dangerous")
+forbid(principal, action == Action::"Invoke", resource)
+when {
+{{- if .DangerousExcludeBins}}
+  !({{.DangerousExcludeBins}}.contains(resource.binary)) &&
+{{- end}}
+  resource.flags.containsAny({{.DangerousDefault}})
+};
+{{- range .DangerousPerTool}}
+@id("dangerous_flags::{{.Binary}}")
+@reason("flag is globally dangerous")
+forbid(principal, action == Action::"Invoke", resource)
+when { resource.binary == {{.BinaryLit}} && resource.flags.containsAny({{.FlagsLiteral}}) };
+{{- end}}
+{{- end}}

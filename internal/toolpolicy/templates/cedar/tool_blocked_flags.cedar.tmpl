@@ -1,0 +1,7 @@
+{{- /* sift.tool_blocked_flags — per-tool blocked flags (Rego: blocked := tool_blocked_flags[binary]; lower(flag) in lower(blocked)). Binary key is case-sensitive; flags lowercased. */ -}}
+{{- range .ToolBlocked}}
+@id("tool_blocked_flags::{{.Binary}}")
+@reason("flag is not permitted on this tool")
+forbid(principal, action == Action::"Invoke", resource)
+when { resource.binary == {{.BinaryLit}} && resource.flags.containsAny({{.FlagsLiteral}}) };
+{{- end}}
