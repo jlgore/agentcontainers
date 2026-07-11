@@ -1,4 +1,4 @@
-package mcpproxy
+package toolpolicy
 
 import (
 	"context"
@@ -81,7 +81,7 @@ func (e *CedarEvaluator) PoliciesEvaluated() []string {
 // evaluateParsed so the structural-deny short-circuit lives in one place
 // (mirrors *Evaluator.EvaluateParsed). Fail-closed handling is the caller's.
 func (e *CedarEvaluator) EvaluateParsed(ctx context.Context, server, tool string, args any, parsed Parsed, pctx map[string]any) (Decision, error) {
-	return evaluateParsed(ctx, e, server, tool, args, parsed, pctx)
+	return EvaluateParsed(ctx, e, server, tool, args, parsed, pctx)
 }
 
 // Evaluate decides one policy-input document. Membership comes from the Cedar

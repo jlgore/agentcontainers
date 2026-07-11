@@ -1,4 +1,4 @@
-package mcpproxy
+package toolpolicy
 
 import (
 	"context"
@@ -56,14 +56,14 @@ type PolicyEngine interface {
 	EvaluateParsed(ctx context.Context, server, tool string, args any, parsed Parsed, pctx map[string]any) (Decision, error)
 }
 
-// evaluateParsed evaluates one decomposed command against any PolicyEngine
+// EvaluateParsed evaluates one decomposed command against any PolicyEngine
 // using the standard policy-input envelope (server/tool/args/parsed/context).
 // The structural-deny short-circuit and the envelope shape live in ONE place
 // for every engine: a decomposition-level deny (parsed.Deny) is a denial the
 // policy language cannot express, so it must hold regardless of engine, and it
 // short-circuits before the engine is ever consulted. Fail-closed handling (an
 // error means deny) is the caller's responsibility.
-func evaluateParsed(ctx context.Context, eng PolicyEngine, server, tool string, args any, parsed Parsed, pctx map[string]any) (Decision, error) {
+func EvaluateParsed(ctx context.Context, eng PolicyEngine, server, tool string, args any, parsed Parsed, pctx map[string]any) (Decision, error) {
 	if parsed.Deny {
 		reasons := parsed.DenyReasons
 		if len(reasons) == 0 {

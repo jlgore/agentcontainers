@@ -1,4 +1,4 @@
-package mcpproxy
+package toolpolicy
 
 import (
 	"path/filepath"
@@ -21,6 +21,10 @@ var devPathTools = map[string]bool{
 // defaultOutputFlags classify which flag's value (or following positional)
 // is an output path. Matches the sift-mcp catalog security.yaml.
 var defaultOutputFlags = []string{"--csv", "--csvf", "-o", "--output", "--json", "--jsonl"}
+
+// DefaultOutputFlags is the exported view of defaultOutputFlags for callers
+// outside this package (e.g. the proxy runtime constructing a serverPolicy).
+var DefaultOutputFlags = defaultOutputFlags
 
 // Parsed is the decomposed view of one command, evaluated as
 // input.parsed by the Rego policies (SPEC §5).
@@ -244,7 +248,7 @@ func decomposeShellLineDepth(line string, outputFlags []string, depth int) []Par
 			}
 			// Normalize transparent wrappers / interpreter -c payloads, then
 			// attach this statement's redirect outputs to the leading segment.
-			ps := decomposeWrapped(tokens, outputFlags, line, depth)
+			ps := DecomposeWrapped(tokens, outputFlags, line, depth)
 			if len(ps) > 0 {
 				ps[0].OutputPaths = append(ps[0].OutputPaths, redirOutputs...)
 			}
@@ -295,7 +299,7 @@ func fallbackSplit(line string, outputFlags []string, depth int) []Parsed {
 		if len(tokens) == 0 {
 			continue
 		}
-		ps := decomposeWrapped(tokens, outputFlags, line, depth)
+		ps := DecomposeWrapped(tokens, outputFlags, line, depth)
 		for i := range ps {
 			ps[i].Via = "fallback"
 		}

@@ -1,4 +1,4 @@
-package mcpproxy
+package toolpolicy
 
 import (
 	"fmt"

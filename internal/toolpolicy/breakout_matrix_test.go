@@ -1,4 +1,4 @@
-package mcpproxy
+package toolpolicy
 
 import (
 	"os"
@@ -111,14 +111,14 @@ func (fx breakoutFixture) compile(t *testing.T) (*CompiledPolicy, []string) {
 
 // evalBreakout mirrors the guard's own evaluation (internal/guard/guard.go:207):
 // decompose the command into sub-commands and deny if ANY sub-command denies,
-// unioning the reasons. decomposeWrapped is the structured-command path
+// unioning the reasons. DecomposeWrapped is the structured-command path
 // (proxy.go:1155) that applies wrapper normalization and the structural eval-flag
 // deny (python -c / perl -e / xargs) — the mechanism test 5 turns on, which the
 // plain Evaluate(input) path cannot see (Parsed.Deny is json:"-").
 func evalBreakout(t *testing.T, eng PolicyEngine, cmd []string, outFlags []string) (bool, []string) {
 	t.Helper()
 	pctx := map[string]any{"case_dir": "", "cwd": "/cases/c"}
-	parsedList := decomposeWrapped(cmd, outFlags, strings.Join(cmd, " "), 0)
+	parsedList := DecomposeWrapped(cmd, outFlags, strings.Join(cmd, " "), 0)
 	if len(parsedList) == 0 {
 		parsedList = []Parsed{{}}
 	}

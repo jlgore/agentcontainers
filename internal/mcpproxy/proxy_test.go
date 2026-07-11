@@ -692,7 +692,7 @@ func TestProxyPolicyNonShellToolPasses(t *testing.T) {
 
 func TestDecomposeToolArgs(t *testing.T) {
 	sp := &serverPolicy{
-		outputFlags: defaultOutputFlags,
+		outputFlags: DefaultOutputFlags,
 		shellTools: map[string]config.ShellToolSpec{
 			"custom": {BinaryArg: "prog", ArgsArg: "argv"},
 			"shelly": {CommandArg: "line"},

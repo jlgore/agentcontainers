@@ -1,4 +1,4 @@
-package mcpproxy
+package toolpolicy
 
 import (
 	"os"
@@ -497,5 +497,44 @@ func TestEmptyParsedIsNoOp(t *testing.T) {
 	}
 	if !d.Allowed {
 		t.Errorf("empty parsed must allow, reasons: %v", d.Reasons)
+	}
+}
+
+// CompiledPolicy.Hash is deterministic for equal policies and changes when the
+// security policy changes.
+func TestCompiledPolicyHash(t *testing.T) {
+	base := &SecurityPolicy{DeniedBinaries: []string{"rm", "dd"}}
+	base.applyDefaults()
+	cp1, err := Compile(base, nil)
+	if err != nil {
+		t.Fatalf("Compile base: %v", err)
+	}
+
+	same := &SecurityPolicy{DeniedBinaries: []string{"rm", "dd"}}
+	same.applyDefaults()
+	cp2, err := Compile(same, nil)
+	if err != nil {
+		t.Fatalf("Compile same: %v", err)
+	}
+	if cp1.Hash() != cp2.Hash() {
+		t.Errorf("hash not deterministic: %q != %q", cp1.Hash(), cp2.Hash())
+	}
+	if !strings.HasPrefix(cp1.Hash(), "sha256:") {
+		t.Errorf("hash = %q, want sha256: prefix", cp1.Hash())
+	}
+
+	changed := &SecurityPolicy{DeniedBinaries: []string{"rm", "dd", "mkfs"}}
+	changed.applyDefaults()
+	cp3, err := Compile(changed, nil)
+	if err != nil {
+		t.Fatalf("Compile changed: %v", err)
+	}
+	if cp3.Hash() == cp1.Hash() {
+		t.Error("hash unchanged after adding a denied binary")
+	}
+
+	var nilCP *CompiledPolicy
+	if nilCP.Hash() != "" {
+		t.Errorf("nil CompiledPolicy hash = %q, want empty", nilCP.Hash())
 	}
 }

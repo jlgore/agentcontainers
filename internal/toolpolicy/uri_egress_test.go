@@ -1,4 +1,4 @@
-package mcpproxy
+package toolpolicy
 
 import (
 	"testing"
@@ -101,7 +101,7 @@ func TestExtractRequestedURIs(t *testing.T) {
 	}}
 	args := map[string]any{"url": "https://api.example.org:8443/v1"}
 
-	uris := extractRequestedURIs(parsed, args)
+	uris := ExtractRequestedURIs(parsed, args)
 
 	var gotHosts []string
 	for _, u := range uris {
@@ -190,7 +190,7 @@ func TestExtractMetaURIs(t *testing.T) {
 			map[string]any{"uri": "ftp://skip2.example"},
 		},
 	}
-	uris := extractMetaURIs(meta)
+	uris := ExtractMetaURIs(meta)
 	var hosts []string
 	for _, u := range uris {
 		hosts = append(hosts, u["host"].(string))
@@ -208,10 +208,10 @@ func TestExtractMetaURIs(t *testing.T) {
 
 // extractMetaURIs tolerates absent or malformed _meta.
 func TestExtractMetaURIsEmpty(t *testing.T) {
-	if got := extractMetaURIs(nil); got != nil {
+	if got := ExtractMetaURIs(nil); got != nil {
 		t.Errorf("nil meta = %+v, want nil", got)
 	}
-	if got := extractMetaURIs(map[string]any{"requested_uris": "not-a-list"}); got != nil {
+	if got := ExtractMetaURIs(map[string]any{"requested_uris": "not-a-list"}); got != nil {
 		t.Errorf("malformed = %+v, want nil", got)
 	}
 }

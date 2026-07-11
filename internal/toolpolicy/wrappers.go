@@ -1,4 +1,4 @@
-package mcpproxy
+package toolpolicy
 
 import "strings"
 
@@ -287,13 +287,13 @@ func denyParsed(binary, reason, rawLine string) Parsed {
 	}
 }
 
-// decomposeWrapped decomposes a tokenized command and normalizes transparent
+// DecomposeWrapped decomposes a tokenized command and normalizes transparent
 // wrappers and interpreters: it always evaluates the command as written, and
 // additionally evaluates the effective executable behind a wrapper, the shell
 // program behind an interpreter `-c`, blocked interpreter eval flags, and
 // unmodeled exec mechanisms. rawLine is carried in Args for the metacharacter
 // scan; depth bounds wrapper/interpreter recursion.
-func decomposeWrapped(command []string, outputFlags []string, rawLine string, depth int) []Parsed {
+func DecomposeWrapped(command []string, outputFlags []string, rawLine string, depth int) []Parsed {
 	if depth > maxWrapperDepth {
 		return []Parsed{denyParsed("", "wrapper/interpreter nesting exceeds limit", rawLine)}
 	}
@@ -330,7 +330,7 @@ func decomposeWrapped(command []string, outputFlags []string, rawLine string, de
 			return out
 		}
 		if len(effective) > 0 {
-			out = append(out, decomposeWrapped(effective, outputFlags, rawLine, depth+1)...)
+			out = append(out, DecomposeWrapped(effective, outputFlags, rawLine, depth+1)...)
 		}
 	case shellInterpreters[bin]:
 		if payload, ok := extractDashC(command[1:]); ok {

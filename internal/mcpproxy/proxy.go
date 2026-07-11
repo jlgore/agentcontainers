@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -850,8 +849,8 @@ func (p *Proxy) evaluatePolicy(ctx context.Context, sp *serverPolicy, server, to
 	// (source "user_message"). The Rego rule prefers user_message when present;
 	// the proxy only acts on the resulting egress_targets for an allowed call.
 	if sp.uriEgress {
-		uris := extractRequestedURIs(parsedList, argsVal)
-		uris = append(uris, extractMetaURIs(meta)...)
+		uris := ExtractRequestedURIs(parsedList, argsVal)
+		uris = append(uris, ExtractMetaURIs(meta)...)
 		if len(uris) > 0 {
 			pctx["requested_uris"] = uris
 		}
@@ -876,7 +875,7 @@ func (p *Proxy) evaluatePolicy(ctx context.Context, sp *serverPolicy, server, to
 	egressSeen := make(map[string]bool)
 
 	for _, parsed := range parsedList {
-		d, err := evaluateParsed(ctx, sp.eval, server, toolName, argsVal, parsed, pctx)
+		d, err := EvaluateParsed(ctx, sp.eval, server, toolName, argsVal, parsed, pctx)
 		if err != nil {
 			// Fail CLOSED: a broken policy engine never falls open.
 			p.deps.Logger.Error("policy evaluation failed",
@@ -923,108 +922,6 @@ func (p *Proxy) evaluatePolicy(ctx context.Context, sp *serverPolicy, server, to
 	}
 	agg.OverrideRejected = overrideRejected
 	return agg, parsedList
-}
-
-// extractRequestedURIs scans a tool call's decomposed arguments for https
-// URLs and returns them as policy input objects {uri, scheme, host, port,
-// source}. This is Phase A provenance: the URL is taken from the tool's own
-// arguments (the link the agent is about to fetch), tagged source
-// "tool_args". URL parsing is done here (Go net/url), not in Rego, so the
-// policy only applies allow-logic over already-parsed fields. Phase B
-// (harness-attested source "user_message" via request _meta) layers on top.
-func extractRequestedURIs(parsedList []Parsed, args any) []map[string]any {
-	seen := make(map[string]bool)
-	var out []map[string]any
-	consider := func(tok string) {
-		if seen[tok] {
-			return
-		}
-		u, ok := parseHTTPSURI(tok)
-		if !ok {
-			return
-		}
-		seen[tok] = true
-		u["source"] = "tool_args"
-		out = append(out, u)
-	}
-	for _, p := range parsedList {
-		for _, a := range p.Args {
-			consider(a)
-		}
-		for _, pth := range p.Paths {
-			consider(pth)
-		}
-	}
-	// Also scan raw string argument values (non-shell tools whose args carry
-	// a URL directly, e.g. {"url": "https://..."}).
-	scanArgStrings(args, consider)
-	return out
-}
-
-// parseHTTPSURI parses an https URL into the policy-input fields
-// {uri, scheme, host, port}, or reports false for anything that is not a
-// well-formed https URL. The caller adds the "source" provenance tag. https
-// only: http/file/ftp never qualify for transient egress.
-func parseHTTPSURI(tok string) (map[string]any, bool) {
-	if !strings.HasPrefix(tok, "https://") {
-		return nil, false
-	}
-	u, err := url.Parse(tok)
-	if err != nil || u.Host == "" {
-		return nil, false
-	}
-	portNum := 443
-	if p := u.Port(); p != "" {
-		if n, err := strconv.Atoi(p); err == nil {
-			portNum = n
-		}
-	}
-	return map[string]any{
-		"uri":    tok,
-		"scheme": u.Scheme,
-		"host":   u.Hostname(),
-		"port":   portNum,
-	}, true
-}
-
-// extractMetaURIs reads harness-attested URIs from a tool call's _meta field
-// (Phase B provenance, G4). The harness — the Claude Code PreToolUse guard or
-// the MCP client — attaches the URLs the *user* actually supplied under
-// _meta.requested_uris, so the policy can grant egress to a user-named host
-// without inferring intent from the tool's own arguments. Each entry may be a
-// bare string ("https://x") or an object carrying a "uri" field; both are
-// normalized and tagged source "user_message". This is the channel that
-// delivers the PRD's "no implicit grants from tool output" guarantee: a URL
-// the model merely echoed from prior output never arrives here.
-func extractMetaURIs(meta map[string]any) []map[string]any {
-	raw, ok := meta["requested_uris"]
-	if !ok {
-		return nil
-	}
-	list, ok := raw.([]any)
-	if !ok {
-		return nil
-	}
-	seen := make(map[string]bool)
-	var out []map[string]any
-	for _, item := range list {
-		var tok string
-		switch v := item.(type) {
-		case string:
-			tok = v
-		case map[string]any:
-			tok, _ = v["uri"].(string)
-		}
-		if seen[tok] {
-			continue
-		}
-		if u, ok := parseHTTPSURI(tok); ok {
-			seen[tok] = true
-			u["source"] = "user_message"
-			out = append(out, u)
-		}
-	}
-	return out
 }
 
 // verifyOverride validates an operator-override VC carried in a tool call's
@@ -1078,23 +975,6 @@ func stringsToAny(s []string) []any {
 	return out
 }
 
-// scanArgStrings walks a decoded JSON argument value, invoking fn on every
-// string it finds (recursing through objects and arrays).
-func scanArgStrings(v any, fn func(string)) {
-	switch t := v.(type) {
-	case string:
-		fn(t)
-	case []any:
-		for _, e := range t {
-			scanArgStrings(e, fn)
-		}
-	case map[string]any:
-		for _, e := range t {
-			scanArgStrings(e, fn)
-		}
-	}
-}
-
 // decomposeToolArgs maps an MCP tool's arguments onto shell commands for
 // policy decomposition: an explicit policy.shellTools declaration wins;
 // otherwise the default heuristic treats an argument object with a string
@@ -1145,7 +1025,7 @@ func decomposeStructuredArgs(argMap map[string]any, binaryArg, argsArg string, o
 	// Normalize transparent wrappers / interpreters so a structured
 	// run_command cannot launder a blocked effective executable behind e.g.
 	// `timeout python3 -c ...`, matching the shell-line path.
-	ps := decomposeWrapped(command, outputFlags, strings.Join(command, " "), 0)
+	ps := DecomposeWrapped(command, outputFlags, strings.Join(command, " "), 0)
 	for i := range ps {
 		ps[i].Via = "structured"
 	}
