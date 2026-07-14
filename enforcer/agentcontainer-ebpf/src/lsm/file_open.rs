@@ -23,8 +23,8 @@ use agentcontainer_common::events::{
     CRED_REASON_WRITE_DENIED, EVENT_CRED_OPEN,
 };
 use agentcontainer_common::maps::{
-    KernelOffsets, ScopedFsInodeKey, SecretAclKey, DENTRY_NAME_LEN, FS_PERM_WRITE, LSM_ALLOW,
-    LSM_DENY, PROC_SUPER_MAGIC,
+    KernelOffsets, ScopedFsInodeKey, SecretAclKey, CGROUP_FLAG_FS_ENFORCED, DENTRY_NAME_LEN,
+    FS_PERM_WRITE, LSM_ALLOW, LSM_DENY, PROC_SUPER_MAGIC,
 };
 
 use crate::maps::{
@@ -240,8 +240,8 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
     // 0. Cgroup / process-tree scoping: only enforce for agent-container subjects.
     //    LSM hooks are system-wide; skip all non-container processes.
     //    `cgid` is the governing enforced cgroup (ancestor or sticky).
-    let cgid = match crate::maps::enforced_cgroup_for_current() {
-        Some(id) => id,
+    let (cgid, cg_flags) = match crate::maps::enforced_cgroup_flags_for_current() {
+        Some(x) => x,
         None => return Ok(LSM_ALLOW),
     };
 
@@ -353,6 +353,17 @@ fn try_file_open(ctx: &LsmContext) -> Result<i32, i64> {
         bump_cgroup_stat(cgid, CGROUP_STAT_FS_BLOCKED);
         emit_fs_block_event(ino, flags);
         return Ok(LSM_DENY);
+    }
+
+    // Filesystem lockdown (positive allow-list + default-deny below) is OPT-IN:
+    // only cgroups that had a non-empty filesystem allowlist applied (the
+    // FS_ENFORCED flag) reach it. The always-on protections above — procfs-environ,
+    // secret ACLs, and the deny-list — have already run for every enforced cgroup.
+    // Without the flag we allow here rather than default-deny, so a container that
+    // did not request FS lockdown can still open the runtime-created files (new
+    // inodes never present in ALLOWED_INODES) it needs.
+    if cg_flags & CGROUP_FLAG_FS_ENFORCED == 0 {
+        return Ok(LSM_ALLOW);
     }
 
     // 3. Check allowed inodes.

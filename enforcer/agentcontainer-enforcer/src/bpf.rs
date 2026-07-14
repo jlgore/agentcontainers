@@ -109,7 +109,7 @@ mod linux {
     use agentcontainer_common::maps::{
         CgroupStats, DenySetKey, KernelOffsets, ScopedBindKey, ScopedFsInodeKey, ScopedLpmKeyV4,
         ScopedPortKeyV4, SecretAclKey, SecretAclValue, CGROUP_FLAG_ENFORCED,
-        CGROUP_FLAG_EXEC_ENFORCED, FS_PERM_READ, FS_PERM_WRITE,
+        CGROUP_FLAG_EXEC_ENFORCED, CGROUP_FLAG_FS_ENFORCED, FS_PERM_READ, FS_PERM_WRITE,
     };
     use aya::maps::lpm_trie::Key as LpmKey;
     use aya::maps::{HashMap as AyaHashMap, LpmTrie, PerCpuHashMap, RingBuf};
@@ -963,6 +963,30 @@ mod linux {
                         warn!(path, error = %e, "failed to resolve deny path inode, skipping");
                     }
                 }
+            }
+
+            // Opt-in FS enforcement: set FS_ENFORCED only when a non-empty
+            // filesystem allowlist (read/write paths) is applied. Without it,
+            // file_open keeps the always-on protections (procfs-environ, secret
+            // ACLs, deny-list) but does not impose positive-allow + default-deny,
+            // so a container that declares no FS allowlist is not broken by
+            // per-inode denial of the runtime files it creates. `deny_paths`
+            // alone populate DENIED_INODES (always enforced) and do not enable
+            // the lockdown. Mirrors the exec-allowlist opt-in in apply_process.
+            {
+                let map_data = bpf
+                    .map_mut("ENFORCED_CGROUPS")
+                    .ok_or_else(|| anyhow::anyhow!("BPF map ENFORCED_CGROUPS not found"))?;
+                let mut emap: AyaHashMap<_, u64, u8> = AyaHashMap::try_from(map_data)?;
+                let cur = emap.get(&cgroup_id, 0).unwrap_or(CGROUP_FLAG_ENFORCED);
+                let has_allowlist =
+                    !policy.read_paths.is_empty() || !policy.write_paths.is_empty();
+                let new = if has_allowlist {
+                    cur | CGROUP_FLAG_FS_ENFORCED
+                } else {
+                    cur & !CGROUP_FLAG_FS_ENFORCED
+                };
+                emap.insert(cgroup_id, new, 0)?;
             }
 
             Ok(())

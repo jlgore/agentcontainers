@@ -171,14 +171,22 @@ pub struct CgroupStats {
 
 // --- Cgroup enforcement flags (values stored in ENFORCED_CGROUPS) ---
 
-/// The cgroup is enforced (registered) — network + filesystem hooks apply.
-/// Every registered cgroup carries this bit; the other hooks read the map via
+/// The cgroup is enforced (registered) — network hooks + always-on file
+/// protections (procfs-environ, secret ACLs, deny-lists) apply. Every registered
+/// cgroup carries this bit; hooks that only test membership read the map via
 /// `.is_some()` and ignore the value, so a nonzero flag byte is compatible.
 pub const CGROUP_FLAG_ENFORCED: u8 = 0x01;
 /// The cgroup has a non-empty exec allowlist; bprm_check authorizes its execs.
 /// Exec enforcement is opt-in: without this bit, execs run freely (a cgroup
 /// with no declared binaries — e.g. a tool-runner backend — is not exec-gated).
 pub const CGROUP_FLAG_EXEC_ENFORCED: u8 = 0x02;
+/// The cgroup has a non-empty filesystem allowlist (read/write paths); file_open
+/// applies positive-allow + default-deny. Filesystem lockdown is opt-in: without
+/// this bit, general file opens are allowed (only the always-on protections —
+/// procfs-environ, secret ACLs, deny-lists — apply), so a container that did not
+/// request FS lockdown is not broken by per-inode default-deny of the
+/// runtime-created files (new inodes) it opens.
+pub const CGROUP_FLAG_FS_ENFORCED: u8 = 0x04;
 
 // --- Kernel struct field offsets (CO-RE substitute) ---
 
