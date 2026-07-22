@@ -1878,99 +1878,172 @@ mod linux {
                 "applying credential policy to BPF maps"
             );
 
-            let mut bpf = self.programs.lock().unwrap();
+            // Phase 1: resolve every ACL into concrete map entries BEFORE any
+            // map mutation. Mirrors apply_process, which resolves all inodes up
+            // front so a resolution failure aborts with zero mutations. This
+            // matters here because Phase 2 CLEARS the cgroup's existing entries:
+            // resolving inside the insert loop would let a mid-list resolve
+            // failure leave earlier secrets cleared-but-not-reinserted, turning
+            // them into SECRET_ACLS misses (file_open default-allow) — a new
+            // fail-open on the error path.
+            struct ResolvedAcl {
+                key: SecretAclKey,
+                value: SecretAclValue,
+                tool_keys: Vec<SecretToolKey>,
+                restricted: bool,
+                path: String,
+                inode: u64,
+                ttl_seconds: u64,
+                allowed_tools: usize,
+            }
 
+            let mut resolved: Vec<ResolvedAcl> = Vec::with_capacity(policy.secret_acls.len());
+            let mut any_restricted = false;
             for acl in &policy.secret_acls {
-                match self.resolve_container_inode(container_id, &acl.path) {
-                    Ok((inode, dev_major, dev_minor)) => {
-                        let key = SecretAclKey {
-                            inode,
-                            dev_major,
-                            dev_minor,
-                            cgroup_id,
-                        };
-
-                        let expires_at_ns = if acl.ttl_seconds > 0 {
-                            // Use CLOCK_MONOTONIC to match BPF ktime_get_ns().
-                            let mut ts = libc::timespec {
-                                tv_sec: 0,
-                                tv_nsec: 0,
-                            };
-                            unsafe {
-                                libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
-                            }
-                            let now_ns = ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64;
-                            now_ns + acl.ttl_seconds * 1_000_000_000
-                        } else {
-                            0 // No expiry.
-                        };
-
-                        // A non-empty allowed-tools list makes the secret
-                        // restricted: readable only during an allowed tool's
-                        // active call window (enforced in file_open via
-                        // ACTIVE_TOOL + SECRET_TOOL_ACLS). An empty list keeps
-                        // container-wide access.
-                        let restricted = !acl.allowed_tools.is_empty();
-
-                        let value = SecretAclValue {
-                            expires_at_ns,
-                            allowed_ops: FS_PERM_READ,
-                            restricted: u8::from(restricted),
-                            _pad: [0; 6],
-                        };
-
-                        let map_data = bpf
-                            .map_mut("SECRET_ACLS")
-                            .ok_or_else(|| anyhow::anyhow!("BPF map SECRET_ACLS not found"))?;
-                        let mut map: AyaHashMap<_, SecretAclKey, SecretAclValue> =
-                            AyaHashMap::try_from(map_data)?;
-                        map.insert(key, value, 0)?;
-
-                        // Populate the per-tool allow-set for restricted secrets.
-                        if restricted {
-                            let tool_map_data =
-                                bpf.map_mut("SECRET_TOOL_ACLS").ok_or_else(|| {
-                                    anyhow::anyhow!("BPF map SECRET_TOOL_ACLS not found")
-                                })?;
-                            let mut tool_map: AyaHashMap<_, SecretToolKey, u8> =
-                                AyaHashMap::try_from(tool_map_data)?;
-                            for tool in &acl.allowed_tools {
-                                let tool_key = SecretToolKey {
-                                    inode,
-                                    dev_major,
-                                    dev_minor,
-                                    cgroup_id,
-                                    tool_id: tool_identity(tool),
-                                };
-                                tool_map.insert(tool_key, 1u8, 0)?;
-                            }
-                            self.restricted_cgroups
-                                .write()
-                                .unwrap()
-                                .insert(cgroup_id, ());
-                        }
-
-                        info!(
-                            path = %acl.path,
-                            inode,
-                            ttl = acl.ttl_seconds,
-                            restricted,
-                            allowed_tools = acl.allowed_tools.len(),
-                            "added secret ACL to SECRET_ACLS"
-                        );
-                    }
-                    Err(e) => {
+                let (inode, dev_major, dev_minor) = self
+                    .resolve_container_inode(container_id, &acl.path)
+                    .map_err(|e| {
                         // Fail closed: a secret whose inode cannot be resolved
                         // would be left ungated (file_open default-allow). The
                         // caller injects secrets before installing ACLs, so the
                         // file must exist by now; an unresolvable path is a real
                         // error and must abort the bootstrap, never be skipped.
-                        return Err(e.context(format!(
+                        e.context(format!(
                             "resolve secret path inode for ACL {} (container {})",
                             acl.path, container_id
-                        )));
+                        ))
+                    })?;
+
+                let key = SecretAclKey {
+                    inode,
+                    dev_major,
+                    dev_minor,
+                    cgroup_id,
+                };
+
+                let expires_at_ns = if acl.ttl_seconds > 0 {
+                    // Use CLOCK_MONOTONIC to match BPF ktime_get_ns().
+                    let mut ts = libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    };
+                    unsafe {
+                        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+                    }
+                    let now_ns = ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64;
+                    now_ns + acl.ttl_seconds * 1_000_000_000
+                } else {
+                    0 // No expiry.
+                };
+
+                // A non-empty allowed-tools list makes the secret
+                // restricted: readable only during an allowed tool's
+                // active call window (enforced in file_open via
+                // ACTIVE_TOOL + SECRET_TOOL_ACLS). An empty list keeps
+                // container-wide access.
+                let restricted = !acl.allowed_tools.is_empty();
+                any_restricted |= restricted;
+
+                let value = SecretAclValue {
+                    expires_at_ns,
+                    allowed_ops: FS_PERM_READ,
+                    restricted: u8::from(restricted),
+                    _pad: [0; 6],
+                };
+
+                let tool_keys = if restricted {
+                    acl.allowed_tools
+                        .iter()
+                        .map(|tool| SecretToolKey {
+                            inode,
+                            dev_major,
+                            dev_minor,
+                            cgroup_id,
+                            tool_id: tool_identity(tool),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                resolved.push(ResolvedAcl {
+                    key,
+                    value,
+                    tool_keys,
+                    restricted,
+                    path: acl.path.clone(),
+                    inode,
+                    ttl_seconds: acl.ttl_seconds,
+                    allowed_tools: acl.allowed_tools.len(),
+                });
+            }
+
+            let mut bpf = self.programs.lock().unwrap();
+
+            // Phase 2: clear this cgroup's existing SECRET_ACLS / SECRET_TOOL_ACLS
+            // entries before re-inserting, so a narrowed re-apply (e.g. a policy
+            // Update that shrinks a restricted secret's allowed_tools from
+            // [A, B] to [A]) actually revokes the removed tool rather than
+            // leaving its stale SECRET_TOOL_ACLS grant behind. Without this the
+            // map only ever grew: apply_credential was purely additive, and the
+            // grpc.rs Update path re-invokes it on already-configured cgroups.
+            // Mirrors apply_process's revoke-on-update clear of ALLOWED_EXECS.
+            // Any secret still present in the new policy is re-inserted below in
+            // the same locked section, so the clear is safe.
+            Self::cleanup_hash_entries::<SecretAclKey, SecretAclValue>(
+                &mut bpf,
+                "SECRET_ACLS",
+                cgroup_id,
+                |k| k.cgroup_id,
+            );
+            Self::cleanup_hash_entries::<SecretToolKey, u8>(
+                &mut bpf,
+                "SECRET_TOOL_ACLS",
+                cgroup_id,
+                |k| k.cgroup_id,
+            );
+
+            // Phase 3: (re-)insert the current grant set.
+            for r in &resolved {
+                let map_data = bpf
+                    .map_mut("SECRET_ACLS")
+                    .ok_or_else(|| anyhow::anyhow!("BPF map SECRET_ACLS not found"))?;
+                let mut map: AyaHashMap<_, SecretAclKey, SecretAclValue> =
+                    AyaHashMap::try_from(map_data)?;
+                map.insert(r.key, r.value, 0)?;
+
+                // Populate the per-tool allow-set for restricted secrets.
+                if r.restricted {
+                    let tool_map_data = bpf
+                        .map_mut("SECRET_TOOL_ACLS")
+                        .ok_or_else(|| anyhow::anyhow!("BPF map SECRET_TOOL_ACLS not found"))?;
+                    let mut tool_map: AyaHashMap<_, SecretToolKey, u8> =
+                        AyaHashMap::try_from(tool_map_data)?;
+                    for tool_key in &r.tool_keys {
+                        tool_map.insert(tool_key, 1u8, 0)?;
                     }
                 }
+
+                info!(
+                    path = %r.path,
+                    inode = r.inode,
+                    ttl = r.ttl_seconds,
+                    restricted = r.restricted,
+                    allowed_tools = r.allowed_tools,
+                    "added secret ACL to SECRET_ACLS"
+                );
+            }
+
+            // Track cgroups that own any restricted secret so the tool-window
+            // machinery only runs where needed. This set is insert-only by
+            // design: it is fail-closed (an extra entry just keeps tool-gating
+            // active) and is cleared wholesale on unregister, so a re-apply that
+            // drops restriction leaves at worst a harmless stale flag.
+            if any_restricted {
+                self.restricted_cgroups
+                    .write()
+                    .unwrap()
+                    .insert(cgroup_id, ());
             }
 
             Ok(())
