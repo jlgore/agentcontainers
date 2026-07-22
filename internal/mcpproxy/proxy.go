@@ -863,7 +863,7 @@ func (p *Proxy) evaluatePolicy(ctx context.Context, sp *serverPolicy, server, to
 	// within the operator's allowlist. A present-but-rejected override (bad
 	// signature, expired, untrusted issuer) is dropped — the call proceeds
 	// under static policy — and the reason is carried out for the audit trail.
-	overrideClaims, overrideRejected := verifyOverride(meta, sp.operatorDIDs)
+	overrideClaims, overrideRejected := verifyOverride(meta, sp.operatorDIDs, toolName, args)
 	if overrideClaims != nil {
 		pctx["operator_override"] = map[string]any{
 			"iss":          overrideClaims.Iss,
@@ -1035,12 +1035,23 @@ func extractMetaURIs(meta map[string]any) []map[string]any {
 //
 //  1. the override must be a string JWT,
 //  2. its EdDSA signature and (if set) expiry must check out (VerifyVC),
-//  3. its issuer DID must be in this server's trusted operator set.
+//  3. it must carry an explicit expiry (exp) — VerifyVC only rejects a *set*
+//     exp once past, so a no-expiry override would otherwise be valid forever;
+//     operator overrides are meant to be short-lived (see IssueVC's doc),
+//  4. its `bind` claim must match this exact (tool, args) invocation, so a
+//     captured override cannot be replayed against a different tool call,
+//  5. its issuer DID must be in this server's trusted operator set.
 //
 // did:key verification is self-certifying, so step 2 only proves the token is
-// internally consistent; step 3 is the actual authorization gate. With an
+// internally consistent; steps 3–5 are the actual authorization gates. With an
 // empty trusted set, every override is rejected.
-func verifyOverride(meta map[string]any, trusted []string) (*identity.VCClaims, string) {
+//
+// Note the residual: steps 3–4 block replay against a *different* call and bound
+// the credential's lifetime, but a captured override replayed against the exact
+// same (tool, args) within its expiry window is still honored. Eliminating that
+// entirely would need used-jti persistence, which this deployment has no store
+// for; the mandatory short expiry bounds the exposure instead.
+func verifyOverride(meta map[string]any, trusted []string, toolName string, args json.RawMessage) (*identity.VCClaims, string) {
 	raw, ok := meta["operator_override"]
 	if !ok {
 		return nil, ""
@@ -1052,6 +1063,15 @@ func verifyOverride(meta map[string]any, trusted []string) (*identity.VCClaims, 
 	claims, err := identity.VerifyVC(token, identity.DIDKeyResolver{})
 	if err != nil {
 		return nil, "operator override rejected: " + err.Error()
+	}
+	if claims.Exp == 0 {
+		return nil, "operator override has no expiry (exp required)"
+	}
+	if claims.Bind == "" {
+		return nil, "operator override has no invocation binding (bind required)"
+	}
+	if want := identity.OverrideBinding(toolName, args); claims.Bind != want {
+		return nil, "operator override not bound to this invocation"
 	}
 	if !containsString(trusted, claims.Iss) {
 		return nil, "operator override issuer not trusted: " + claims.Iss

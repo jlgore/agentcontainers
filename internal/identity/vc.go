@@ -1,8 +1,11 @@
 package identity
 
 import (
+	"bytes"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -34,6 +37,54 @@ type VCClaims struct {
 	// Capabilities optionally names what an operator-override VC widens (G3).
 	// The override ceiling in Rego decides which of these are honored.
 	Capabilities []string `json:"capabilities,omitempty"`
+
+	// Bind pins an operator-override VC to a single tool invocation. It is the
+	// OverrideBinding hash of the exact (tool name, arguments) the operator
+	// authorized. The proxy recomputes it for the live call and refuses the
+	// override unless it matches, so a captured override cannot be replayed
+	// against a *different* tool call. Empty on non-override credentials
+	// (e.g. the long-lived publisher VC), which are never accepted as overrides.
+	Bind string `json:"bind,omitempty"`
+}
+
+// OverrideBinding is the canonical single-invocation binding for an operator
+// override: a SHA-256 over the tool name and its arguments. Both the issuer
+// (when minting the VC's Bind claim) and the proxy (when verifying) call this
+// exact function so their hashes agree.
+//
+// Determinism matters — a mismatch rejects a legitimate override. Arguments are
+// re-encoded from a json.Number-preserving decode so object key order and
+// insignificant whitespace do not affect the result, and large integers keep
+// their exact literal form rather than being rounded through float64. Arguments
+// that are absent or not valid JSON are folded to a single canonical empty form.
+func OverrideBinding(toolName string, argsJSON []byte) string {
+	h := sha256.New()
+	h.Write([]byte(toolName))
+	h.Write([]byte{0})
+	h.Write(canonicalArgs(argsJSON))
+	return "sha256:" + hex.EncodeToString(h.Sum(nil))
+}
+
+// canonicalArgs returns a stable byte representation of a JSON arguments blob:
+// decoded with UseNumber (so numeric literals are preserved exactly) and
+// re-marshaled (so Go sorts object keys and drops whitespace). Empty or
+// unparseable input canonicalizes to "null".
+func canonicalArgs(argsJSON []byte) []byte {
+	trimmed := bytes.TrimSpace(argsJSON)
+	if len(trimmed) == 0 {
+		return []byte("null")
+	}
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return []byte("null")
+	}
+	canon, err := json.Marshal(v)
+	if err != nil {
+		return []byte("null")
+	}
+	return canon
 }
 
 type vcHeader struct {
