@@ -79,7 +79,7 @@ func resolveFilesystem(p *ContainerPolicy, fs *config.FilesystemCaps) {
 			continue
 		}
 		p.AllowedMounts = append(p.AllowedMounts, MountPolicy{
-			Source:   pattern,
+			Source:   filepath.Clean(pattern),
 			Target:   mountTarget(pattern),
 			ReadOnly: true,
 		})
@@ -90,7 +90,7 @@ func resolveFilesystem(p *ContainerPolicy, fs *config.FilesystemCaps) {
 			continue
 		}
 		p.AllowedMounts = append(p.AllowedMounts, MountPolicy{
-			Source:   pattern,
+			Source:   filepath.Clean(pattern),
 			Target:   mountTarget(pattern),
 			ReadOnly: false,
 		})
