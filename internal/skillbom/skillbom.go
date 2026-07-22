@@ -32,6 +32,18 @@ type SkillBOM struct {
 	// (normalized name + description + sorted capabilities). Format: "sha256:<hex>".
 	ContentHash string `json:"contentHash"`
 
+	// FilesHash is a deterministic SHA-256 over the sorted per-file
+	// (relative path, content digest, executable bit) inventory of the
+	// bundled skill files. Unlike ContentHash -- which covers only
+	// name/description/capabilities and therefore does not change when a
+	// bundled file's bytes are swapped in place -- and unlike Digest --
+	// which embeds a per-generation timestamp and random serial number and
+	// so is not stable across regenerations of identical content --
+	// FilesHash is a stable fingerprint of the actual file bytes. Drift
+	// detection compares it to catch in-place file-content swaps (rug pulls)
+	// that leave metadata and component count unchanged. Format: "sha256:<hex>".
+	FilesHash string `json:"filesHash,omitempty"`
+
 	// EmbeddingVector is the semantic embedding of the skill's content,
 	// produced by the model named in EmbeddingModel. When present, drift
 	// detection uses cosine distance on this vector instead of binary
