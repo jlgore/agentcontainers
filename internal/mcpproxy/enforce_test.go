@@ -130,6 +130,10 @@ type recordingEnforcer struct {
 	// success carrying an application-level failure (success:false) — the
 	// enforcer accepted the RPC but could not install the policy.
 	fsPolicyUnsuccessful bool
+	// netPolicyUnsuccessful makes ApplyNetworkPolicy return a transport
+	// success carrying an application-level failure (success:false) — the
+	// enforcer accepted the RPC but could not install the network maps.
+	netPolicyUnsuccessful bool
 	// unresolvedHosts is returned on ApplyNetworkPolicy responses to
 	// simulate a partial application (DNS-skipped policy hosts).
 	unresolvedHosts []string
@@ -151,6 +155,9 @@ func (f *recordingEnforcer) UnregisterContainer(ctx context.Context, req *enforc
 func (f *recordingEnforcer) ApplyNetworkPolicy(ctx context.Context, req *enforcerapi.NetworkPolicyRequest, opts ...grpc.CallOption) (*enforcerapi.PolicyResponse, error) {
 	if f.netPolicyErr != nil {
 		return nil, f.netPolicyErr
+	}
+	if f.netPolicyUnsuccessful {
+		return &enforcerapi.PolicyResponse{Success: false, Error: "bpf map full"}, nil
 	}
 	return &enforcerapi.PolicyResponse{Success: true, UnresolvedHosts: f.unresolvedHosts}, nil
 }
@@ -236,6 +243,27 @@ func TestApplyBackendEnforcementFailsClosedOnUnsuccessfulFilesystemPolicy(t *tes
 	unregister, err := applyBackendEnforcement(context.Background(), ec, zaptest.NewLogger(t), b, enforcementTestTool(), "/sys/fs/cgroup/test", 123)
 	if err == nil {
 		t.Fatal("expected error when enforcer reports filesystem policy failure (success:false)")
+	}
+	if unregister != nil {
+		t.Error("expected nil cleanup on failure so the caller does not resume the container")
+	}
+	if len(ec.unregistered) != 1 || ec.unregistered[0] != "ctr-1" {
+		t.Errorf("unregistered = %v, want rollback of ctr-1", ec.unregistered)
+	}
+}
+
+// A success:false response from ApplyNetworkPolicy with a nil transport error
+// is a real enforcement failure (e.g. the enforcer could not write its network
+// maps): it must fail closed, roll the registration back, and NOT leave the
+// container resumable. Without the GetSuccess() check the proxy would unpause a
+// container that believes it is default-deny confined while egress is open.
+func TestApplyBackendEnforcementFailsClosedOnUnsuccessfulNetworkPolicy(t *testing.T) {
+	ec := &recordingEnforcer{netPolicyUnsuccessful: true}
+	b := &Backend{Name: "sift", ContainerID: "ctr-1"}
+
+	unregister, err := applyBackendEnforcement(context.Background(), ec, zaptest.NewLogger(t), b, enforcementTestTool(), "/sys/fs/cgroup/test", 123)
+	if err == nil {
+		t.Fatal("expected error when enforcer reports network policy failure (success:false)")
 	}
 	if unregister != nil {
 		t.Error("expected nil cleanup on failure so the caller does not resume the container")

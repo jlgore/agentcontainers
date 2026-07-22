@@ -103,6 +103,17 @@ func applyBackendEnforcement(ctx context.Context, ec enforcerapi.EnforcerClient,
 	if err != nil {
 		return fail(fmt.Errorf("mcpproxy: backend %s: applying network policy: %w", b.Name, err))
 	}
+	// A nil transport error does NOT mean the policy was installed: the
+	// enforcer returns success:false (e.g. a BPF map-capacity error) when it
+	// fails to write the network allow/deny maps. Treat that as a hard failure
+	// and roll back — resuming here would unpause a container that believes it
+	// is default-deny confined while egress is wide open. Mirrors the
+	// filesystem-policy check below and the one in internal/enforcement/grpc.go.
+	if !netResp.GetSuccess() {
+		return fail(fmt.Errorf("mcpproxy: backend %s: enforcer rejected network policy: %s", b.Name, netResp.GetError()))
+	}
+	// Distinct from success:false — a successful apply can still skip
+	// individual policy hosts whose DNS failed; surface that partial coverage.
 	warnUnresolvedHosts(log, b.Name, "registration", netResp)
 
 	// Filesystem policy: deny_paths are kernel-enforced (DENIED_INODES);
