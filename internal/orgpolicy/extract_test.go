@@ -2,9 +2,12 @@ package orgpolicy
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -222,6 +225,55 @@ func TestExtractPolicy_MultiplePolicyLayers(t *testing.T) {
 	}
 	if p.MinSLSALevel != 2 {
 		t.Errorf("MinSLSALevel = %d, want 2 (base/org policy should win, F-3)", p.MinSLSALevel)
+	}
+}
+
+// TestExtractPolicy_TrustedKeysRejectUnsignedLayer proves the F-6 wiring: when
+// trusted org keys are configured (as the real run path now does from the
+// persisted trust store) and the manifest's policy layer carries no valid
+// signature, strict-mode extraction fails closed rather than accepting the
+// unsigned, attacker-controlled layer. This is the exact scenario the finding
+// describes — an adversary supplying an unsigned policy layer — and it must be
+// rejected once trust keys are in play.
+func TestExtractPolicy_TrustedKeysRejectUnsignedLayer(t *testing.T) {
+	// newExtractPolicyServer serves a policy layer with no org-signer annotation.
+	srv := newExtractPolicyServer(t, `{"requireSignatures": true, "minSLSALevel": 2}`)
+	defer srv.Close()
+
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+	trusted := map[string]ed25519.PublicKey{oci.OrgKeyID(pub): pub}
+
+	ref := srv.Listener.Addr().String() + "/myorg/agent-base:latest"
+	_, err = ExtractPolicy(context.Background(), ref,
+		oci.WithHTTPClient(srv.Client()),
+		oci.WithOrgTrustedKeys(trusted),
+		oci.WithOrgStrictMode(true),
+	)
+	if err == nil {
+		t.Fatal("ExtractPolicy() error = nil; want rejection of unsigned policy layer when trusted keys are configured (F-6)")
+	}
+	if !errors.Is(err, oci.ErrNoOrgSignedPolicy) {
+		t.Errorf("error = %v, want it to wrap ErrNoOrgSignedPolicy", err)
+	}
+}
+
+// TestExtractPolicy_NoTrustedKeysAcceptsLayer is the control: with no trusted
+// keys configured (empty trust store, the common case), extraction keeps the
+// prior first-wins-without-signature behavior and accepts the layer.
+func TestExtractPolicy_NoTrustedKeysAcceptsLayer(t *testing.T) {
+	srv := newExtractPolicyServer(t, `{"requireSignatures": true, "minSLSALevel": 2}`)
+	defer srv.Close()
+
+	ref := srv.Listener.Addr().String() + "/myorg/agent-base:latest"
+	p, err := ExtractPolicy(context.Background(), ref, oci.WithHTTPClient(srv.Client()))
+	if err != nil {
+		t.Fatalf("ExtractPolicy() error = %v, want nil (no trusted keys → first-wins)", err)
+	}
+	if !p.RequireSignatures {
+		t.Error("RequireSignatures = false, want true")
 	}
 }
 

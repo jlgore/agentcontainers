@@ -25,6 +25,7 @@ import (
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/config"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/container"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/enforcement"
+	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/oci"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/oidc"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/orgpolicy"
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/policy"
@@ -129,6 +130,50 @@ func policyImageRef(imageTag, cfgPath string) string {
 	return ref + "@" + lf.Resolved.Image.Digest
 }
 
+// orgResolverOptions loads the persisted org policy trust store (the same one
+// `agentcontainer policy trust add/list/remove` manages) and, when it holds
+// trusted keys, returns oci.ResolverOptions that make org policy extraction
+// verify the Ed25519 signature on the policy layer before applying it.
+//
+// Without this wiring the resolver is always constructed with zero options, so
+// oci.findPolicyLayer always takes the no-trusted-keys branch and accepts the
+// first policy-media-type layer with no signature check — the F-6 fail-open. An
+// adversary with image push rights could then inject an unsigned, attacker-
+// chosen policy layer and have it applied unverified.
+//
+// When the trust store holds one or more keys the resolver is additionally put
+// in strict mode: a policy layer must carry a valid signature from a trusted
+// key or the run fails closed (oci.ErrNoOrgSignedPolicy). Non-strict alone does
+// not close the finding — with keys present but the attacker's layer unsigned,
+// findPolicyLayer's non-strict path falls back to first-wins and still accepts
+// the unsigned layer. Strict is what stops injection of an unsigned policy,
+// which is precisely the documented purpose of the trust store ("a developer
+// with registry write access cannot inject a permissive policy layer that
+// bypasses enforcement"). Populating the store is opt-in, so this stricter
+// behavior only applies to operators who have explicitly declared which keys
+// may sign org policy; environments with no trust store keep the prior
+// first-wins-without-signature behavior.
+//
+// A corrupt or unparseable trust store is a hard error (fail closed) rather
+// than a silent downgrade to no verification.
+func orgResolverOptions() ([]oci.ResolverOption, error) {
+	ts, err := oci.LoadTrustStoreDefault()
+	if err != nil {
+		return nil, fmt.Errorf("loading org policy trust store: %w", err)
+	}
+	if len(ts.Keys) == 0 {
+		return nil, nil
+	}
+	keys, err := ts.TrustedKeys()
+	if err != nil {
+		return nil, fmt.Errorf("parsing org policy trust store: %w", err)
+	}
+	return []oci.ResolverOption{
+		oci.WithOrgTrustedKeys(keys),
+		oci.WithOrgStrictMode(true),
+	}, nil
+}
+
 func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath string, runtimeFlag string, insecureSkipVerify bool) error {
 	// 0. Resolve "auto" to a concrete runtime type so all downstream checks
 	// (e.g. sandbox sidecar skip) work regardless of the original flag value.
@@ -165,7 +210,17 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 	// regardless of tag mutation.
 	policyRef := policyImageRef(cfg.Image, cfgPath)
 
-	orgPolicy, err := orgpolicy.ExtractPolicy(cmd.Context(), policyRef)
+	// Load the persisted org policy trust store (managed by
+	// `agentcontainer policy trust add/list/remove`). When it holds trusted
+	// keys, these options make policy extraction verify the Ed25519 signature
+	// on the policy layer instead of blindly taking the first policy-media-type
+	// layer — the wiring that makes the org-signing feature actually enforce.
+	resolverOpts, err := orgResolverOptions()
+	if err != nil {
+		return fmt.Errorf("run: %w", err)
+	}
+
+	orgPolicy, err := orgpolicy.ExtractPolicy(cmd.Context(), policyRef, resolverOpts...)
 	if err != nil {
 		return fmt.Errorf("run: extracting org policy from image: %w", err)
 	}
@@ -178,7 +233,7 @@ func runRun(cmd *cobra.Command, detach bool, timeout time.Duration, configPath s
 	// strictly additive (deny always wins), so merging it on top of the
 	// image-layer policy can only tighten the effective configuration.
 	if cfg.Agent != nil && cfg.Agent.OrgPolicy != "" {
-		refPolicy, err := orgpolicy.ExtractPolicy(cmd.Context(), cfg.Agent.OrgPolicy)
+		refPolicy, err := orgpolicy.ExtractPolicy(cmd.Context(), cfg.Agent.OrgPolicy, resolverOpts...)
 		if err != nil {
 			return fmt.Errorf("run: extracting org policy from %s: %w", cfg.Agent.OrgPolicy, err)
 		}
