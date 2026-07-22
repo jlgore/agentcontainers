@@ -3,6 +3,7 @@ package orgpolicy
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/Kubedoll-Heavy-Industries/agentcontainers/internal/config"
@@ -147,13 +148,30 @@ func checkFilesystemPaths(org *OrgPolicy, ws *config.AgentContainer) []error {
 
 // pathPermittedByAllowlist returns true if p is equal to or a sub-path of
 // at least one entry in the allowlist.
+//
+// Both the declared path and each allowlist entry are lexically cleaned
+// (filepath.Clean) before comparison, and containment is checked with
+// filepath.Rel rather than a raw string prefix. This prevents a declared
+// path containing ".." (e.g. "/workspace/../../etc") from bypassing an
+// allowlist of "/workspace": cleaning resolves it to "/etc", which Rel
+// reports as escaping the allowed root. Note this is purely lexical and
+// does not resolve symlinks.
 func pathPermittedByAllowlist(p string, allowlist []string) bool {
+	cleaned := filepath.Clean(p)
 	for _, allowed := range allowlist {
-		if p == allowed {
+		allowedClean := filepath.Clean(allowed)
+		if cleaned == allowedClean {
 			return true
 		}
-		// Sub-path check: p must start with allowed + "/"
-		if strings.HasPrefix(p, strings.TrimSuffix(allowed, "/")+"/") {
+		rel, err := filepath.Rel(allowedClean, cleaned)
+		if err != nil {
+			// Mismatched absolute/relative forms cannot be compared; treat
+			// as not permitted (consistent with the previous prefix check).
+			continue
+		}
+		// rel must stay within allowedClean: it may not be ".." or start
+		// with a "../" segment, which would indicate escaping the root.
+		if rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			return true
 		}
 	}

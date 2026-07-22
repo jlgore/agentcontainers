@@ -481,16 +481,19 @@ func (s *GRPCStrategy) Update(ctx context.Context, containerID string, p *policy
 
 // Remove unregisters the container from the enforcer sidecar.
 func (s *GRPCStrategy) Remove(ctx context.Context, containerID string) error {
-	// Stop event streaming if active.
+	// Stop event streaming if active. We only cancel the stream context here and
+	// drop our reference to the channel; we never close eventCh from this side.
+	// Closing the channel is the exclusive responsibility of the streaming
+	// goroutine (see startEventStream), which closes it once — after the send
+	// loop has exited. Closing here would race with the goroutine's in-flight
+	// send and panic with "send on closed channel". Cancelling unblocks
+	// stream.Recv(), which lets the goroutine observe the end and close.
 	s.mu.Lock()
 	if cancel, ok := s.cancelFn[containerID]; ok {
 		cancel()
 		delete(s.cancelFn, containerID)
 	}
-	if ch, ok := s.events[containerID]; ok {
-		close(ch)
-		delete(s.events, containerID)
-	}
+	delete(s.events, containerID)
 	s.mu.Unlock()
 
 	// Unregister the container.
@@ -570,12 +573,12 @@ func (s *GRPCStrategy) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Cancel all active event streams.
+	// Cancel all active event streams. As in Remove, we never close the event
+	// channels here — each streaming goroutine is the sole closer of its own
+	// channel and closes it after its send loop exits (see startEventStream).
+	// Cancelling unblocks the goroutines' stream.Recv() calls so they wind down.
 	for _, cancel := range s.cancelFn {
 		cancel()
-	}
-	for _, ch := range s.events {
-		close(ch)
 	}
 	s.cancelFn = make(map[string]context.CancelFunc)
 	s.events = make(map[string]chan Event)
@@ -602,7 +605,14 @@ func (s *GRPCStrategy) startEventStream(containerID string) error {
 	s.cancelFn[containerID] = cancel
 	s.mu.Unlock()
 
+	// This goroutine is the exclusive owner and sole closer of eventCh. Because
+	// the send below and the close here both run in this one goroutine, they are
+	// sequenced: the channel can only be closed after the send loop has exited,
+	// so no send can ever hit a closed channel. Remove()/Close() therefore never
+	// close eventCh — they only cancel ctx, which unblocks stream.Recv() and
+	// drives this loop to its close.
 	go func() {
+		defer close(eventCh)
 		defer cancel()
 		for {
 			protoEvent, err := stream.Recv()
@@ -610,15 +620,20 @@ func (s *GRPCStrategy) startEventStream(containerID string) error {
 				return
 			}
 			if err != nil {
-				// Stream closed or error
+				// Stream closed or error (includes ctx cancellation).
 				return
 			}
 
 			event := translateEvent(protoEvent)
 			select {
 			case eventCh <- event:
+			case <-ctx.Done():
+				// Teardown in progress; stop sending and let the deferred
+				// close run. Guards the send against a cancellation that races
+				// with an in-flight event.
+				return
 			default:
-				// Channel full, drop event
+				// Channel full, drop event.
 			}
 		}
 	}()

@@ -922,9 +922,10 @@ func parseMount(raw string) *mount.Mount {
 		}
 	}
 
-	_, readOnly := fields["readonly"]
-	if ro, ok := fields["readonly"]; ok && ro == "true" {
-		readOnly = true
+	readOnly, ok := parseMountReadOnly(fields)
+	if !ok {
+		// Unrecognised readonly/ro value; reject the mount rather than guessing.
+		return nil
 	}
 
 	m := &mount.Mount{
@@ -944,6 +945,34 @@ func parseMount(raw string) *mount.Mount {
 	}
 
 	return m
+}
+
+// parseMountReadOnly resolves whether a mount should be read-only from its
+// spec fields. It recognises both the "readonly" key and its "ro" shorthand,
+// following typical CLI/Docker mount conventions:
+//
+//   - a bare key (no "=value") or an explicit "true" means read-only;
+//   - an explicit "false" means writable;
+//   - any other value is unrecognised and reported via ok=false.
+//
+// The mere presence of the key no longer forces read-only, so an explicit
+// "readonly=false" now yields a writable mount as the user intended.
+func parseMountReadOnly(fields map[string]string) (readOnly bool, ok bool) {
+	for _, key := range []string{"readonly", "ro"} {
+		v, present := fields[key]
+		if !present {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "", "true":
+			readOnly = true
+		case "false":
+			readOnly = false
+		default:
+			return false, false
+		}
+	}
+	return readOnly, true
 }
 
 // parsePropagation maps a propagation string to a mount.Propagation constant.

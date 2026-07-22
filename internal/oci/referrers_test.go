@@ -197,7 +197,6 @@ func TestFetchSigstoreBundle(t *testing.T) {
 	bundleJSON := `{"mediaType":"application/vnd.dev.sigstore.bundle.v0.3+json","verificationMaterial":{}}`
 	// Use a real sha256 digest so verifyDigest passes.
 	bundleBlobDigest := policyDigestOf(bundleJSON)
-	referrerDigest := "sha256:" + strings.Repeat("1", 64)
 	imageDigest := "sha256:" + strings.Repeat("a", 64)
 
 	// The referrer manifest points to the bundle blob as a layer.
@@ -212,6 +211,14 @@ func TestFetchSigstoreBundle(t *testing.T) {
 			},
 		},
 	}
+	// Serve the manifest as content-addressed bytes so the by-digest fetch
+	// passes the manifest integrity check (registries return a body that
+	// hashes to the requested digest).
+	referrerManifestBytes, err := json.Marshal(referrerManifest)
+	if err != nil {
+		t.Fatalf("marshal referrer manifest: %v", err)
+	}
+	referrerDigest := policyDigestOf(string(referrerManifestBytes))
 
 	// Referrers index.
 	idx := ociIndex{
@@ -236,7 +243,7 @@ func TestFetchSigstoreBundle(t *testing.T) {
 		// Referrer manifest (by digest).
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/manifests/"+referrerDigest):
 			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
-			_ = json.NewEncoder(w).Encode(referrerManifest)
+			_, _ = w.Write(referrerManifestBytes)
 
 		// Image manifest (HEAD for tag resolution).
 		case r.Method == http.MethodHead && strings.Contains(r.URL.Path, "/manifests/"):

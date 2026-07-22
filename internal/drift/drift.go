@@ -38,6 +38,7 @@ const (
 	KindNameChange        Kind = "name-changed"
 	KindVersionChange     Kind = "version-changed"
 	KindContentHashChange Kind = "content-hash-changed"
+	KindFileContentChange Kind = "file-content-changed"
 	KindComponentCountUp  Kind = "component-count-increased"
 	KindComponentCountDn  Kind = "component-count-decreased"
 	KindSemanticDrift     Kind = "semantic-drift"
@@ -164,6 +165,27 @@ func DiffSkillBOMWithThresholds(old, new *skillbom.SkillBOM, thresholds skillbom
 			Description: fmt.Sprintf("semantic content hash changed (distance: %.4f, classification: %s)", dr.Distance, dr.Classification),
 			OldValue:    old.ContentHash,
 			NewValue:    new.ContentHash,
+		})
+	}
+
+	// 6b. Check for in-place bundled-file content changes. FilesHash is a
+	// deterministic fingerprint of the actual bytes of every bundled file.
+	// A change here is a strong rug-pull signal: an attacker can swap the
+	// contents of an existing file (e.g. inject a payload into helper.sh)
+	// while leaving name, description, capabilities, and component count --
+	// and therefore ContentHash and the count-based signals -- unchanged.
+	// This check is independent of the ContentHash-derived drift distance
+	// (and of embedding mode, which ignores ContentHash entirely), so it
+	// fires even when every other signal is silent. Only compared when both
+	// sides carry a FilesHash; a legacy baseline generated before this field
+	// existed is skipped on its first post-upgrade comparison.
+	if old.FilesHash != "" && new.FilesHash != "" && old.FilesHash != new.FilesHash {
+		signals = append(signals, DriftSignal{
+			Severity:    SeverityHigh,
+			Kind:        KindFileContentChange,
+			Description: "bundled file content changed (per-file content digest mismatch) -- possible in-place payload swap",
+			OldValue:    old.FilesHash,
+			NewValue:    new.FilesHash,
 		})
 	}
 

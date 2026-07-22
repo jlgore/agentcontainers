@@ -148,6 +148,53 @@ func TestMergePolicy(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			name: "filesystem path within allowed root passes",
+			org: &OrgPolicy{
+				AllowedFilesystemPaths: []string{"/workspace"},
+			},
+			workspace: &config.AgentContainer{
+				Image: "ubuntu:22.04",
+				Agent: &config.AgentConfig{
+					Capabilities: &config.Capabilities{
+						Filesystem: &config.FilesystemCaps{Read: []string{"/workspace/project"}},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "filesystem path traversal escaping allowed root is rejected",
+			org: &OrgPolicy{
+				AllowedFilesystemPaths: []string{"/workspace"},
+			},
+			workspace: &config.AgentContainer{
+				Image: "ubuntu:22.04",
+				Agent: &config.AgentConfig{
+					Capabilities: &config.Capabilities{
+						Filesystem: &config.FilesystemCaps{Read: []string{"/workspace/../../etc"}},
+					},
+				},
+			},
+			wantErr:     true,
+			errContains: "not within any org-allowed path",
+		},
+		{
+			name: "filesystem sibling-prefix path is rejected",
+			org: &OrgPolicy{
+				AllowedFilesystemPaths: []string{"/workspace"},
+			},
+			workspace: &config.AgentContainer{
+				Image: "ubuntu:22.04",
+				Agent: &config.AgentConfig{
+					Capabilities: &config.Capabilities{
+						Filesystem: &config.FilesystemCaps{Write: []string{"/workspace-evil"}},
+					},
+				},
+			},
+			wantErr:     true,
+			errContains: "not within any org-allowed path",
+		},
 	}
 
 	for _, tt := range tests {

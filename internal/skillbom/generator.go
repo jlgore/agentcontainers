@@ -71,6 +71,10 @@ func (g *DefaultGenerator) Generate(ctx context.Context, skillPath string) (*Ski
 		return nil, fmt.Errorf("computing content hash: %w", err)
 	}
 
+	// Compute a deterministic hash of the actual bundled file bytes so drift
+	// detection can catch in-place content swaps that leave metadata unchanged.
+	filesHash := computeFilesHash(files)
+
 	// Build CycloneDX document.
 	cdxJSON, err := buildCycloneDX(meta, files, contentHash, g.ACVersion)
 	if err != nil {
@@ -86,6 +90,7 @@ func (g *DefaultGenerator) Generate(ctx context.Context, skillPath string) (*Ski
 		Description:  meta.Description,
 		Capabilities: meta.Capabilities,
 		ContentHash:  contentHash,
+		FilesHash:    filesHash,
 		Content:      cdxJSON,
 		Digest:       digest,
 		Components:   len(files),
@@ -169,6 +174,34 @@ func computeContentHash(meta *SkillMetadata) (string, error) {
 	combined := strings.Join(parts, "\n")
 	hash := sha256.Sum256([]byte(combined))
 	return fmt.Sprintf("sha256:%x", hash), nil
+}
+
+// computeFilesHash produces a deterministic SHA-256 fingerprint over the
+// per-file content inventory: for each file, its relative path, SHA-256
+// content digest, and executable bit. Fields are NUL-delimited so no
+// combination of path and digest values can collide across entries.
+//
+// This hash intentionally covers the actual bytes of every bundled file (via
+// each file's content digest), so swapping the contents of an existing file
+// -- e.g. injecting a payload into helper.sh -- changes FilesHash even when
+// SKILL.md metadata, capabilities, and the file count are all unchanged. The
+// input is assumed to be sorted by RelPath (enumerateFiles guarantees this),
+// making the result stable and reproducible across regenerations.
+func computeFilesHash(files []fileEntry) string {
+	h := sha256.New()
+	for _, f := range files {
+		h.Write([]byte(f.RelPath))
+		h.Write([]byte{0})
+		h.Write([]byte(f.SHA256))
+		h.Write([]byte{0})
+		if f.Executable {
+			h.Write([]byte{1})
+		} else {
+			h.Write([]byte{0})
+		}
+		h.Write([]byte{0})
+	}
+	return fmt.Sprintf("sha256:%x", h.Sum(nil))
 }
 
 // normalizeText applies the PRD-008 text normalization algorithm:

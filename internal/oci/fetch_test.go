@@ -458,6 +458,75 @@ func TestFetchPolicy_DigestMismatch(t *testing.T) {
 	}
 }
 
+func TestFetchPolicy_ManifestDigestMismatch(t *testing.T) {
+	// A multi-arch tag resolves to an image index whose entry pins a concrete
+	// per-arch image manifest by content-addressed digest. Here the registry is
+	// compromised/MITM'd: it serves the pinned digest URL a *forged* manifest
+	// (carrying an attacker-controlled, self-consistent policy layer) that does
+	// not hash to the requested digest. fetchRawManifest must reject the body on
+	// the digest check before ever decoding it, so no forged policy is returned.
+	forgedPolicy := `{"requireSignatures": false}`
+	forgedPolicyDigest := policyDigestOf(forgedPolicy)
+
+	// The manifest the attacker wants us to consume. Its own layer descriptor is
+	// internally consistent (the blob would pass blob-digest verification), so
+	// the only defense is verifying the manifest body itself.
+	forgedManifest := ociManifest{
+		MediaType: "application/vnd.oci.image.manifest.v1+json",
+		Config:    ociDescriptor{MediaType: "application/vnd.oci.image.config.v1+json"},
+		Layers: []ociDescriptor{
+			{MediaType: PolicyArtifactMediaType, Digest: forgedPolicyDigest, Size: int64(len(forgedPolicy))},
+		},
+	}
+	forgedManifestBytes, err := json.Marshal(forgedManifest)
+	if err != nil {
+		t.Fatalf("marshal forged manifest: %v", err)
+	}
+
+	// The index pins a genuine digest that does NOT correspond to the forged
+	// manifest body the registry actually serves.
+	pinnedDigest := "sha256:" + strings.Repeat("b", 64)
+	index := rawManifest{
+		MediaType: "application/vnd.oci.image.index.v1+json",
+		Manifests: []ociIndexEntry{
+			{
+				MediaType: "application/vnd.oci.image.manifest.v1+json",
+				Digest:    pinnedDigest,
+				Size:      int64(len(forgedManifestBytes)),
+				Platform:  &ociPlatform{OS: "linux", Architecture: runtime.GOARCH},
+			},
+		},
+	}
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/manifests/latest"):
+			w.Header().Set("Content-Type", "application/vnd.oci.image.index.v1+json")
+			_ = json.NewEncoder(w).Encode(index)
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/manifests/"+pinnedDigest):
+			// MITM: serve a forged manifest that does not hash to pinnedDigest.
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			_, _ = w.Write(forgedManifestBytes)
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/blobs/"):
+			_, _ = w.Write([]byte(forgedPolicy))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	resolver := NewResolver(WithHTTPClient(srv.Client()))
+	ref := srv.Listener.Addr().String() + "/myorg/policy:latest"
+
+	_, err = resolver.FetchPolicy(context.Background(), ref)
+	if err == nil {
+		t.Fatal("FetchPolicy() error = nil; want manifest digest mismatch error")
+	}
+	if !strings.Contains(err.Error(), "digest mismatch") {
+		t.Errorf("error = %q, want it to contain 'digest mismatch'", err.Error())
+	}
+}
+
 func TestFindPolicyLayer(t *testing.T) {
 	tests := []struct {
 		name    string

@@ -2,9 +2,11 @@ package enforcement
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,6 +22,11 @@ import (
 // mockEnforcerServer is a test implementation of the Enforcer gRPC service.
 type mockEnforcerServer struct {
 	enforcerapi.UnimplementedEnforcerServer
+	// mu guards handler-set flags against concurrent RPC handlers. Most tests
+	// drive the mock sequentially, but the teardown-race test issues concurrent
+	// Remove() calls, so UnregisterContainer's flag write must be synchronized
+	// to keep the test scaffolding itself race-free under -race.
+	mu                    sync.Mutex
 	registerCalled        bool
 	unregisterCalled      bool
 	networkCalled         bool
@@ -38,6 +45,7 @@ type mockEnforcerServer struct {
 	lastInjectRequest     *enforcerapi.InjectSecretsRequest
 	lastSetImmutableReq   *enforcerapi.SetImmutableRequest
 	events                []*enforcerapi.EnforcementEvent
+	streamForever         bool
 	lsmActive             bool
 	lsmDetail             string
 }
@@ -50,7 +58,9 @@ func (m *mockEnforcerServer) RegisterContainer(ctx context.Context, req *enforce
 }
 
 func (m *mockEnforcerServer) UnregisterContainer(ctx context.Context, req *enforcerapi.UnregisterContainerRequest) (*enforcerapi.UnregisterContainerResponse, error) {
+	m.mu.Lock()
 	m.unregisterCalled = true
+	m.mu.Unlock()
 	return &enforcerapi.UnregisterContainerResponse{}, nil
 }
 
@@ -100,6 +110,25 @@ func (m *mockEnforcerServer) ApplyCredentialPolicy(ctx context.Context, req *enf
 }
 
 func (m *mockEnforcerServer) StreamEvents(req *enforcerapi.StreamEventsRequest, stream grpc.ServerStreamingServer[enforcerapi.EnforcementEvent]) error {
+	if m.streamForever {
+		// Continuously emit events until the client cancels the stream context.
+		// Used by the teardown-race test to keep events flowing while Remove/Close
+		// run concurrently.
+		ev := &enforcerapi.EnforcementEvent{Domain: "filesystem", Verdict: "allow"}
+		for {
+			select {
+			case <-stream.Context().Done():
+				return stream.Context().Err()
+			default:
+			}
+			if err := stream.Send(ev); err != nil {
+				return err
+			}
+			// Small pause so the stream keeps flowing without pegging a CPU; the
+			// send loop still overlaps teardown across many events.
+			time.Sleep(100 * time.Microsecond)
+		}
+	}
 	for _, event := range m.events {
 		if err := stream.Send(event); err != nil {
 			return err
@@ -252,6 +281,59 @@ func TestGRPCStrategy_Remove(t *testing.T) {
 
 	if !mock.unregisterCalled {
 		t.Error("UnregisterContainer was not called")
+	}
+}
+
+// TestGRPCStrategy_EventStreamTeardownRace exercises the teardown path while the
+// per-container event-stream goroutine is actively sending. Before the fix,
+// Remove()/Close() closed eventCh under s.mu while the goroutine sent on it
+// without holding that mutex; a send on the just-closed channel panics
+// ("send on closed channel") even inside a select with a default case, because
+// Go treats a send on a closed channel as a ready communication. The test spins
+// up many concurrent streams and tears them down concurrently (both Remove and
+// Close racing) over many rounds; on the pre-fix code this reliably panics and
+// crashes the test process, and -race also flags the unsynchronized close vs
+// send. With the fix (the streaming goroutine is the sole closer of eventCh),
+// it completes cleanly with no panic and no race.
+func TestGRPCStrategy_EventStreamTeardownRace(t *testing.T) {
+	mock := &mockEnforcerServer{streamForever: true}
+	server, listener := setupMockServer(mock)
+	defer server.Stop()
+
+	const rounds = 40
+	const perRound = 8
+
+	for r := 0; r < rounds; r++ {
+		strategy := newTestGRPCStrategy(t, listener)
+
+		ids := make([]string, perRound)
+		for i := range ids {
+			ids[i] = fmt.Sprintf("r%d-c%d", r, i)
+			if err := strategy.startEventStream(ids[i]); err != nil {
+				t.Fatalf("startEventStream() error = %v", err)
+			}
+		}
+
+		// Give the server-side stream a moment to start emitting so the client
+		// goroutines are inside their send loop when teardown hits.
+		time.Sleep(time.Millisecond)
+
+		var wg sync.WaitGroup
+		for _, id := range ids {
+			wg.Add(1)
+			go func(cid string) {
+				defer wg.Done()
+				_ = strategy.Remove(context.Background(), cid)
+			}(id)
+		}
+		// Concurrently tear the whole strategy down, racing the per-container
+		// Remove calls and the still-running send loops.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = strategy.Close()
+		}()
+		wg.Wait()
 	}
 }
 

@@ -1,6 +1,9 @@
 package mcpproxy
 
-import "strings"
+import (
+	"regexp"
+	"strings"
+)
 
 // Resource limits for command decomposition. Wrapper/interpreter nesting,
 // per-command token counts, and -c payload sizes are bounded so a hostile or
@@ -69,6 +72,40 @@ var interpreterEvalFlags = map[string]map[string]bool{
 	"node":    flagSet("-e", "--eval", "-p", "--print"),
 	"nodejs":  flagSet("-e", "--eval", "-p", "--print"),
 	"php":     flagSet("-r"),
+}
+
+// interpreterVersionSuffix matches a binary that is an alphabetic interpreter
+// base name immediately followed by a pure version suffix — a run of digits with
+// optional dotted minor/patch components and nothing after it. It captures the
+// alphabetic prefix. Examples that match: python3.11, python312, ruby3.2,
+// perl5.36. Examples that do NOT match: sha256sum (trailing letters fail the
+// anchor), ssh (no digits, so it never collapses to sh), python3.6m (the ABI
+// letter fails the anchor).
+var interpreterVersionSuffix = regexp.MustCompile(`^([a-z]+)[0-9]+(?:\.[0-9]+)*$`)
+
+// interpreterFamily normalizes a version-suffixed interpreter binary to its
+// unversioned family name so version-suffixed variants (python3.11, ruby3.2,
+// perl5.36, ...) are matched by shellInterpreters/interpreterEvalFlags exactly
+// like their unversioned counterparts. Normalization is deliberately guarded:
+// the name is rewritten only when its alphabetic prefix is itself a known
+// interpreter key, so an unrelated binary whose name happens to end in digits is
+// never rewritten (and thus never gains a spurious deny). Binaries that are
+// already exact keys, and anything that is not a known interpreter family, are
+// returned unchanged. Case is preserved: matching stays exact-case, consistent
+// with the maps and with the existing unversioned matching behavior.
+func interpreterFamily(bin string) string {
+	if shellInterpreters[bin] || interpreterEvalFlags[bin] != nil {
+		return bin
+	}
+	m := interpreterVersionSuffix.FindStringSubmatch(bin)
+	if m == nil {
+		return bin
+	}
+	base := m[1]
+	if shellInterpreters[base] || interpreterEvalFlags[base] != nil {
+		return base
+	}
+	return bin
 }
 
 // unmodeledExecMechanisms run other programs in ways this decomposer does not
@@ -308,6 +345,11 @@ func decomposeWrapped(command []string, outputFlags []string, rawLine string, de
 	p.Via = "shell"
 	p.Args = append(p.Args, rawLine)
 	bin := p.Binary
+	// family strips a version suffix (python3.11 -> python) but only for known
+	// interpreters, so version-suffixed interpreters reach the same shell/eval
+	// handling as their unversioned counterparts. Wrappers and unmodeled exec
+	// mechanisms have no version forms and keep the exact bin.
+	family := interpreterFamily(bin)
 	out := []Parsed{p}
 
 	switch {
@@ -332,7 +374,7 @@ func decomposeWrapped(command []string, outputFlags []string, rawLine string, de
 		if len(effective) > 0 {
 			out = append(out, decomposeWrapped(effective, outputFlags, rawLine, depth+1)...)
 		}
-	case shellInterpreters[bin]:
+	case shellInterpreters[family]:
 		if payload, ok := extractDashC(command[1:]); ok {
 			payload = unquoteCArg(payload)
 			if len(payload) > maxPayloadBytes {
@@ -341,8 +383,8 @@ func decomposeWrapped(command []string, outputFlags []string, rawLine string, de
 				out = append(out, decomposeShellLineDepth(payload, outputFlags, depth+1)...)
 			}
 		}
-	case interpreterEvalFlags[bin] != nil:
-		if f, ok := blockedEvalFlag(command[1:], interpreterEvalFlags[bin]); ok {
+	case interpreterEvalFlags[family] != nil:
+		if f, ok := blockedEvalFlag(command[1:], interpreterEvalFlags[family]); ok {
 			out[0].Deny = true
 			out[0].DenyReasons = append(out[0].DenyReasons,
 				"blocked eval flag "+f+" on interpreter "+bin)

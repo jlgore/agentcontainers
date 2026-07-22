@@ -306,6 +306,39 @@ func TestParseMount_BindReadonly(t *testing.T) {
 	assert.True(t, m.ReadOnly)
 }
 
+func TestParseMount_ReadOnlyValue(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		wantRO  bool
+		wantNil bool
+	}{
+		{"bare readonly", "type=bind,source=/a,target=/b,readonly", true, false},
+		{"readonly=true", "type=bind,source=/a,target=/b,readonly=true", true, false},
+		{"readonly=false", "type=bind,source=/a,target=/b,readonly=false", false, false},
+		{"readonly=TRUE case-insensitive", "type=bind,source=/a,target=/b,readonly=TRUE", true, false},
+		{"readonly=False case-insensitive", "type=bind,source=/a,target=/b,readonly=False", false, false},
+		{"no readonly key", "type=bind,source=/a,target=/b", false, false},
+		{"bare ro", "type=bind,source=/a,target=/b,ro", true, false},
+		{"ro=true", "type=bind,source=/a,target=/b,ro=true", true, false},
+		{"ro=false", "type=bind,source=/a,target=/b,ro=false", false, false},
+		{"unrecognised readonly value rejects mount", "type=bind,source=/a,target=/b,readonly=maybe", false, true},
+		{"unrecognised ro value rejects mount", "type=bind,source=/a,target=/b,ro=nope", false, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := parseMount(tt.raw)
+			if tt.wantNil {
+				assert.Nil(t, m, "unrecognised readonly value should reject the mount")
+				return
+			}
+			require.NotNil(t, m)
+			assert.Equal(t, tt.wantRO, m.ReadOnly)
+		})
+	}
+}
+
 func TestParseMount_Volume(t *testing.T) {
 	m := parseMount("type=volume,source=data,target=/data")
 	require.NotNil(t, m)
