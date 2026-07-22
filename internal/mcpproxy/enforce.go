@@ -122,13 +122,23 @@ func applyBackendEnforcement(ctx context.Context, ec enforcerapi.EnforcerClient,
 				zap.Int("readPaths", len(fs.Read)),
 				zap.Int("writePaths", len(fs.Write)))
 		}
-		if _, err := ec.ApplyFilesystemPolicy(ctx, &enforcerapi.FilesystemPolicyRequest{
+		fsResp, err := ec.ApplyFilesystemPolicy(ctx, &enforcerapi.FilesystemPolicyRequest{
 			ContainerId: b.ContainerID,
 			ReadPaths:   fs.Read,
 			WritePaths:  fs.Write,
 			DenyPaths:   fs.Deny,
-		}); err != nil {
+		})
+		if err != nil {
 			return fail(fmt.Errorf("mcpproxy: backend %s: applying filesystem policy: %w", b.Name, err))
+		}
+		// A nil transport error does NOT mean the policy was installed: the
+		// enforcer returns success:false (e.g. a BPF map-capacity error) when
+		// it fails to write DENIED_INODES. Treat that as a hard failure and
+		// roll back — resuming here would unpause a container with zero
+		// deny-path enforcement. Mirrors the identical check in
+		// internal/enforcement/grpc.go.
+		if !fsResp.GetSuccess() {
+			return fail(fmt.Errorf("mcpproxy: backend %s: enforcer rejected filesystem policy: %s", b.Name, fsResp.GetError()))
 		}
 	}
 
