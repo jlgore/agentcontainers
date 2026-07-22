@@ -92,6 +92,18 @@ func TestWrapperBypassesAreDecomposed(t *testing.T) {
 		{"plain python no eval flag", "python3 script.py", "python3", false},
 		{"xargs unmodeled", "xargs rm", "xargs", true},
 		{"nested wrappers reach python", "timeout 5 nohup env stdbuf -oL python3 -c 'x'", "python3", true},
+		// Version-suffixed interpreters must get the same structural deny as
+		// their unversioned counterparts, and must NOT be denied without an
+		// eval flag.
+		{"python3.11 -c denied", "python3.11 -c 'import os'", "python3.11", true},
+		{"python3.12 -c denied", "python3.12 -c 'import os'", "python3.12", true},
+		{"python311 undotted -c denied", "python311 -c 'import os'", "python311", true},
+		{"ruby3.2 -e denied", "ruby3.2 -e 'system(1)'", "ruby3.2", true},
+		{"perl5.36 -e denied", "perl5.36 -e 'system(1)'", "perl5.36", true},
+		{"php8.2 -r denied", "php8.2 -r 'system(1);'", "php8.2", true},
+		{"versioned wrapped python3.11 -c denied", "timeout 5 python3.11 -c 'import os'", "python3.11", true},
+		{"python3.11 script not denied", "python3.11 script.py", "python3.11", false},
+		{"ruby3.2 script not denied", "ruby3.2 app.rb", "ruby3.2", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -177,6 +189,10 @@ func TestBenignCommandsUnaffected(t *testing.T) {
 		"grep -c foo file.txt", // -c is a count flag here, not a python eval flag
 		"timeout 30 git fetch", // wrapper around a benign command
 		"env FOO=bar ls",
+		// Overmatch guards: names ending in digits whose alphabetic prefix is
+		// NOT a known interpreter must not be normalized into one.
+		"sha256sum -c sums.txt", // -c is a check flag; "sha" is not an interpreter
+		"base64 -d file",        // trailing digits, prefix "base" is not a key
 	} {
 		ps := DecomposeShellLine(line, nil)
 		if anyDenied(ps) {
