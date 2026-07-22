@@ -129,6 +129,7 @@ func runAuditShow(out io.Writer, dir, sessionID string) error {
 func newAuditVerifyCmd() *cobra.Command {
 	var dir string
 	var verifySignatures bool
+	var allowUnsigned bool
 
 	cmd := &cobra.Command{
 		Use:   "verify <session-id>",
@@ -138,20 +139,29 @@ is intact. Reports the result and exits with non-zero status on failure.
 
 With --verify-signatures, also verify the Ed25519 signature on every signed
 entry (G1): each entry's did:key is resolved self-certifyingly and its
-signature checked against the recomputed entry hash. Unsigned legacy entries
-are reported but not failed.`,
+signature checked against the recomputed entry hash. By default this fails
+closed: if the log is empty or ANY entry is unsigned, verification FAILS with
+a non-zero exit. This is deliberate — a command whose purpose is proving
+authorship must not report "OK" over attacker-controlled unsigned content
+(the hash chain alone is not a secret and can be recomputed by anyone who can
+write the .jsonl file).
+
+For genuine legacy logs written before signing was introduced, pass
+--allow-unsigned to accept unsigned entries; they are then reported but not
+failed.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runAuditVerify(cmd.OutOrStdout(), dir, args[0], verifySignatures)
+			return runAuditVerify(cmd.OutOrStdout(), dir, args[0], verifySignatures, allowUnsigned)
 		},
 	}
 
 	cmd.Flags().StringVar(&dir, "dir", "", "Audit log directory (default: ~/.ac/audit/)")
-	cmd.Flags().BoolVar(&verifySignatures, "verify-signatures", false, "Also verify per-entry Ed25519 signatures (G1)")
+	cmd.Flags().BoolVar(&verifySignatures, "verify-signatures", false, "Also verify per-entry Ed25519 signatures (G1); fails closed on any unsigned entry")
+	cmd.Flags().BoolVar(&allowUnsigned, "allow-unsigned", false, "With --verify-signatures, accept unsigned legacy entries instead of failing")
 	return cmd
 }
 
-func runAuditVerify(out io.Writer, dir, sessionID string, verifySignatures bool) error {
+func runAuditVerify(out io.Writer, dir, sessionID string, verifySignatures, allowUnsigned bool) error {
 	path, err := resolveAuditPath(dir, sessionID)
 	if err != nil {
 		return fmt.Errorf("audit verify: %w", err)
@@ -179,9 +189,24 @@ func runAuditVerify(out io.Writer, dir, sessionID string, verifySignatures bool)
 			return fmt.Errorf("audit verify: signature check failed")
 		}
 		unsigned := len(entries) - verified
+		// Fail closed by default: proving authorship means every entry must
+		// carry a valid signature. An attacker who appends a forged entry with
+		// empty DID/signature (attack a) or strips all signatures and recomputes
+		// the chain (attack b) leaves verified < len(entries); an emptied/
+		// truncated log leaves verified == 0. Either way, without an explicit
+		// --allow-unsigned opt-out for genuine legacy logs, that is a FAIL, not
+		// a misleading "OK ... unsigned (legacy)".
+		if !allowUnsigned && (len(entries) == 0 || verified != len(entries)) {
+			if len(entries) == 0 {
+				_, _ = fmt.Fprintln(out, "FAIL: no entries to verify; nothing is signed (pass --allow-unsigned to accept legacy logs)")
+			} else {
+				_, _ = fmt.Fprintf(out, "FAIL: %d of %d entries unsigned; pass --allow-unsigned to accept legacy logs.\n", unsigned, len(entries))
+			}
+			return fmt.Errorf("audit verify: signature check failed: %d of %d entries unsigned", unsigned, len(entries))
+		}
 		_, _ = fmt.Fprintf(out, "OK: %d signed entries verified", verified)
 		if unsigned > 0 {
-			_, _ = fmt.Fprintf(out, ", %d unsigned (legacy)", unsigned)
+			_, _ = fmt.Fprintf(out, ", %d unsigned (legacy, accepted via --allow-unsigned)", unsigned)
 		}
 		_, _ = fmt.Fprintln(out, ".")
 	}

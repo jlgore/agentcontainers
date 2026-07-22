@@ -249,6 +249,15 @@ func (l *Logger) Path() string {
 
 // computeHash computes the SHA-256 hash for an entry, dispatching on the
 // entry's hash-scheme version.
+// ComputeEntryHash recomputes the canonical hash of an entry using the same
+// scheme the logger uses when writing. It lets external verifiers (and tests)
+// recompute an entry's expected EntryHash from its content, e.g. to confirm a
+// chain was recomputed correctly. The result is independent of the entry's
+// stored EntryHash and Signature, both of which are excluded from the hash.
+func ComputeEntryHash(e Entry) (string, error) {
+	return computeHash(e)
+}
+
 func computeHash(e Entry) (string, error) {
 	if e.Version >= 1 {
 		return computeHashCanonical(e)

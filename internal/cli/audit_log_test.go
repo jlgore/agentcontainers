@@ -98,7 +98,7 @@ func TestAuditVerify(t *testing.T) {
 	_ = l.Close()
 
 	var buf bytes.Buffer
-	err = runAuditVerify(&buf, dir, "verify-test", false)
+	err = runAuditVerify(&buf, dir, "verify-test", false, false)
 	if err != nil {
 		t.Fatalf("runAuditVerify: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestAuditVerifySignatures(t *testing.T) {
 
 	// Signed chain verifies.
 	var buf bytes.Buffer
-	if err := runAuditVerify(&buf, dir, "sig-test", true); err != nil {
+	if err := runAuditVerify(&buf, dir, "sig-test", true, false); err != nil {
 		t.Fatalf("runAuditVerify: %v", err)
 	}
 	if out := buf.String(); !strings.Contains(out, "3 signed entries verified") {
@@ -155,9 +155,133 @@ func TestAuditVerifySignatures(t *testing.T) {
 	// The hash chain itself breaks first (verdict is hashed), which is a valid
 	// detection path; assert verify fails either way.
 	var buf2 bytes.Buffer
-	if err := runAuditVerify(&buf2, dir, "sig-test", true); err == nil {
+	if err := runAuditVerify(&buf2, dir, "sig-test", true, false); err == nil {
 		t.Fatalf("expected tampered log to fail verification, output: %q", buf2.String())
 	}
+}
+
+// TestAuditVerifySignaturesFailsClosedOnUnsigned proves that --verify-signatures
+// fails closed on attacker-controlled unsigned content: both an appended forged
+// entry (empty DID/signature but a correctly-recomputed hash chain) and a fully
+// stripped/recomputed all-unsigned chain must produce a non-zero exit and a
+// clear FAIL, not an exit-0 "OK ... unsigned (legacy)". The genuine legacy path
+// remains reachable only via the explicit --allow-unsigned opt-out.
+func TestAuditVerifySignaturesFailsClosedOnUnsigned(t *testing.T) {
+	assertFailsClosed := func(t *testing.T, dir, sessionID string) {
+		t.Helper()
+		var buf bytes.Buffer
+		// Chain integrity holds in these attacks (the chain is recomputable by
+		// anyone with write access), so the failure must come from the signature
+		// policy, not ValidateChain.
+		if err := runAuditVerify(&buf, dir, sessionID, true, false); err == nil {
+			t.Fatalf("expected fail-closed on unsigned content, got nil error; output: %q", buf.String())
+		}
+		out := buf.String()
+		if !strings.Contains(out, "FAIL") {
+			t.Errorf("expected FAIL in output, got %q", out)
+		}
+		if strings.Contains(out, "signed entries verified") {
+			t.Errorf("unsigned content must not report an OK verification line, got %q", out)
+		}
+	}
+
+	// Attack (a): a genuinely signed chain with one appended unsigned entry
+	// whose hash chain is correctly recomputed.
+	t.Run("appended_unsigned_entry", func(t *testing.T) {
+		dir := t.TempDir()
+		ks, err := identity.LoadOrCreateKeyStore(filepath.Join(t.TempDir(), "id.pem"))
+		if err != nil {
+			t.Fatalf("keystore: %v", err)
+		}
+		l, err := audit.NewLogger("attack-a", audit.WithDir(dir), audit.WithSigner(ks))
+		if err != nil {
+			t.Fatalf("NewLogger: %v", err)
+		}
+		actor := audit.Actor{Type: "tool", Name: "run"}
+		for range 2 {
+			if err := l.Log(audit.EventToolCall, actor, audit.WithVerdict(audit.VerdictAllow)); err != nil {
+				t.Fatalf("Log: %v", err)
+			}
+		}
+		_ = l.Close()
+
+		// Append a forged unsigned entry with a correctly recomputed hash chain,
+		// exactly as an attacker with write access to the .jsonl could.
+		path := filepath.Join(dir, "attack-a.jsonl")
+		entries, err := audit.ReadLog(path)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		last := entries[len(entries)-1]
+		forged := audit.Entry{
+			Version:   last.Version,
+			SessionID: "attack-a",
+			Sequence:  uint64(len(entries)),
+			Timestamp: last.Timestamp,
+			EventType: audit.EventToolCall,
+			Actor:     audit.Actor{Type: "tool", Name: "run"},
+			Verdict:   audit.VerdictAllow,
+			PrevHash:  last.EntryHash,
+		}
+		h, err := audit.ComputeEntryHash(forged)
+		if err != nil {
+			t.Fatalf("ComputeEntryHash: %v", err)
+		}
+		forged.EntryHash = h
+		appended := append(entries, forged)
+
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		enc := json.NewEncoder(f)
+		for _, e := range appended {
+			if err := enc.Encode(e); err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+		}
+		_ = f.Close()
+
+		// Sanity: the hash chain itself must still be intact, so the only thing
+		// that can catch this attack is the signature policy.
+		reread, err := audit.ReadLog(path)
+		if err != nil {
+			t.Fatalf("reread: %v", err)
+		}
+		if err := audit.ValidateChain(reread); err != nil {
+			t.Fatalf("expected chain to remain intact after forgery, got %v", err)
+		}
+
+		assertFailsClosed(t, dir, "attack-a")
+	})
+
+	// Attack (b): every entry stripped of DID/signature with a freshly recomputed
+	// chain (an unsigned logger produces exactly this shape).
+	t.Run("all_unsigned_chain", func(t *testing.T) {
+		dir := t.TempDir()
+		l, err := audit.NewLogger("attack-b", audit.WithDir(dir)) // no signer
+		if err != nil {
+			t.Fatalf("NewLogger: %v", err)
+		}
+		actor := audit.Actor{Type: "tool", Name: "run"}
+		for range 3 {
+			if err := l.Log(audit.EventToolCall, actor, audit.WithVerdict(audit.VerdictAllow)); err != nil {
+				t.Fatalf("Log: %v", err)
+			}
+		}
+		_ = l.Close()
+
+		assertFailsClosed(t, dir, "attack-b")
+
+		// The genuine legacy use case is preserved via the explicit opt-out.
+		var buf bytes.Buffer
+		if err := runAuditVerify(&buf, dir, "attack-b", true, true); err != nil {
+			t.Fatalf("--allow-unsigned should accept a legacy all-unsigned log: %v", err)
+		}
+		if out := buf.String(); !strings.Contains(out, "0 signed entries verified") {
+			t.Errorf("expected accepted legacy report, got %q", out)
+		}
+	})
 }
 
 func TestAuditExport(t *testing.T) {
