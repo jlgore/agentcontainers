@@ -249,8 +249,27 @@ func (r *Resolver) fetchRawManifest(ctx context.Context, fetchRef, origRef Refer
 			resp.StatusCode, origRef.String(), string(body))
 	}
 
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPolicySize))
+	if err != nil {
+		return nil, fmt.Errorf("reading manifest for %s: %w", origRef.String(), err)
+	}
+
+	// When the manifest was fetched by a content-addressed digest, verify that
+	// the response body actually hashes to that digest before trusting it. This
+	// closes the same MITM / compromised-registry gap that verifyDigest already
+	// guards against for blobs (F-2): a registry could otherwise serve a forged
+	// manifest (e.g. one carrying a permissive org-policy layer) in response to
+	// a pinned digest URL while Docker's own image pull received the genuine
+	// manifest. When fetched by tag there is no expected digest to check
+	// against, so this check naturally does not apply to that path.
+	if fetchRef.Digest != "" {
+		if err := verifyDigest(body, fetchRef.Digest); err != nil {
+			return nil, fmt.Errorf("manifest integrity check failed for %s: %w", origRef.String(), err)
+		}
+	}
+
 	var m rawManifest
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxPolicySize)).Decode(&m); err != nil {
+	if err := json.Unmarshal(body, &m); err != nil {
 		return nil, fmt.Errorf("decoding manifest for %s: %w", origRef.String(), err)
 	}
 
